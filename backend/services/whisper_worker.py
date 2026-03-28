@@ -13,7 +13,10 @@ import argparse
 import gc
 import json
 import logging
+import os
+import subprocess
 import sys
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -76,17 +79,19 @@ def _filter_segments(result_segments: list[dict], initial_prompt: str = "", task
 
         # Ghost check: text-to-duration ratio
         # Translate: English translations of Japanese are structurally shorter —
-        # a 20s Japanese utterance may be just "That's right." (13 chars = 0.65 c/s).
+        # a 30s Japanese utterance may be just "Is that so?" (11 chars = 0.37 c/s).
         chars_per_sec = len(text) / max(duration, 0.1)
-        ghost_ratio_threshold = 0.3 if is_translate else 1.0
-        ghost_min_duration = 25 if is_translate else 15
+        ghost_ratio_threshold = 0.1 if is_translate else 1.0
+        ghost_min_duration = 60 if is_translate else 15
         if duration > ghost_min_duration and chars_per_sec < ghost_ratio_threshold:
             logger.warning("Filter: ghost (ratio) at %.1fs (%.0fs, %.2f c/s): %s", seg["start"], duration, chars_per_sec, text[:60])
             continue
 
-        # Mega-segments (>120s) need proportional text
-        mega_min_text = 80 if is_translate else 200
-        if duration > 120 and len(text) < mega_min_text:
+        # Mega-segments need proportional text
+        # Translate: even short phrases like "Yes." are valid for long segments
+        mega_min_text = 10 if is_translate else 200
+        mega_min_duration = 300 if is_translate else 120
+        if duration > mega_min_duration and len(text) < mega_min_text:
             logger.warning("Filter: mega-ghost at %.1fs (%.0fs, %d chars): %s", seg["start"], duration, len(text), text[:60])
             continue
 
@@ -212,8 +217,95 @@ def main():
 
         logger.info("Transcribing: %s", args.audio)
 
+        # ── Audio preprocessing (matches in-process path in transcription.py) ──
+        # Normalize volume so Whisper gets consistent input levels.
+        # Whisper was trained on -20 LUFS audio; quiet/loud recordings degrade accuracy.
+        preprocessed_path = args.audio
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                preprocessed_path = tmp.name
+
+            # Two-pass loudnorm for precise normalization
+            # Pass 1: Measure loudness statistics
+            measure_cmd = [
+                "ffmpeg", "-y", "-i", args.audio,
+                "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
+                       "agate=threshold=-45dB:attack=5:release=50,"
+                       "loudnorm=I=-20:TP=-1.5:LRA=7:print_format=json",
+                "-f", "null", "-",
+            ]
+            measure_result = subprocess.run(measure_cmd, capture_output=True, text=True, timeout=120)
+
+            loudnorm_stats = None
+            if measure_result.returncode == 0 and measure_result.stderr:
+                stderr_text = measure_result.stderr
+                json_start = stderr_text.rfind('{')
+                json_end = stderr_text.rfind('}')
+                if json_start >= 0 and json_end > json_start:
+                    try:
+                        loudnorm_stats = json.loads(stderr_text[json_start:json_end + 1])
+                    except (ValueError, KeyError):
+                        pass
+
+            if loudnorm_stats:
+                # Pass 2: Apply measured corrections (precise normalization)
+                normalize_filter = (
+                    f"highpass=f=50,"
+                    f"acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
+                    f"agate=threshold=-45dB:attack=5:release=50,"
+                    f"loudnorm=I=-20:TP=-1.5:LRA=7:linear=true"
+                    f":measured_I={loudnorm_stats.get('input_i', '-24.0')}"
+                    f":measured_TP={loudnorm_stats.get('input_tp', '-2.0')}"
+                    f":measured_LRA={loudnorm_stats.get('input_lra', '7.0')}"
+                    f":measured_thresh={loudnorm_stats.get('input_thresh', '-34.0')}"
+                    f":offset={loudnorm_stats.get('target_offset', '0.0')}"
+                )
+                cmd = [
+                    "ffmpeg", "-y", "-i", args.audio,
+                    "-af", normalize_filter,
+                    "-ar", "16000", "-ac", "1",
+                    preprocessed_path,
+                ]
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
+                if result.returncode != 0:
+                    logger.warning("Two-pass loudnorm failed, falling back to single-pass")
+                    cmd_fallback = [
+                        "ffmpeg", "-y", "-i", args.audio,
+                        "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
+                               "agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7",
+                        "-ar", "16000", "-ac", "1",
+                        preprocessed_path,
+                    ]
+                    result = subprocess.run(cmd_fallback, capture_output=True, timeout=120)
+                    if result.returncode != 0:
+                        preprocessed_path = args.audio
+                else:
+                    logger.info("Audio preprocessed: two-pass loudnorm to -20 LUFS, 16kHz mono")
+            else:
+                # Fallback: single-pass if measurement failed
+                cmd = [
+                    "ffmpeg", "-y", "-i", args.audio,
+                    "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
+                           "agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7",
+                    "-ar", "16000", "-ac", "1",
+                    preprocessed_path,
+                ]
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
+                if result.returncode != 0:
+                    preprocessed_path = args.audio
+                else:
+                    logger.info("Audio preprocessed: single-pass loudnorm (measurement failed)")
+        except Exception as e:
+            logger.warning("Audio preprocessing skipped: %s", e)
+            preprocessed_path = args.audio
+
         # All quality parameters matching the in-process path (transcription.py ~line 1076)
-        compression_ratio = 3.0 if args.cjk else args.compression_ratio_threshold
+        if args.cjk and args.task != "translate":
+            compression_ratio = 3.0  # CJK source, CJK output
+        elif args.task == "translate":
+            compression_ratio = 2.8  # Translated output has moderate compression
+        else:
+            compression_ratio = args.compression_ratio_threshold
 
         transcribe_kwargs = {
             "beam_size": args.beam_size,
@@ -238,11 +330,10 @@ def main():
                 "onset": args.vad_onset,
                 "min_speech_duration_ms": args.vad_min_speech_ms,
             }
-            # For translation tasks, widen padding to catch quiet speech
+            # For translation tasks, ensure minimum speech padding
+            # (parent process already sets translate-optimized values)
             if args.task == "translate":
-                vad_params["speech_pad_ms"] = max(vad_params["speech_pad_ms"], 1000)
-                vad_params["onset"] = min(vad_params["onset"], 0.12)
-                vad_params["min_speech_duration_ms"] = min(vad_params["min_speech_duration_ms"], 50)
+                vad_params["speech_pad_ms"] = max(vad_params["speech_pad_ms"], 600)
             transcribe_kwargs["vad_parameters"] = vad_params
 
         if args.language:
@@ -259,7 +350,7 @@ def main():
             args.no_speech_threshold, args.cjk,
         )
 
-        segments_gen, info = model.transcribe(args.audio, **transcribe_kwargs)
+        segments_gen, info = model.transcribe(preprocessed_path, **transcribe_kwargs)
 
         # Materialize segments with real-time progress reporting to stderr.
         # The parent process reads PROGRESS:{json} lines to update the UI.
@@ -332,10 +423,23 @@ def main():
         del model
         gc.collect()
 
+        # Clean up preprocessed audio temp file
+        if preprocessed_path != args.audio:
+            try:
+                os.unlink(preprocessed_path)
+            except OSError:
+                pass
+
     except Exception as e:
         logger.error("Whisper worker failed: %s", e, exc_info=True)
         with open(args.output, "w") as f:
             json.dump({"status": "error", "error": str(e)}, f)
+        # Clean up preprocessed audio temp file on error
+        try:
+            if preprocessed_path != args.audio:
+                os.unlink(preprocessed_path)
+        except (OSError, NameError):
+            pass
         sys.exit(1)
 
     # Process exits → OS reclaims ALL CUDA memory

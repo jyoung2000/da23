@@ -224,6 +224,27 @@ async def transcribe_audio_subprocess(
             elif vram_mb >= 6000:
                 model_name = "large-v3-turbo"
 
+        # For translate tasks with CJK source, upgrade to medium even on 4GB VRAM.
+        # Medium model (~1.5GB) + CUDA context fits in 4GB for translate (shorter output).
+        # Medium has dramatically better cross-lingual accuracy than small for CJK→EN.
+        if task == "translate" and model_name == "small":
+            is_cjk_source = language.lower() in ("ja", "ko", "zh", "zh-cn", "zh-tw") if language else False
+            if is_cjk_source and vram_mb >= 3500:
+                model_name = "medium"
+                beam_size = min(beam_size, 3)
+                logger.info(
+                    "TRANSLATE UPGRADE: small→medium for CJK→EN translation on %dMB GPU",
+                    vram_mb,
+                )
+            elif not language and vram_mb >= 3500:
+                # Auto-detect language — try medium for potentially CJK content
+                model_name = "medium"
+                beam_size = min(beam_size, 3)
+                logger.info(
+                    "TRANSLATE UPGRADE: small→medium for auto-detect→EN translation on %dMB GPU",
+                    vram_mb,
+                )
+
         # Beam size safety: reduce if model+beam won't fit
         _MODEL_VRAM_MB = {
             "tiny": 400, "base": 500, "small": 1000,
@@ -275,12 +296,11 @@ async def transcribe_audio_subprocess(
             "--repetition-penalty", "1.1",
             "--no-repeat-ngram-size", "3",
             "--prompt-reset-on-temperature", "0.5",
-            # VAD fine-tuning — lower thresholds for translate tasks since
-            # English output from non-English audio has different speech patterns
-            "--vad-min-silence-ms", "300",
-            "--vad-speech-pad-ms", "800" if task == "translate" else "600",
-            "--vad-onset", "0.10" if task == "translate" else "0.15",
-            "--vad-min-speech-ms", "80" if task == "translate" else "100",
+            # VAD fine-tuning — balanced for Japanese conversational audio
+            "--vad-min-silence-ms", "250" if task == "translate" else "300",
+            "--vad-speech-pad-ms", "600",
+            "--vad-onset", "0.18" if task == "translate" else "0.15",
+            "--vad-min-speech-ms", "120" if task == "translate" else "100",
         ]
         if vad_filter:
             cmd.append("--vad-filter")
@@ -352,12 +372,14 @@ async def transcribe_audio_subprocess(
         if raw.get("status") == "error":
             raise RuntimeError(f"Whisper worker error: {raw.get('error')}")
 
-        # Apply the full hallucination filter as a second pass.
-        # The worker does basic filtering internally, but _filter_hallucinations
-        # has more sophisticated checks (CJK n-grams, SequenceMatcher dedup).
+        # Apply post-processing filters.
+        # The worker already ran _filter_segments() internally.
+        # For translate mode, skip the second hallucination filter pass to avoid
+        # double-filtering that cumulatively removes ~19% of valid segments.
         raw_segments = raw.get("segments", [])
-        raw_segments = _filter_hallucinations(raw_segments)
-        raw_segments = _consolidate_segments(raw_segments)
+        if task != "translate":
+            raw_segments = _filter_hallucinations(raw_segments, task=task)
+        raw_segments = _consolidate_segments(raw_segments, task=task)
         segments = []
         for seg in raw_segments:
             words = None
@@ -1059,8 +1081,8 @@ async def transcribe_audio(
                     "Returning partial transcription.",
                     len(partial), str(e)[:200],
                 )
-                partial = _filter_hallucinations(partial)
-                partial = _consolidate_segments(partial)
+                partial = _filter_hallucinations(partial, task=task)
+                partial = _consolidate_segments(partial, task=task)
                 if partial:
                     result_segs = []
                     for seg in partial:
@@ -1666,8 +1688,8 @@ def _transcribe_sync(
         return []
 
     # Filter hallucinations and consolidate fragments before speaker assignment
-    raw_segments = _filter_hallucinations(raw_segments)
-    raw_segments = _consolidate_segments(raw_segments)
+    raw_segments = _filter_hallucinations(raw_segments, task=task)
+    raw_segments = _consolidate_segments(raw_segments, task=task)
     if not raw_segments:
         return []
 
@@ -1903,7 +1925,7 @@ _WHISPER_BOILERPLATE = {
 }
 
 
-def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
+def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -> list[dict]:
     """Remove Whisper hallucination segments.
 
     Detects and filters:
@@ -1913,7 +1935,11 @@ def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
     - Abnormally long single segments (>1500 chars = likely runaway)
     - Repeated n-grams (looping text like "Thank you. Thank you. Thank you.")
     - Segments that are near-exact duplicates of the previous segment (sequence-based)
+
+    When task='translate', applies looser thresholds because English translations
+    of non-English audio produce shorter text for the same audio duration.
     """
+    is_translate = (task == "translate")
     if not raw_segments:
         return raw_segments
 
@@ -1968,16 +1994,21 @@ def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
             continue
 
         # Check 0d: Text-to-duration ratio — catches ghosts that have low no_speech_prob
+        # Translate: English translations are structurally shorter than source audio
         seg_duration = seg["end"] - seg["start"]
         if seg_duration > 0:
             chars_per_sec = len(text) / seg_duration
-            if seg_duration > 15 and chars_per_sec < 1.0:
+            min_ratio_duration = 60 if is_translate else 15
+            min_chars_ratio = 0.1 if is_translate else 1.0
+            if seg_duration > min_ratio_duration and chars_per_sec < min_chars_ratio:
                 logger.warning(
                     "Hallucination filter: ghost (ratio) at %.1fs (%.0fs, %.2f c/s): %s...",
                     seg["start"], seg_duration, chars_per_sec, text[:60],
                 )
                 continue
-            if seg_duration > 120 and len(text) < 200:
+            mega_threshold = 300 if is_translate else 120
+            mega_min_chars = 10 if is_translate else 200
+            if seg_duration > mega_threshold and len(text) < mega_min_chars:
                 logger.warning(
                     "Hallucination filter: mega-ghost at %.1fs (%.0fs, %d chars): %s...",
                     seg["start"], seg_duration, len(text), text[:60],
@@ -2061,9 +2092,22 @@ def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
                 continue
 
         # Check 3b: Exact duplicate of any segment in the last 10
+        # Translate: backchannel responses ("Is that so?", "Really?") repeat
+        # legitimately — only filter if timestamps are also close
         if len(filtered) >= 2:
             recent_texts = {s["text"].strip().lower() for s in filtered[-10:]}
             if text.lower() in recent_texts:
+                if is_translate:
+                    is_time_dup = False
+                    for recent in filtered[-10:]:
+                        if (recent["text"].strip().lower() == text.lower()
+                                and abs(seg["start"] - recent["end"]) < 5.0):
+                            is_time_dup = True
+                            break
+                    if not is_time_dup:
+                        filtered.append(seg)
+                        prev_text = text
+                        continue  # Keep it — legitimate repeat at different time
                 logger.warning(
                     "Hallucination filter: near-dup (window) at %.1fs: %s...",
                     seg["start"], text[:60],
@@ -2072,9 +2116,13 @@ def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
 
         # Check 3c: Fuzzy near-duplicate within 30s (Jaccard word overlap)
         # large-v3 sometimes re-transcribes the same content 10-30s later
+        # Translate: skip for short phrases (≤5 words) — backchannel responses
+        # repeat legitimately. Use higher threshold for longer translated text.
         _is_fuzzy_dup = False
-        if len(filtered) >= 2 and len(text.split()) > 3 and len(text) > 15:
+        _skip_jaccard = is_translate and len(text.split()) <= 5
+        if not _skip_jaccard and len(filtered) >= 2 and len(text.split()) > 3 and len(text) > 15:
             text_words = set(text.lower().split())
+            jaccard_threshold = 0.85 if is_translate else 0.7
             for recent in filtered[-10:]:
                 recent_text = recent["text"].strip()
                 time_gap = abs(seg["start"] - recent["start"])
@@ -2083,7 +2131,7 @@ def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
                 recent_words = set(recent_text.lower().split())
                 if text_words and recent_words:
                     jaccard = len(text_words & recent_words) / len(text_words | recent_words)
-                    if jaccard > 0.7:
+                    if jaccard > jaccard_threshold:
                         logger.warning(
                             "Hallucination filter: fuzzy dup at %.1fs (%.0f%% similar to %.1fs): %s...",
                             seg["start"], jaccard * 100, recent["start"], text[:60],
@@ -2102,16 +2150,25 @@ def _filter_hallucinations(raw_segments: list[dict]) -> list[dict]:
     return filtered
 
 
-def _consolidate_segments(segments: list[dict], max_gap: float = 2.0) -> list[dict]:
+def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str = "transcribe") -> list[dict]:
     """Consolidate over-fragmented Whisper output into natural subtitle-length segments.
 
     Merges micro-segments (<0.5s), consecutive short fragments (1-3 words),
     and removes near-duplicate text within 30 seconds.
+
+    When task='translate', uses gentler merging to preserve short backchannel
+    responses ("Yes.", "Really?", "I see.") as separate segments.
     """
     if len(segments) <= 1:
         return segments
 
-    # ── Pass 1: Merge micro-segments (<0.5s) into neighbors ──
+    is_translate = (task == "translate")
+
+    # ── Pass 1: Merge micro-segments into neighbors ──
+    # Translate: only merge truly tiny segments (< 0.2s, single word)
+    micro_threshold = 0.2 if is_translate else 0.5
+    micro_max_words = 1 if is_translate else 3
+
     merged = []
     i = 0
     while i < len(segments):
@@ -2120,7 +2177,7 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0) -> list[di
         text = seg.get("text", "").strip()
 
         # Merge very short segment forward into next
-        if duration < 0.5 and len(text.split()) <= 3 and i + 1 < len(segments):
+        if duration < micro_threshold and len(text.split()) <= micro_max_words and i + 1 < len(segments):
             next_seg = segments[i + 1]
             gap = next_seg["start"] - seg["end"]
             if gap < max_gap:
@@ -2136,7 +2193,7 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0) -> list[di
                 continue
 
         # Merge very short segment backward into previous
-        if duration < 0.5 and len(text.split()) <= 3 and merged:
+        if duration < micro_threshold and len(text.split()) <= micro_max_words and merged:
             prev = merged[-1]
             gap = seg["start"] - prev["end"]
             if gap < max_gap:
@@ -2151,78 +2208,86 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0) -> list[di
         i += 1
 
     # ── Pass 2: Merge consecutive short fragments into sentences ──
-    consolidated = []
-    i = 0
-    while i < len(merged):
-        seg = dict(merged[i])
-        text = seg.get("text", "").strip()
-        words = text.split()
+    # Translate: skip this pass — short fragments are individual backchannel responses
+    if is_translate:
+        consolidated = merged
+    else:
+        consolidated = []
+        i = 0
+        while i < len(merged):
+            seg = dict(merged[i])
+            text = seg.get("text", "").strip()
+            words = text.split()
 
-        if len(words) <= 3 and i + 1 < len(merged):
-            combined_text = text
-            combined_end = seg["end"]
-            combined_words = list(seg.get("words", []) or [])
-            j = i + 1
+            if len(words) <= 3 and i + 1 < len(merged):
+                combined_text = text
+                combined_end = seg["end"]
+                combined_words = list(seg.get("words", []) or [])
+                j = i + 1
 
-            while j < len(merged):
-                next_seg = merged[j]
-                next_text = next_seg.get("text", "").strip()
-                gap = next_seg["start"] - combined_end
+                while j < len(merged):
+                    next_seg = merged[j]
+                    next_text = next_seg.get("text", "").strip()
+                    gap = next_seg["start"] - combined_end
 
-                if gap > max_gap:
-                    break
-                if len(combined_text.split()) + len(next_text.split()) > 15:
-                    break
-                if len(combined_text) + len(next_text) > 80:
-                    break
-                if len(next_text.split()) > 3 and len(combined_text.split()) > 3:
-                    break
-
-                combined_text = combined_text + " " + next_text
-                combined_end = next_seg["end"]
-                if next_seg.get("words"):
-                    combined_words.extend(next_seg["words"])
-                j += 1
-
-            if j > i + 1:
-                seg["end"] = combined_end
-                seg["text"] = combined_text
-                if combined_words:
-                    seg["words"] = combined_words
-                i = j
-                consolidated.append(seg)
-                continue
-
-        consolidated.append(seg)
-        i += 1
-
-    # ── Pass 3: Remove near-duplicate text within 30 seconds ──
-    deduped = []
-    for seg in consolidated:
-        text = seg.get("text", "").strip().lower()
-        is_dup = False
-
-        for recent in deduped[-10:]:
-            recent_text = recent.get("text", "").strip().lower()
-            time_gap = abs(seg["start"] - recent["start"])
-            if time_gap > 30:
-                continue
-            if len(text) > 10 and len(recent_text) > 10:
-                if text in recent_text or recent_text in text:
-                    is_dup = True
-                    break
-                words_a = set(text.split())
-                words_b = set(recent_text.split())
-                if words_a and words_b:
-                    jaccard = len(words_a & words_b) / len(words_a | words_b)
-                    if jaccard > 0.7:
-                        is_dup = True
+                    if gap > max_gap:
+                        break
+                    if len(combined_text.split()) + len(next_text.split()) > 15:
+                        break
+                    if len(combined_text) + len(next_text) > 80:
+                        break
+                    if len(next_text.split()) > 3 and len(combined_text.split()) > 3:
                         break
 
-        if is_dup:
-            logger.info("Consolidation: removed near-dup at %.1fs: %s", seg["start"], seg.get("text", "")[:60])
-            continue
-        deduped.append(seg)
+                    combined_text = combined_text + " " + next_text
+                    combined_end = next_seg["end"]
+                    if next_seg.get("words"):
+                        combined_words.extend(next_seg["words"])
+                    j += 1
+
+                if j > i + 1:
+                    seg["end"] = combined_end
+                    seg["text"] = combined_text
+                    if combined_words:
+                        seg["words"] = combined_words
+                    i = j
+                    consolidated.append(seg)
+                    continue
+
+            consolidated.append(seg)
+            i += 1
+
+    # ── Pass 3: Remove near-duplicate text within 30 seconds ──
+    # Translate: skip dedup pass — already handled by _filter_hallucinations
+    if is_translate:
+        deduped = consolidated
+    else:
+        deduped = []
+        for seg in consolidated:
+            text = seg.get("text", "").strip().lower()
+            is_dup = False
+
+            for recent in deduped[-10:]:
+                recent_text = recent.get("text", "").strip().lower()
+                time_gap = abs(seg["start"] - recent["start"])
+                if time_gap > 30:
+                    continue
+                if len(text) > 10 and len(recent_text) > 10:
+                    if text in recent_text or recent_text in text:
+                        is_dup = True
+                        break
+                    words_a = set(text.split())
+                    words_b = set(recent_text.split())
+                    if words_a and words_b:
+                        jaccard = len(words_a & words_b) / len(words_a | words_b)
+                        if jaccard > 0.7:
+                            is_dup = True
+                            break
+
+            if is_dup:
+                logger.info("Consolidation: removed near-dup at %.1fs: %s", seg["start"], seg.get("text", "")[:60])
+                continue
+            deduped.append(seg)
 
     removed = len(segments) - len(deduped)
     if removed > 0:

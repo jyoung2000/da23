@@ -382,8 +382,21 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             from backend.services.transcription import _last_detected_language
             whisper_lang = _last_detected_language.get("lang", "")
 
+            # If Whisper used task="translate", the transcript is already English
+            # regardless of the source language. Tell the corrector it's English
+            # so it doesn't apply Japanese-specific corrections to English text.
+            _source = job.language.strip().lower() if job.language else ""
+            if not _source:
+                _source = whisper_lang
+            _whisper_translated = (
+                job.subtitle_language
+                and job.subtitle_language.strip().lower() == "en"
+                and _source and _source != "en"
+            )
+            correction_lang = "en" if _whisper_translated else whisper_lang
+
             polished = await asyncio.wait_for(
-                correct_transcript(transcript, orchestrator, job_id=job_id, language=whisper_lang),
+                correct_transcript(transcript, orchestrator, job_id=job_id, language=correction_lang),
                 timeout=_correction_timeout,
             )
             await database.update_job_status(job_id, transcript=list(polished))
@@ -968,6 +981,17 @@ async def _run_analysis_inner(job_id: str):
         # This helps Whisper recognize proper nouns, technical terms, etc.
         import re
         initial_prompt_parts = []
+
+        # For translate tasks, prime the decoder for natural English output
+        if whisper_task == "translate":
+            audio_lang_label = job.language.strip().lower() if job.language else ""
+            if audio_lang_label == "ja" or not audio_lang_label:
+                translate_prompt = (
+                    "This is a casual Japanese conversation translated to natural English. "
+                    "Use complete sentences. Keep names as-is."
+                )
+                initial_prompt_parts.append(translate_prompt)
+
         if job.filename:
             name_clean = re.sub(r'\.[^.]+$', '', job.filename)
             name_clean = re.sub(r'[-_\[\](){}]', ' ', name_clean)
