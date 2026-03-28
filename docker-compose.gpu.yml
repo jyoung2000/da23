@@ -1,0 +1,30 @@
+# GPU override — use: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+      - GPU_ACCELERATION_ENABLED=true
+    devices:
+      # Intel/AMD VA-API support (passthrough DRI devices)
+      - /dev/dri:/dev/dri
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute]
+
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute]
