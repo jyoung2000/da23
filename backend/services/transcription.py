@@ -196,21 +196,38 @@ async def transcribe_audio_subprocess(
     if device == "cuda":
         vram_mb = _get_gpu_vram_mb()
         # Subprocess-exclusive VRAM requirements (model + beam + CUDA context)
+        # Lowered from original — subprocess has exclusive GPU, no competing CUDA contexts
         _VRAM_REQUIREMENTS = {
-            "large-v3": 4500,       # 3.5GB model + 0.5GB beam + 0.4GB context
-            "large-v3-turbo": 3800, # 3.0GB model + 0.5GB beam + 0.3GB context
-            "medium": 2400,         # 1.5GB model + 0.3GB beam + 0.2GB context + margin
-            "medium.en": 2400,
+            "large-v3": 4000,       # 3.1GB model + 0.4GB context + 0.5GB beam (was 4500)
+            "large-v3-turbo": 3500, # 2.8GB model + 0.4GB context (was 3800)
+            "medium": 2200,         # 1.5GB model + 0.3GB beam + 0.2GB context (was 2400)
+            "medium.en": 2200,
         }
         if model_name in _VRAM_REQUIREMENTS:
             min_vram = _VRAM_REQUIREMENTS[model_name]
+            user_explicitly_set = getattr(settings, 'WHISPER_MODEL_USER_SET', False)
+
             if 0 < vram_mb < min_vram:
-                logger.warning(
-                    "SUBPROCESS VRAM: '%s' needs ~%dMB but GPU has %dMB total. "
-                    "Downgrading to 'small'.",
-                    model_name, min_vram, vram_mb,
-                )
-                model_name = "small"
+                if user_explicitly_set:
+                    # User explicitly chose this model — DON'T downgrade.
+                    # Force beam_size=1 (greedy) to minimize VRAM usage.
+                    beam_size = 1
+                    logger.warning(
+                        "SUBPROCESS VRAM TIGHT: '%s' needs ~%dMB but GPU has %dMB. "
+                        "User explicitly selected this model — keeping it with beam=1 "
+                        "(greedy decode) to fit in VRAM.",
+                        model_name, min_vram, vram_mb,
+                    )
+                else:
+                    # Auto-selected model doesn't fit — downgrade to medium (NEVER small)
+                    logger.warning(
+                        "SUBPROCESS VRAM: '%s' needs ~%dMB but GPU has %dMB total. "
+                        "Downgrading to 'medium' (not small — medium has much better "
+                        "translation accuracy).",
+                        model_name, min_vram, vram_mb,
+                    )
+                    model_name = "medium"
+                    beam_size = min(beam_size, 3)
             else:
                 logger.info(
                     "SUBPROCESS VRAM OK: '%s' needs ~%dMB, GPU has %dMB (exclusive)",
@@ -296,16 +313,23 @@ async def transcribe_audio_subprocess(
             "--repetition-penalty", "1.1",
             "--no-repeat-ngram-size", "3",
             "--prompt-reset-on-temperature", "0.5",
-            # VAD fine-tuning — balanced for Japanese conversational audio
+            # VAD fine-tuning — same parameters for both transcribe and translate.
+            # Translate-specific overrides were removed: they caused more harm
+            # (capturing noise artifacts) than benefit.
             "--vad-min-silence-ms", "250" if task == "translate" else "300",
             "--vad-speech-pad-ms", "600",
-            "--vad-onset", "0.18" if task == "translate" else "0.15",
-            "--vad-min-speech-ms", "120" if task == "translate" else "100",
+            "--vad-onset", "0.15",
+            "--vad-min-speech-ms", "100",
         ]
         if vad_filter:
             cmd.append("--vad-filter")
         cmd.append("--word-timestamps")
-        cmd.append("--condition-on-previous")
+        # Disable condition_on_previous_text for translate tasks — conditioning
+        # propagates translation errors forward, causing chains of wrong phrases
+        if task != "translate":
+            cmd.append("--condition-on-previous")
+        else:
+            cmd.append("--no-condition-on-previous")
         if _is_cjk:
             cmd.append("--cjk")
         if language:
@@ -734,10 +758,10 @@ def _get_whisper_model():
             # medium (~1.5GB model + ~0.5GB beam/KV + ~0.3GB buffers = ~2.3GB peak)
             # needs ~3GB total to leave headroom for CUDA spikes on complex audio.
             _VRAM_REQUIREMENTS = {
-                "large-v3": 6000,       # ~3.5GB model alone
-                "large-v3-turbo": 5000, # ~3.0GB model alone
-                "medium": 3000,         # ~1.5GB model + ~0.5GB beam + ~0.3GB buffers
-                "medium.en": 3000,
+                "large-v3": 4000,       # ~3.5GB model alone (was 6000)
+                "large-v3-turbo": 3500, # ~3.0GB model alone (was 5000)
+                "medium": 2200,         # ~1.5GB model + ~0.5GB beam + ~0.3GB buffers (was 3000)
+                "medium.en": 2200,
             }
             if device == "cuda" and settings.WHISPER_MODEL in _VRAM_REQUIREMENTS:
                 # Try nvidia-smi first, fall back to PyTorch CUDA reporting
@@ -754,14 +778,23 @@ def _get_whisper_model():
                         pass
                 min_vram = _VRAM_REQUIREMENTS[settings.WHISPER_MODEL]
                 if 0 < vram_mb < min_vram:
-                    original = settings.WHISPER_MODEL
-                    settings.WHISPER_MODEL = "small"
-                    logger.warning(
-                        "AUTO-DOWNGRADE: Whisper '%s' needs ~%dMB VRAM but GPU only has %dMB. "
-                        "Downgrading to 'small' to prevent CUDA OOM on long audio. "
-                        "To use '%s', you need a GPU with %dMB+ VRAM.",
-                        original, min_vram, vram_mb, original, min_vram,
-                    )
+                    if getattr(settings, 'WHISPER_MODEL_USER_SET', False):
+                        # User explicitly chose — keep it, reduce beam
+                        logger.warning(
+                            "IN-PROCESS VRAM TIGHT: '%s' needs ~%dMB, GPU has %dMB. "
+                            "Keeping user's choice with beam=1.",
+                            settings.WHISPER_MODEL, min_vram, vram_mb,
+                        )
+                        whisper_device_info["recommended_beam_size"] = 1
+                    else:
+                        original = settings.WHISPER_MODEL
+                        settings.WHISPER_MODEL = "medium"  # NEVER small on GPU
+                        logger.warning(
+                            "AUTO-DOWNGRADE: Whisper '%s' needs ~%dMB VRAM but GPU only has %dMB. "
+                            "Downgrading to 'medium' (not small — medium has much better "
+                            "translation accuracy). To force '%s', select it in Settings.",
+                            original, min_vram, vram_mb, original,
+                        )
 
             # ── VRAM-aware beam size for inference ──
             # Estimate whether model + beam_size will fit in available VRAM.
@@ -842,8 +875,8 @@ def _get_whisper_model():
                     compute_type = "int8"
                     # Downgrade model for CPU — large models are too slow on CPU
                     if settings.WHISPER_MODEL in ("large-v3", "large-v3-turbo"):
-                        settings.WHISPER_MODEL = "small"
-                        logger.info("Downgraded Whisper model to 'small' for CPU fallback (large models too slow on CPU)")
+                        settings.WHISPER_MODEL = "medium"
+                        logger.info("Downgraded Whisper model to 'medium' for CPU fallback (large models too slow on CPU, medium has much better accuracy than small)")
                     whisper_device_info.update({"device": device, "compute_type": compute_type})
                     _whisper_model = WhisperModel(
                         settings.WHISPER_MODEL,
@@ -1241,7 +1274,7 @@ def _transcribe_sync(
         "beam_size": effective_beam,
         "best_of": effective_best_of,
         "vad_filter": settings.WHISPER_VAD_FILTER,
-        "condition_on_previous_text": True,
+        "condition_on_previous_text": (task != "translate"),
         "word_timestamps": True,
         "no_speech_threshold": 0.8,
         "log_prob_threshold": -1.5,

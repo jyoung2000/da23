@@ -1157,16 +1157,16 @@ async def _run_analysis_inner(job_id: str):
         if not result and audio_duration > 10:
             logger.error(
                 "[%s] Whisper returned 0 segments for %.0fs audio (model=%s) — "
-                "likely CTranslate2 silent OOM. Retrying with 'small' on GPU...",
+                "likely CTranslate2 silent OOM. Retrying with 'medium' on GPU...",
                 job_id, audio_duration, settings.WHISPER_MODEL,
             )
             await _update_branch_progress("transcription", 10, JobStatus.TRANSCRIBING,
-                "Transcription failed — retrying with smaller model on GPU...")
+                "Transcription failed — retrying with medium model on GPU...")
 
             original_model = settings.WHISPER_MODEL
             original_beam = settings.WHISPER_BEAM_SIZE
             try:
-                settings.WHISPER_MODEL = "small"
+                settings.WHISPER_MODEL = "medium"
                 settings.WHISPER_BEAM_SIZE = 1  # Greedy decode — lowest VRAM usage
                 result = await transcribe_audio_subprocess(
                     audio_path, language=job.language, task=whisper_task,
@@ -1174,17 +1174,17 @@ async def _run_analysis_inner(job_id: str):
                     progress_callback=_transcribe_progress,
                 )
                 logger.info(
-                    "[%s] Retry transcription (small/GPU) produced %d segments",
+                    "[%s] Retry transcription (medium/GPU) produced %d segments",
                     job_id, len(result),
                 )
             finally:
                 settings.WHISPER_MODEL = original_model
                 settings.WHISPER_BEAM_SIZE = original_beam
 
-            # If GPU retry with small also failed, try CPU as last resort
+            # If GPU retry with medium also failed, try CPU as last resort
             if not result and audio_duration > 10:
                 logger.error(
-                    "[%s] GPU retry with 'small' also returned 0 segments. "
+                    "[%s] GPU retry with 'medium' also returned 0 segments. "
                     "Trying CPU as last resort (may take %.0f minutes)...",
                     job_id, audio_duration / 60,
                 )
@@ -1193,7 +1193,7 @@ async def _run_analysis_inner(job_id: str):
 
                 original_gpu = settings.GPU_ACCELERATION_ENABLED
                 try:
-                    settings.WHISPER_MODEL = "small"
+                    settings.WHISPER_MODEL = "medium"
                     settings.WHISPER_BEAM_SIZE = 1
                     settings.GPU_ACCELERATION_ENABLED = False
                     result = await transcribe_audio_subprocess(
