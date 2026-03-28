@@ -587,11 +587,82 @@ async def _run_analysis_inner(job_id: str):
     _scene_phase_start = [0.0]  # set when scene analysis begins
     _scene_recent_timestamps: list[float] = []  # timestamps of recent frame completions
 
+    # Phase timing history — records (end_pct, elapsed_sec) for completed phases.
+    # Used to estimate remaining phases more accurately than hardcoded constants.
+    _phase_timings: dict[str, float] = {}  # phase_name → elapsed seconds
+    _transcription_phase_start = [0.0]  # set when transcription begins
+
+    # Last ETA value for smoothing (avoids jarring jumps)
+    _last_eta_value = [0.0]
+    _last_eta_time = [0.0]
+
     def _format_remaining(total_remaining: float) -> str:
         if total_remaining < 60:
             return f" — ~{int(total_remaining)}s remaining"
         m, s = divmod(int(total_remaining), 60)
         return f" — ~{m}m {s}s remaining"
+
+    def _smooth_eta(raw_eta: float) -> float:
+        """Smooth ETA to avoid jarring jumps between updates.
+
+        Uses exponential moving average: new_eta = 0.3 * raw + 0.7 * prev.
+        Resets if more than 30s have passed since last update (phase change).
+        """
+        now = _time.monotonic()
+        prev = _last_eta_value[0]
+        gap = now - _last_eta_time[0]
+
+        if prev <= 0 or gap > 30:
+            # First call or phase transition — use raw value
+            _last_eta_value[0] = raw_eta
+            _last_eta_time[0] = now
+            return raw_eta
+
+        # Exponential smoothing — heavily weight previous to reduce jitter
+        smoothed = 0.3 * raw_eta + 0.7 * prev
+        # Clamp: never increase by more than 20% in a single update
+        if smoothed > prev * 1.2 and prev > 30:
+            smoothed = prev * 1.05
+        _last_eta_value[0] = smoothed
+        _last_eta_time[0] = now
+        return smoothed
+
+    def _estimate_remaining_phases(current_phase: str) -> float:
+        """Estimate time for phases after current_phase using actual timings.
+
+        Phase order: extraction → transcription → scene_analysis → summary → clips → save
+        Uses actual measured times for completed phases to estimate remaining ones.
+        """
+        vid_min = metadata["duration"] / 60 if metadata.get("duration") else 10
+
+        # Rough per-phase estimates as fraction of video duration (minutes)
+        # These are defaults; replaced by actual timings when available.
+        _default_factors = {
+            "extraction": 0.04,       # ~4% of video duration
+            "transcription": 0.08,    # ~8% of video duration (GPU)
+            "scene_analysis": 0.20,   # ~20% of video duration (Ollama)
+            "summary": 0.03,          # ~3% of video duration
+            "clips": 0.08,            # ~8% of video duration
+            "save": 0.002,            # ~15s regardless
+        }
+        _phase_order = ["extraction", "transcription", "scene_analysis", "summary", "clips", "save"]
+
+        # Find which phases are after current
+        try:
+            current_idx = _phase_order.index(current_phase)
+        except ValueError:
+            current_idx = len(_phase_order)
+
+        remaining_secs = 0.0
+        for phase_name in _phase_order[current_idx + 1:]:
+            if phase_name in _phase_timings:
+                # Use actual timing from a completed phase of similar cost
+                remaining_secs += _phase_timings[phase_name]
+            else:
+                # Estimate from video duration
+                remaining_secs += vid_min * 60 * _default_factors.get(phase_name, 0.05)
+
+        return max(15, remaining_secs)
 
     def _pipeline_eta(current_pct):
         """Estimate remaining time based on progress.
@@ -603,7 +674,22 @@ async def _run_analysis_inner(job_id: str):
             return ""
         elapsed = _pipeline_elapsed()
 
-        # During scene analysis (15-62%), use sliding window ETA
+        # During transcription (15-40% in sequential mode), use transcription-local ETA
+        if 15 <= current_pct < 40 and _transcription_phase_start[0] > 0 and _scene_phase_start[0] == 0:
+            trans_elapsed = _time.monotonic() - _transcription_phase_start[0]
+            if trans_elapsed > 5:
+                # Transcription maps to 15-40% range (25 points)
+                trans_pct_done = current_pct - 15  # 0-25
+                if trans_pct_done > 1:
+                    trans_rate = trans_pct_done / trans_elapsed
+                    trans_remaining = max(0, (40 - current_pct) / trans_rate)
+                    # Add estimate for remaining phases
+                    after_trans = _estimate_remaining_phases("transcription")
+                    raw_eta = trans_remaining + after_trans
+                    return _format_remaining(_smooth_eta(raw_eta))
+
+        # During scene analysis (40-62% in sequential mode, or 15-62% concurrent),
+        # use sliding window ETA
         if 15 < current_pct < 62 and _scene_phase_start[0] > 0:
             now = _time.monotonic()
             _scene_recent_timestamps.append(now)
@@ -620,9 +706,22 @@ async def _run_analysis_inner(job_id: str):
                     phase_remaining_pct = 62 - current_pct
                     # Estimate remaining using recent rate (steps map roughly to pct)
                     scene_remaining = phase_remaining_pct / max(0.001, recent_rate)
-                    # Add estimate for remaining phases (clip detection + saving)
-                    total_remaining = scene_remaining + 120  # rough estimate for later phases
-                    return _format_remaining(total_remaining)
+                    # Add estimate for remaining phases using actual timings
+                    after_scenes = _estimate_remaining_phases("scene_analysis")
+                    raw_eta = scene_remaining + after_scenes
+                    return _format_remaining(_smooth_eta(raw_eta))
+
+        # During summary (65-75%), use phase-local estimate
+        if 65 <= current_pct < 75:
+            phase_elapsed = elapsed - sum(_phase_timings.get(p, 0) for p in ["extraction", "transcription", "scene_analysis"])
+            if phase_elapsed > 3:
+                phase_pct = current_pct - 65  # 0-10
+                if phase_pct > 0:
+                    phase_rate = phase_pct / max(1, phase_elapsed)
+                    summary_remaining = max(0, (75 - current_pct) / phase_rate)
+                    after_summary = _estimate_remaining_phases("summary")
+                    raw_eta = summary_remaining + after_summary
+                    return _format_remaining(_smooth_eta(raw_eta))
 
         # During clip detection (78-95%), use phase-local ETA
         if 78 <= current_pct <= 95 and _clips_phase_start[0] > 0:
@@ -636,16 +735,16 @@ async def _run_analysis_inner(job_id: str):
                 # Not enough data yet — rough estimate from video duration
                 vid_min = metadata["duration"] / 60 if metadata.get("duration") else 10
                 total_remaining = max(60, vid_min * 8)
-            return _format_remaining(total_remaining)
+            return _format_remaining(_smooth_eta(total_remaining))
 
-        # Default: global pipeline rate
+        # Default: global pipeline rate (used for transitions, early stages)
         if elapsed <= 0:
             return ""
         rate = current_pct / elapsed
         if rate <= 0:
             return ""
         remaining = max(0, (100 - current_pct) / rate)
-        return _format_remaining(remaining)
+        return _format_remaining(_smooth_eta(remaining))
 
     # Step 1 — Video Metadata (0-5%)
     cancel_check()
@@ -856,6 +955,7 @@ async def _run_analysis_inner(job_id: str):
                 "The video file may be very large or the container is under heavy load."
             )
     total_frames = len(frames)
+    _phase_timings["extraction"] = _pipeline_elapsed()
     logger.info("[%s] Extracted %d frames + audio track", job_id, total_frames)
     await _update_progress(
         job_id, JobStatus.EXTRACTING_FRAMES, 15,
@@ -886,11 +986,26 @@ async def _run_analysis_inner(job_id: str):
     async def _update_branch_progress(
         branch: str, branch_pct: float, status: str, message: str,
     ):
-        """Update progress from one concurrent branch, computing combined pipeline %."""
+        """Update progress from one concurrent branch, computing combined pipeline %.
+
+        In sequential mode (local GPU), transcription maps to 15-40% and scene
+        analysis maps to 40-62%, so each phase gets meaningful progress movement.
+        In concurrent mode, both branches share the 15-62% range equally.
+        """
         _branch_pct[branch] = min(100.0, branch_pct)
-        # Each branch contributes half the 15-62% range (23.5 points each)
-        combined = (_branch_pct["transcription"] + _branch_pct["scene_analysis"]) / 200
-        pipeline_pct = 15 + int(combined * 47)  # 15% to 62%
+
+        if _uses_local_gpu:
+            # Sequential mode: transcription = 15-40% (25 points), scenes = 40-62% (22 points)
+            if branch == "transcription":
+                pipeline_pct = 15 + int((_branch_pct["transcription"] / 100) * 25)
+            else:
+                # Scene analysis starts at 40% (where transcription ended)
+                pipeline_pct = 40 + int((_branch_pct["scene_analysis"] / 100) * 22)
+        else:
+            # Concurrent mode: each branch contributes half the 15-62% range
+            combined = (_branch_pct["transcription"] + _branch_pct["scene_analysis"]) / 200
+            pipeline_pct = 15 + int(combined * 47)
+
         eta = _pipeline_eta(pipeline_pct)
         await _update_progress(job_id, status, min(62, pipeline_pct), message + eta)
 
@@ -905,6 +1020,7 @@ async def _run_analysis_inner(job_id: str):
         # ── Pre-flight: verify Whisper model loads and CUDA works ──
         # This catches model download hangs, CUDA OOM, and corrupted models
         # BEFORE committing to a potentially hour-long transcription.
+        _transcription_phase_start[0] = _time.monotonic()
         from backend.services.transcription import preflight_whisper_check
         await _update_branch_progress("transcription", 2, JobStatus.TRANSCRIBING,
             f"Verifying Whisper model ({settings.WHISPER_MODEL})...")
@@ -1120,6 +1236,10 @@ async def _run_analysis_inner(job_id: str):
             diar_label = f"{speaker_count} speaker{'s' if speaker_count != 1 else ''} detected via neural (pyannote)"
         else:
             diar_label = f"{speaker_count} speaker{'s' if speaker_count != 1 else ''} detected via heuristic (pause-based)"
+        # Record phase timing for ETA estimation of remaining phases
+        if _transcription_phase_start[0] > 0:
+            _phase_timings["transcription"] = _time.monotonic() - _transcription_phase_start[0]
+
         await _update_branch_progress("transcription", 100, JobStatus.TRANSCRIBING,
             f"Transcribed {len(result)} segments \u2014 {diar_label}")
         return result
@@ -1170,6 +1290,7 @@ async def _run_analysis_inner(job_id: str):
 
         _scene_start = _time.monotonic()
         _scene_phase_start[0] = _scene_start
+        _last_eta_value[0] = 0.0  # Reset ETA smoothing for new phase
 
         async def _scene_progress(frames_done, frames_total, provider_name):
             pct = int((frames_done / max(frames_total, 1)) * 100)
@@ -1231,6 +1352,10 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Scene analysis: %d real + %d synthetic descriptions",
                 job_id, len(real_scenes), fake_count,
             )
+
+        # Record phase timing for ETA estimation of remaining phases
+        if _scene_phase_start[0] > 0:
+            _phase_timings["scene_analysis"] = _time.monotonic() - _scene_phase_start[0]
 
         await _update_branch_progress("scene_analysis", 100, JobStatus.ANALYZING_SCENES,
             f"Analyzed {len(real_scenes)} scenes via {provider}"
@@ -1652,6 +1777,10 @@ async def _run_analysis_inner(job_id: str):
         summary = VideoSummary(**fb)
         summary_provider = "none"
 
+    # Record summary phase timing
+    if _summary_start:
+        _phase_timings["summary"] = _time.monotonic() - _summary_start
+
     await _update_progress(
         job_id, JobStatus.GENERATING_SUMMARY, 75,
         f"Summary generated via {summary_provider} — now detecting viral clips...{_pipeline_eta(75)}",
@@ -1704,6 +1833,7 @@ async def _run_analysis_inner(job_id: str):
 
         _clips_start = _time.monotonic()
         _clips_phase_start[0] = _clips_start  # For phase-aware ETA
+        _last_eta_value[0] = 0.0  # Reset ETA smoothing for new phase
 
         # Scale clip count with video duration — use tier if available
         dynamic_clip_count = tier.max_clip_candidates
