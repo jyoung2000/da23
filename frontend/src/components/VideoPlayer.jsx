@@ -23,23 +23,40 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
   const videoRef = useRef(null);
   const containerRef = useRef(null);
   const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [displayTime, setDisplayTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(1);
   const [speed, setSpeed] = useState(1);
   const [hovered, setHovered] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
 
+  // Store callback in a ref to avoid re-registering event listeners when
+  // the parent passes a new function reference on each render.
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  onTimeUpdateRef.current = onTimeUpdate;
+
+  // Throttled display time updater — avoids re-rendering on every timeupdate
+  // event (~4x/sec). Instead, updates the display ~4x/sec via rAF batching.
+  const lastDisplayUpdateRef = useRef(0);
+
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     const onTime = () => {
-      setCurrentTime(video.currentTime);
-      onTimeUpdate?.(video.currentTime);
+      // Call the parent callback without triggering a re-render
+      onTimeUpdateRef.current?.(video.currentTime);
       // Auto-stop at clip end in preview mode
       if (clipEnd && video.currentTime >= clipEnd) {
         video.pause();
         setPlaying(false);
+        setDisplayTime(video.currentTime);
+        return;
+      }
+      // Throttle display updates to ~4x/sec (every 250ms)
+      const now = performance.now();
+      if (now - lastDisplayUpdateRef.current > 250) {
+        lastDisplayUpdateRef.current = now;
+        setDisplayTime(video.currentTime);
       }
     };
     const onDur = () => setDuration(video.duration);
@@ -49,7 +66,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       video.removeEventListener('timeupdate', onTime);
       video.removeEventListener('loadedmetadata', onDur);
     };
-  }, [clipEnd, onTimeUpdate]);
+  }, [clipEnd]);
 
   // Track fullscreen changes
   useEffect(() => {
@@ -67,6 +84,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     } else {
       video.pause();
       setPlaying(false);
+      setDisplayTime(video.currentTime);
     }
   };
 
@@ -76,13 +94,14 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     const rect = e.currentTarget.getBoundingClientRect();
     const pct = (e.clientX - rect.left) / rect.width;
     video.currentTime = pct * duration;
+    setDisplayTime(pct * duration);
   };
 
   const seekTo = (time) => {
     const video = videoRef.current;
     if (!video) return;
     video.currentTime = time;
-    setCurrentTime(time);
+    setDisplayTime(time);
   };
 
   // Expose seekTo and pause/getTime via window for cross-component control.
@@ -118,7 +137,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     initialTimeApplied.current = true;
     const doSeek = () => {
       video.currentTime = initialTime;
-      setCurrentTime(initialTime);
+      setDisplayTime(initialTime);
     };
     if (video.readyState >= 1) doSeek();
     else video.addEventListener('loadedmetadata', doSeek, { once: true });
@@ -129,7 +148,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     const video = videoRef.current;
     if (!video || clipStart === undefined || clipStart === null) return;
     video.currentTime = clipStart;
-    setCurrentTime(clipStart);
+    setDisplayTime(clipStart);
     video.play().then(() => setPlaying(true)).catch(() => {});
   }, [clipStart, clipEnd]);
 
@@ -151,7 +170,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     }
   };
 
-  const progress = duration ? (currentTime / duration) * 100 : 0;
+  const progress = duration ? (displayTime / duration) * 100 : 0;
 
   // Aspect ratio awareness — match ClipPreview / ClipSEO behavior
   const srcRatio = sourceWidth / sourceHeight;
@@ -387,7 +406,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
           </button>
 
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
-            {formatTime(currentTime)} / {formatTime(duration)}
+            {formatTime(displayTime)} / {formatTime(duration)}
           </span>
 
           <div style={{ flex: 1 }} />

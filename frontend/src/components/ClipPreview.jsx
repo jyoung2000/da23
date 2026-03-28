@@ -307,7 +307,10 @@ export default function ClipPreview({
   const SPEED_OPTIONS = [0.5, 1.0, 1.5, 2.0];
 
   const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(clipStart);
+  // Use a ref for the raw video time to avoid re-rendering on every timeupdate.
+  // Only the display time (throttled) triggers re-renders.
+  const currentTimeRef = useRef(clipStart);
+  const [displayTime, setDisplayTime] = useState(clipStart);
   const [volume, setVolume] = useState(initialVolume != null ? initialVolume / 100 : 1);
   const [speed, setSpeed] = useState(initialSpeed != null && initialSpeed > 0 ? initialSpeed : 1.0);
   const [hovered, setHovered] = useState(false);
@@ -317,7 +320,7 @@ export default function ClipPreview({
   const [isFullscreen, setIsFullscreen] = useState(false);
 
   const clipDur = clipEnd - clipStart;
-  const elapsed = Math.max(0, Math.min(clipDur, currentTime - clipStart));
+  const elapsed = Math.max(0, Math.min(clipDur, displayTime - clipStart));
   const progress = clipDur > 0 ? (elapsed / clipDur) * 100 : 0;
 
   const frameMode = useMemo(
@@ -397,6 +400,11 @@ export default function ClipPreview({
   }, []);
 
   // --- Seek to start and auto-play ---
+  // Use a ref-based timeupdate handler to avoid re-rendering the entire
+  // component ~4x/sec. The display time is updated via the rAF subtitle
+  // loop (throttled to ~250ms) which batches the state update with
+  // subtitle changes to minimize React re-renders.
+  const displayTimeRafRef = useRef(0);
   useEffect(() => {
     const video = fgVideoRef.current;
     if (!video) return;
@@ -407,7 +415,7 @@ export default function ClipPreview({
     };
 
     const onTimeUpdate = () => {
-      setCurrentTime(video.currentTime);
+      currentTimeRef.current = video.currentTime;
       if (clipEnd && video.currentTime >= clipEnd) {
         video.pause();
         setPlaying(false);
@@ -473,35 +481,94 @@ export default function ClipPreview({
     document.fonts.load(`700 16px "${font}"`).catch(() => {});
   }, [subtitleSettings?.subtitleFont]);
 
-  // --- Subtitle sync via requestAnimationFrame ---
+  // --- Subtitle sync + display time update via requestAnimationFrame ---
+  // This rAF loop handles two things:
+  // 1. Subtitle segment matching (only sets state when subtitle changes)
+  // 2. Display time updates for the seek bar (throttled to ~250ms)
+  // By batching both into one loop, we minimize React re-renders during playback.
   const activeWordEnabled = subtitleSettings?.activeWordEnabled || false;
   useEffect(() => {
-    if (!subtitlesEnabled || clipSegments.length === 0) {
-      setCurrentSubtitle(null);
-      setCurrentWordIdx(-1);
-      return;
-    }
     const video = fgVideoRef.current;
     if (!video) return;
 
+    // If subtitles are disabled, still run the display time updater
+    const hasSubtitles = subtitlesEnabled && clipSegments.length > 0;
+    if (!hasSubtitles) {
+      setCurrentSubtitle(null);
+      setCurrentWordIdx(-1);
+    }
+
     let animId;
+    let prevSubRef = null;     // Track previous subtitle by reference
     let prevWordIdx = -1;
+    let lastDisplayUpdate = 0; // Timestamp of last display time setState
+    // Use binary-search-friendly index hint for segment lookup
+    let lastSegIdx = 0;
+
     const tick = () => {
-      const relTime = video.currentTime - clipStart;
-      const active = clipSegments.find(
-        (seg) => seg.start <= relTime && relTime < seg.end,
-      );
-      setCurrentSubtitle(active || null);
-      if (active && activeWordEnabled) {
-        const idx = getCurrentWordIndex(active, relTime, speakerRates);
-        if (idx !== prevWordIdx) {
-          prevWordIdx = idx;
-          setCurrentWordIdx(idx);
+      const now = video.currentTime;
+      currentTimeRef.current = now;
+      const relTime = now - clipStart;
+
+      // --- Subtitle matching (only when subtitles enabled) ---
+      if (hasSubtitles) {
+        // Optimized segment lookup: start from last known index and scan
+        // forward/backward (segments are sorted by time). Falls back to
+        // linear scan if the hint is stale.
+        let active = null;
+        const segs = clipSegments;
+        const len = segs.length;
+        // Check last known segment first (common case: same segment)
+        if (lastSegIdx < len && segs[lastSegIdx].start <= relTime && relTime < segs[lastSegIdx].end) {
+          active = segs[lastSegIdx];
+        } else {
+          // Scan forward from hint
+          for (let i = lastSegIdx + 1; i < len; i++) {
+            if (segs[i].start <= relTime && relTime < segs[i].end) {
+              active = segs[i];
+              lastSegIdx = i;
+              break;
+            }
+            if (segs[i].start > relTime) break; // Past current time
+          }
+          // If not found forward, scan backward
+          if (!active) {
+            for (let i = Math.min(lastSegIdx, len - 1); i >= 0; i--) {
+              if (segs[i].start <= relTime && relTime < segs[i].end) {
+                active = segs[i];
+                lastSegIdx = i;
+                break;
+              }
+              if (segs[i].end <= relTime) break; // Before current time
+            }
+          }
         }
-      } else if (prevWordIdx !== -1) {
-        prevWordIdx = -1;
-        setCurrentWordIdx(-1);
+
+        // Only update React state when the active subtitle actually changes
+        if (active !== prevSubRef) {
+          prevSubRef = active;
+          setCurrentSubtitle(active || null);
+        }
+
+        if (active && activeWordEnabled) {
+          const idx = getCurrentWordIndex(active, relTime, speakerRates);
+          if (idx !== prevWordIdx) {
+            prevWordIdx = idx;
+            setCurrentWordIdx(idx);
+          }
+        } else if (prevWordIdx !== -1) {
+          prevWordIdx = -1;
+          setCurrentWordIdx(-1);
+        }
       }
+
+      // --- Throttled display time update for seek bar (~4 updates/sec) ---
+      const nowMs = performance.now();
+      if (nowMs - lastDisplayUpdate > 250) {
+        lastDisplayUpdate = nowMs;
+        setDisplayTime(now);
+      }
+
       animId = requestAnimationFrame(tick);
     };
     animId = requestAnimationFrame(tick);
@@ -602,11 +669,16 @@ export default function ClipPreview({
     const video = fgVideoRef.current;
     if (!video) return;
     if (video.paused) {
-      if (clipEnd && video.currentTime >= clipEnd) video.currentTime = clipStart;
+      if (clipEnd && video.currentTime >= clipEnd) {
+        video.currentTime = clipStart;
+        currentTimeRef.current = clipStart;
+      }
       video.play().then(() => setPlaying(true)).catch(() => {});
     } else {
       video.pause();
       setPlaying(false);
+      // Update display time immediately on pause so seek bar is accurate
+      setDisplayTime(video.currentTime);
     }
   }, [clipStart, clipEnd]);
 
@@ -619,7 +691,10 @@ export default function ClipPreview({
     if (!video || !bar || clipDur <= 0) return;
     const rect = bar.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    video.currentTime = clipStart + pct * clipDur;
+    const newTime = clipStart + pct * clipDur;
+    video.currentTime = newTime;
+    currentTimeRef.current = newTime;
+    setDisplayTime(newTime); // Immediate feedback while scrubbing
   }, [clipStart, clipDur]);
 
   const onSeekPointerDown = useCallback((e) => {
