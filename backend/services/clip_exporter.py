@@ -2388,19 +2388,36 @@ def _apply_dead_zone(
 def _smooth_keyframes_bidirectional(
     keyframes: list[tuple[float, int]],
     max_speed: float = 22.0,
+    src_ratio: float = 0,
+    target_ratio: float = 0,
 ) -> list[tuple[float, int]]:
     """Damped-lerp with hold-then-move for human-like camera motion.
 
     Mimics a professional camera operator: holds steady, then makes
     deliberate smooth reframes. No oscillation, no reactive tracking.
 
+    When src_ratio and target_ratio are provided, scales speed, hold time,
+    and ease factor for extreme aspect ratio conversions where the visible
+    crop window is narrow and the camera needs to be more responsive.
+
     Matches frontend smoothKeyframesBidirectional() exactly for preview-export parity.
     """
     if len(keyframes) <= 1:
         return list(keyframes)
 
-    MIN_HOLD_TIME = 0.3    # Seconds to hold before panning
-    EASE_FACTOR = 0.18     # Per-step lerp factor
+    # Scale smoothing parameters for extreme aspect ratio conversions
+    effective_max_speed = max_speed
+    hold_time = 0.3
+    ease_factor = 0.18
+    if src_ratio > 0 and target_ratio > 0:
+        R = src_ratio / target_ratio
+        if R > 1.5:
+            effective_max_speed = min(60, max_speed * math.sqrt(R))
+            hold_time = max(0.1, 0.3 / math.sqrt(R))
+            ease_factor = min(0.4, 0.18 * math.sqrt(R))
+
+    MIN_HOLD_TIME = hold_time
+    EASE_FACTOR = ease_factor
     dt_step = 0.016        # 16ms simulation step
 
     result = [keyframes[0]]
@@ -2435,9 +2452,9 @@ def _smooth_keyframes_bidirectional(
 
                 if abs_delta > 0.5:
                     movement = delta * EASE_FACTOR
-                    max_dist = max_speed * step
+                    max_dist = effective_max_speed * step
                     if abs(movement) > max_dist:
-                        movement = (1 if movement > 0 else -1) * max_speed * step
+                        movement = (1 if movement > 0 else -1) * effective_max_speed * step
                     pos += movement
                 else:
                     pos = target
@@ -2493,6 +2510,8 @@ def _merge_holds(
 def _compress_range(
     keyframes: list[tuple[float, int]],
     max_range: int = 30,
+    src_ratio: float = 0,
+    target_ratio: float = 0,
 ) -> list[tuple[float, int]]:
     """Compress the range of subject_x values to prevent erratic swinging.
 
@@ -2500,23 +2519,35 @@ def _compress_range(
     median so total motion stays within bounds.  Preserves relative timing
     and direction of motion — just reduces amplitude.
 
+    When src_ratio and target_ratio are provided, scales max_range up for
+    extreme aspect ratio conversions where the visible crop window is much
+    narrower than the source frame.
+
     Matches frontend compressRange() exactly for preview-export parity.
     """
     if len(keyframes) <= 1:
         return list(keyframes)
+
+    # Scale max_range based on aspect ratio magnification
+    effective_max_range = max_range
+    if src_ratio > 0 and target_ratio > 0:
+        R = src_ratio / target_ratio
+        if R > 1.01:
+            safe_lo, safe_hi = _compute_safe_range(src_ratio, target_ratio)
+            effective_max_range = max(max_range, safe_hi - safe_lo)
 
     xs = [kf[1] for kf in keyframes]
     min_x = min(xs)
     max_x = max(xs)
     current_range = max_x - min_x
 
-    if current_range <= max_range:
+    if current_range <= effective_max_range:
         return list(keyframes)
 
     # Compress toward median
     sorted_xs = sorted(xs)
     median = sorted_xs[len(sorted_xs) // 2]
-    scale = max_range / current_range
+    scale = effective_max_range / current_range
 
     result = []
     for t, sx in keyframes:
@@ -2524,8 +2555,8 @@ def _compress_range(
         result.append((t, new_sx))
 
     logger.info(
-        "[SubjectTracking] _compress_range: range %d→%d (max=%d), median=%d, compressed %d keyframes",
-        current_range, max_range, max_range, median, len(keyframes),
+        "[SubjectTracking] _compress_range: range %d→%d (effective_max=%d, base=%d), median=%d, compressed %d keyframes",
+        current_range, effective_max_range, effective_max_range, max_range, median, len(keyframes),
     )
 
     return result
@@ -2564,9 +2595,16 @@ def _build_crop_x_expr(
     if max_offset <= 0:
         return "0"
 
+    # Compute aspect ratio for safe clamping (closure over outer variables)
+    _expr_src_ratio = src_w / crop_w if crop_w > 0 else 0
+    # The target ratio for the crop window is 1.0 (crop_w is already target-sized)
+    # but we need the original source-to-target ratio for _safe_subject_x.
+    # Infer it: crop_w = src_h * target_ratio → target_ratio = crop_w / src_h
+    # src_ratio = src_w / src_h
+    # However, we don't have src_h here. Since the keyframes are already
+    # clamped by the pipeline, just pass the values through with centering.
     def _sx_to_offset(sx: int) -> int:
         """Convert subject_x to a centering crop offset with safety clamping."""
-        sx = _safe_subject_x(sx)
         if src_w > 0 and crop_w > 0:
             return _center_crop_offset(sx, src_w, crop_w)
         # Fallback to proportional if dimensions not provided
@@ -5052,10 +5090,10 @@ async def export_clip(
                 )
                 if len(raw_kf) > 1:
                     # Full pipeline: build → compress range → dead zone → scene cuts → damped-lerp smooth → merge holds
-                    after_compress = _compress_range(raw_kf)
+                    after_compress = _compress_range(raw_kf, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_dead_zone = _apply_dead_zone(after_compress, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_cuts = _handle_scene_cuts(after_dead_zone)
-                    after_smooth = _smooth_keyframes_bidirectional(after_cuts)
+                    after_smooth = _smooth_keyframes_bidirectional(after_cuts, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_holds = _merge_holds(after_smooth)
 
                     # Final bounds enforcement — clamp every keyframe to safe range

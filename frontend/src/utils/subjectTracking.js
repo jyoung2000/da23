@@ -7,7 +7,7 @@
  *
  * Processing pipeline (applied in order):
  *   1. buildSubjectKeyframes()        — raw (time, subject_x) pairs with DYNAMIC safe margin
- *   2. compressRange()                — limit total sx swing per clip toward median (maxRange=20)
+ *   2. compressRange()                — limit total sx swing per clip toward median (aspect-ratio-aware)
  *   3. applyDeadZone()                — anchor-based hold zone (eliminate drift, not movements)
  *   4. handleSceneCuts()              — insert 1ms instant-jump keyframes at hard cuts
  *   5. smoothKeyframesBidirectional() — damped-lerp with hold-then-move (maxSpeed=15)
@@ -191,29 +191,48 @@ export function handleSceneCuts(keyframes, jumpThreshold = 15) {
  * median so total motion stays within bounds. Preserves relative timing
  * and direction of motion — just reduces amplitude.
  *
- * A human editor typically keeps the crop within a narrow band for a
- * single clip, only making large reframes at clear shot changes.
+ * When aspect ratios are provided, the maxRange is scaled up proportionally
+ * to R (the magnification factor). At R=3.16 (16:9→9:16), the visible
+ * crop window is only ~32% of the source width, so the subject can
+ * legitimately span a wider sx range while still appearing within frame.
  *
  * Matches backend _compress_range() exactly for preview-export parity.
  *
  * @param {Array<{t: number, x: number}>} keyframes
- * @param {number} maxRange - Maximum allowed range of sx values (default 25)
+ * @param {number} maxRange - Maximum allowed range of sx values (default 30)
+ * @param {number|null} srcRatio - Source video aspect ratio (optional)
+ * @param {number|null} targetRatio - Target crop aspect ratio (optional)
  * @returns {Array<{t: number, x: number}>}
  */
-export function compressRange(keyframes, maxRange = 30) {
+export function compressRange(keyframes, maxRange = 30, srcRatio = null, targetRatio = null) {
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
+
+  // Scale maxRange based on aspect ratio magnification. When cropping to a
+  // narrower aspect ratio (e.g. 16:9→9:16), the visible window is much
+  // smaller than the source, so larger sx movement is needed to keep the
+  // subject centered. Without this, compressRange squashes tracking to a
+  // tiny band and the subject drifts out of frame.
+  let effectiveMaxRange = maxRange;
+  if (srcRatio && targetRatio) {
+    const R = srcRatio / targetRatio;
+    if (R > 1.01) {
+      // Scale up: allow the full safe range as max motion
+      const safeRange = computeSafeRange(srcRatio, targetRatio);
+      effectiveMaxRange = Math.max(maxRange, safeRange.max - safeRange.min);
+    }
+  }
 
   const xs = keyframes.map(k => k.x);
   const minX = Math.min(...xs);
   const maxX = Math.max(...xs);
   const currentRange = maxX - minX;
 
-  if (currentRange <= maxRange) return [...keyframes.map(k => ({ ...k }))];
+  if (currentRange <= effectiveMaxRange) return [...keyframes.map(k => ({ ...k }))];
 
   // Compress toward median
   const sorted = xs.slice().sort((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)];
-  const scale = maxRange / currentRange;
+  const scale = effectiveMaxRange / currentRange;
 
   return keyframes.map(k => ({
     t: k.t,
@@ -295,10 +314,12 @@ export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetR
  * Matches backend _smooth_keyframes_bidirectional() exactly for preview-export parity.
  *
  * @param {Array<{t: number, x: number}>} keyframes - Sorted keyframes
- * @param {number} maxSpeed - Maximum subject_x units per second (default 15)
+ * @param {number} maxSpeed - Maximum subject_x units per second (default 22)
+ * @param {number|null} srcRatio - Source video aspect ratio (optional)
+ * @param {number|null} targetRatio - Target crop aspect ratio (optional)
  * @returns {Array<{t: number, x: number}>} Smoothed keyframes
  */
-export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22) {
+export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio = null, targetRatio = null) {
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
 
   // Human camera operator model:
@@ -307,8 +328,26 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22) {
   // 3. Never exceed maxSpeed units per second
   // 4. When target changes significantly, re-enter hold period (deliberate, not reactive)
 
-  const MIN_HOLD_TIME = 0.3;   // Seconds to hold before panning
-  const EASE_FACTOR = 0.18;    // Per-step lerp factor (lower = smoother/slower)
+  // Scale smoothing parameters for extreme aspect ratio conversions.
+  // At high R values (e.g. 16:9→9:16, R=3.16), a small sx change produces
+  // a large visible crop movement. The camera needs to be more responsive
+  // (faster speed, shorter hold, higher ease factor) to keep the subject
+  // centered before they drift out of the narrow visible window.
+  let effectiveMaxSpeed = maxSpeed;
+  let holdTime = 0.3;
+  let easeFactor = 0.18;
+  if (srcRatio && targetRatio) {
+    const R = srcRatio / targetRatio;
+    if (R > 1.5) {
+      // Scale speed up with R — more magnification needs faster tracking
+      effectiveMaxSpeed = Math.min(60, maxSpeed * Math.sqrt(R));
+      holdTime = Math.max(0.1, 0.3 / Math.sqrt(R));
+      easeFactor = Math.min(0.4, 0.18 * Math.sqrt(R));
+    }
+  }
+
+  const MIN_HOLD_TIME = holdTime;
+  const EASE_FACTOR = easeFactor;
   const dt_step = 0.016;       // 16ms simulation step
 
   const result = [{ t: keyframes[0].t, x: keyframes[0].x }];
@@ -353,7 +392,7 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22) {
           let movement = delta * EASE_FACTOR;
 
           // Speed limit
-          const maxDist = maxSpeed * step;
+          const maxDist = effectiveMaxSpeed * step;
           if (Math.abs(movement) > maxDist) {
             movement = (movement > 0 ? 1 : -1) * maxDist;
           }
@@ -423,10 +462,10 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   if (!raw || raw.length <= 1) return raw;
 
   // NEW ORDER: compress → dead zone → scene cuts → smooth → merge holds
-  const afterCompress = compressRange(raw);
+  const afterCompress = compressRange(raw, 30, srcRatio, targetRatio);
   const afterDeadZone = applyDeadZone(afterCompress, 5, srcRatio, targetRatio);
   const afterCuts = handleSceneCuts(afterDeadZone);
-  const afterSmooth = smoothKeyframesBidirectional(afterCuts);
+  const afterSmooth = smoothKeyframesBidirectional(afterCuts, 22, srcRatio, targetRatio);
   const afterHolds = mergeHolds(afterSmooth);
 
   // Final bounds enforcement — ensure every keyframe x is clamped to [0, 100]
