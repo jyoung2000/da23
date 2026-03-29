@@ -105,8 +105,9 @@ def _restore_user_settings():
     """Load persisted settings and apply them to the settings object.
     Called once at module import time so saved API keys survive restarts.
 
-    For API keys: persisted real keys always override env-injected placeholders.
-    For other settings: persisted values override defaults and placeholders."""
+    API keys are ALWAYS restored from the persisted file — they take priority
+    over environment variables and defaults. This ensures user-entered keys
+    survive container recreate cycles where the .env file is lost."""
     if not os.path.exists(USER_SETTINGS_PATH):
         logger.info(f"No persisted settings found at {USER_SETTINGS_PATH}")
         return
@@ -120,26 +121,23 @@ def _restore_user_settings():
             # Bool/int types: always restore from persisted value
             if isinstance(val, (bool, int)):
                 setattr(settings, key, val)
-                logger.info(f"Restored setting: {key}={val}")
                 restored += 1
                 continue
             if not _is_real_value(key, val):
                 continue
-            current = getattr(settings, key, "")
-            # For API keys: always prefer a persisted real key over a placeholder
+            # For API keys: ALWAYS restore persisted real keys.
+            # The persisted value is the most recent user-entered key and
+            # should override env defaults, placeholders, and even env vars
+            # (the user explicitly saved via the UI after the env was set).
             if key in _API_KEY_FIELDS:
-                if not _is_real_value(key, current):
-                    setattr(settings, key, val)
-                    logger.info(f"Restored API key: {key} (was placeholder)")
-                    restored += 1
-                # If current is a real key (user set it via env), keep it
+                setattr(settings, key, val)
+                logger.info(f"Restored API key: {key}")
+                restored += 1
             else:
-                # For model/preset settings: override if current is default/empty
-                default = Settings.model_fields[key].default if key in Settings.model_fields else ""
-                if not current or current == default:
-                    setattr(settings, key, val)
-                    logger.info(f"Restored setting: {key}")
-                    restored += 1
+                # For model/preset settings: always restore persisted values.
+                # The persisted file represents the user's last explicit choice.
+                setattr(settings, key, val)
+                restored += 1
         logger.info(f"Restored {restored} persisted settings from {USER_SETTINGS_PATH}")
     except Exception as e:
         logger.warning(f"Failed to restore user settings from {USER_SETTINGS_PATH}: {e}")
@@ -1497,6 +1495,11 @@ async def save_models(req: SaveModelsRequest):
         (req.vision_model and req.vision_model.startswith("ollama/"))
         or (req.text_model and req.text_model.startswith("ollama/"))
     )
+    has_openrouter_models = (
+        (req.vision_model and not req.vision_model.startswith("ollama/") and req.vision_model)
+        or (req.text_model and not req.text_model.startswith("ollama/") and req.text_model)
+    )
+
     if has_ollama_models:
         chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
         if "ollama" not in chain:
@@ -1512,6 +1515,22 @@ async def save_models(req: SaveModelsRequest):
             if env_path:
                 _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
             logger.info("Moved Ollama to front of fallback chain (user selected Ollama models)")
+    elif has_openrouter_models:
+        # User selected OpenRouter models — ensure OpenRouter is in the chain
+        # and move it to the front so it's the primary provider
+        chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+        if "openrouter" not in chain:
+            chain.insert(0, "openrouter")
+            settings.AI_FALLBACK_CHAIN = ",".join(chain)
+            if env_path:
+                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
+            logger.info("Auto-enabled OpenRouter in fallback chain (user selected OpenRouter models)")
+        elif chain[0] != "openrouter":
+            chain = ["openrouter"] + [p for p in chain if p != "openrouter"]
+            settings.AI_FALLBACK_CHAIN = ",".join(chain)
+            if env_path:
+                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
+            logger.info("Moved OpenRouter to front of fallback chain (user selected OpenRouter models)")
 
     _invalidate_status_cache()
     _persist_user_settings()
