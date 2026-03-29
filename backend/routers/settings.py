@@ -1739,10 +1739,10 @@ async def get_gpu_acceleration():
     """
     from backend.services.clip_exporter import detect_gpu_capabilities
 
-    # Always detect GPUs so the UI can show all available devices,
-    # even when GPU acceleration is toggled off.
-    # Run in thread to avoid blocking the event loop (subprocess calls inside).
-    gpu_info = await asyncio.to_thread(detect_gpu_capabilities, force_redetect=True)
+    # Use cached detection result if available — the test-encode can fail
+    # transiently when Ollama is using the GPU. Only force re-detect when
+    # explicitly requested (POST toggle endpoint uses force_redetect=True).
+    gpu_info = await asyncio.to_thread(detect_gpu_capabilities, force_redetect=False)
 
     return {
         "enabled": settings.GPU_ACCELERATION_ENABLED,

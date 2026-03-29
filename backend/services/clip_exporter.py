@@ -268,16 +268,30 @@ def detect_gpu_capabilities(force_redetect: bool = False) -> dict:
             })
 
     # ── Step 2: Check CUDA for Whisper ──
-    try:
-        import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
-            info["cuda_available"] = True
-            info["whisper_device"] = "cuda"
-            if "whisper_cuda" not in info["capabilities"]:
-                info["capabilities"].append("whisper_cuda")
-            logger.info("CUDA available for Whisper transcription")
-    except Exception:
-        pass
+    # Use multiple methods — ctranslate2 and /dev/nvidia* device nodes.
+    # The main process may not have a working CUDA context, but the Whisper
+    # subprocess creates its own via CTranslate2 and can use CUDA fine.
+    if not info.get("cuda_available"):
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                info["cuda_available"] = True
+                info["whisper_device"] = "cuda"
+                if "whisper_cuda" not in info["capabilities"]:
+                    info["capabilities"].append("whisper_cuda")
+                logger.info("CUDA available for Whisper transcription (via CTranslate2)")
+        except Exception:
+            pass
+
+    # Fallback: if ctranslate2 CUDA check failed but /dev/nvidia* exists,
+    # Whisper can still use CUDA in subprocess mode (CTranslate2 creates its
+    # own CUDA context in the subprocess).
+    if not info.get("cuda_available") and nvidia_detected:
+        info["cuda_available"] = True
+        info["whisper_device"] = "cuda"
+        if "whisper_cuda" not in info["capabilities"]:
+            info["capabilities"].append("whisper_cuda")
+        logger.info("CUDA available for Whisper transcription (via /dev/nvidia* device nodes, subprocess mode)")
 
     # ── Step 3: Probe FFmpeg for available HW encoders ──
     available_encoders: set[str] = set()
@@ -401,7 +415,34 @@ def detect_gpu_capabilities(force_redetect: bool = False) -> dict:
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
             logger.debug("Encoder %s test error: %s", cfg["encoder"], e)
 
-    # No working GPU encoder — provide actionable guidance
+    # No working GPU encoder found via test-encode. If NVIDIA GPU was detected
+    # via device nodes, still report it as available — the test may have failed
+    # transiently because Ollama is using the GPU VRAM. The actual export will
+    # retry with the encoder and fail gracefully to CPU if needed.
+    if nvidia_detected and nvidia_gpus and "h264_nvenc" in available_encoders:
+        logger.warning(
+            "NVENC test-encode failed (GPU may be busy with Ollama) but h264_nvenc is "
+            "compiled into FFmpeg and /dev/nvidia* exists — reporting GPU as available"
+        )
+        info.update({
+            "vendor": "nvidia",
+            "encoder": "h264_nvenc",
+            "decoder": "h264_cuvid",
+            "hwaccel": "cuda",
+            "hwaccel_device": None,
+            "capabilities": ["encode_gpu", "decode_gpu"],
+        })
+        if info.get("cuda_available"):
+            info["capabilities"].append("whisper_cuda")
+        hevc_enc = "hevc_nvenc"
+        if hevc_enc in available_encoders:
+            info["hevc_encoder"] = hevc_enc
+            info["capabilities"].append("encode_hevc_gpu")
+        info["gpus"] = _detect_all_gpus()
+        _gpu_info = info
+        return info
+
+    # No working GPU encoder and no NVENC fallback — provide actionable guidance
     if nvidia_detected:
         # Check specifically what's missing
         missing_parts = []
