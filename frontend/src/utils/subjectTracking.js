@@ -259,46 +259,45 @@ export function compressRange(keyframes, maxRange = 30, srcRatio = null, targetR
 export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetRatio = null) {
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
 
-  // Compute effective threshold: we want ~3% of VISIBLE crop width as the dead zone
-  const VISIBLE_THRESHOLD = 5; // % of visible crop width
+  const VISIBLE_THRESHOLD = 5;
   let effectiveThreshold = threshold;
   if (srcRatio && targetRatio) {
     const R = srcRatio / targetRatio;
     if (R > 1.01) {
-      // Convert visible threshold back to source-frame units
       effectiveThreshold = Math.max(2, Math.round(VISIBLE_THRESHOLD * (R - 1) / R));
     }
   }
 
+  // Two-threshold hysteresis: higher to START moving, lower to STOP.
+  // This prevents the "move-pause-move" stutter from the old velocity-aware
+  // threshold that would trigger/untrigger on tiny velocity changes.
+  const engageThreshold = effectiveThreshold;
+  const disengageThreshold = effectiveThreshold * 0.5;
+
   const result = [{ ...keyframes[0] }];
-  let anchor = keyframes[0].x; // The position the camera is "committed to"
+  let anchor = keyframes[0].x;
+  let isTracking = false;
+
   for (let i = 1; i < keyframes.length; i++) {
     const cur = keyframes[i];
-    const prev = keyframes[i - 1];
-    const dt = cur.t - prev.t;
-    // Velocity-aware dead zone: reduce threshold when subject moves consistently
-    let actualThreshold = effectiveThreshold;
-    if (dt > 0) {
-      const velocity = (cur.x - prev.x) / dt;
-      let sameDirection = false;
-      if (i >= 2) {
-        const prevPrev = keyframes[i - 2];
-        const prevDt = prev.t - prevPrev.t;
-        if (prevDt > 0) {
-          const prevVelocity = (prev.x - prevPrev.x) / prevDt;
-          sameDirection = (velocity > 0 && prevVelocity > 0) || (velocity < 0 && prevVelocity < 0);
-        }
-      }
-      actualThreshold = effectiveThreshold * (sameDirection ? 0.6 : 1.0);
-    }
     const driftFromAnchor = Math.abs(cur.x - anchor);
-    if (driftFromAnchor >= actualThreshold) {
-      // Subject has drifted far enough from anchor — move to new position
-      result.push({ t: cur.t, x: cur.x });
-      anchor = cur.x; // Reset anchor to new committed position
+
+    if (!isTracking) {
+      if (driftFromAnchor >= engageThreshold) {
+        isTracking = true;
+        result.push({ t: cur.t, x: cur.x });
+        anchor = cur.x;
+      } else {
+        result.push({ t: cur.t, x: anchor });
+      }
     } else {
-      // Within dead zone of anchor — hold at anchor
-      result.push({ t: cur.t, x: anchor });
+      if (driftFromAnchor <= disengageThreshold) {
+        isTracking = false;
+        result.push({ t: cur.t, x: anchor });
+      } else {
+        result.push({ t: cur.t, x: cur.x });
+        anchor = cur.x;
+      }
     }
   }
 
@@ -322,38 +321,26 @@ export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetR
 export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio = null, targetRatio = null) {
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
 
-  // Human camera operator model:
-  // 1. Hold steady at current position for MIN_HOLD_TIME before any pan
-  // 2. Ease toward target with damped lerp (naturally decelerates near target)
-  // 3. Never exceed maxSpeed units per second
-  // 4. When target changes significantly, re-enter hold period (deliberate, not reactive)
-
-  // Scale smoothing parameters for extreme aspect ratio conversions.
-  // At high R values (e.g. 16:9→9:16, R=3.16), a small sx change produces
-  // a large visible crop movement. The camera needs to be more responsive
-  // (faster speed, shorter hold, higher ease factor) to keep the subject
-  // centered before they drift out of the narrow visible window.
   let effectiveMaxSpeed = maxSpeed;
   let holdTime = 0.3;
-  let easeFactor = 0.18;
+  let baseEaseFactor = 0.22;
   if (srcRatio && targetRatio) {
     const R = srcRatio / targetRatio;
     if (R > 1.5) {
-      // Scale speed up with R — more magnification needs faster tracking
       effectiveMaxSpeed = Math.min(60, maxSpeed * Math.sqrt(R));
-      holdTime = Math.max(0.1, 0.3 / Math.sqrt(R));
-      easeFactor = Math.min(0.4, 0.18 * Math.sqrt(R));
+      holdTime = Math.max(0.08, 0.25 / Math.sqrt(R));
+      baseEaseFactor = Math.min(0.45, 0.22 * Math.sqrt(R));
     }
   }
 
   const MIN_HOLD_TIME = holdTime;
-  const EASE_FACTOR = easeFactor;
-  const dt_step = 0.016;       // 16ms simulation step
+  const dt_step = 0.016;
 
   const result = [{ t: keyframes[0].t, x: keyframes[0].x }];
   let pos = keyframes[0].x;
-  let holdTimer = MIN_HOLD_TIME;   // Always start with a hold
+  let holdTimer = MIN_HOLD_TIME;
   let lastTarget = keyframes[0].x;
+  let lastDirection = 0; // Track movement direction: -1, 0, +1
 
   for (let i = 1; i < keyframes.length; i++) {
     const target = keyframes[i].x;
@@ -364,15 +351,19 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio 
       pos = target;
       holdTimer = MIN_HOLD_TIME;
       lastTarget = target;
+      lastDirection = 0;
       result.push({ t: keyframes[i].t, x: pos });
       continue;
     }
 
-    // If target changed significantly, reset hold timer (be deliberate)
-    if (Math.abs(target - lastTarget) > 3) {
+    // Only reset hold on DIRECTION REVERSAL, not on every target change.
+    // This prevents hold timer starvation during sustained movement.
+    const newDirection = target > lastTarget ? 1 : (target < lastTarget ? -1 : 0);
+    if (newDirection !== 0 && lastDirection !== 0 && newDirection !== lastDirection) {
       holdTimer = MIN_HOLD_TIME;
-      lastTarget = target;
     }
+    if (newDirection !== 0) lastDirection = newDirection;
+    lastTarget = target;
 
     // Simulate per-step
     let simTime = 0;
@@ -380,16 +371,17 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio 
       const step = Math.min(dt_step, segDt - simTime);
 
       if (holdTimer > 0) {
-        // During hold period — camera stays still
         holdTimer -= step;
       } else {
-        // Damped lerp toward target
         const delta = target - pos;
         const absDelta = Math.abs(delta);
 
         if (absDelta > 0.5) {
-          // Lerp produces natural deceleration (movement shrinks as pos approaches target)
-          let movement = delta * EASE_FACTOR;
+          // Distance-adaptive ease: farther = more responsive
+          const distFactor = Math.min(1, absDelta / 20);
+          const easeFactor = 0.12 + (baseEaseFactor - 0.12) * distFactor;
+
+          let movement = delta * easeFactor;
 
           // Speed limit
           const maxDist = effectiveMaxSpeed * step;
@@ -399,7 +391,6 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio 
 
           pos += movement;
         } else {
-          // Within 0.5 units — snap to target (sub-pixel, invisible)
           pos = target;
         }
       }
@@ -485,12 +476,16 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     }));
   }
 
-  // Check for near-convergence: if range < 5, collapse to static to avoid jitter
+  // Check for near-convergence: collapse to static to avoid jitter.
+  // Scale threshold by aspect ratio — at high R (narrow crop), small sx
+  // changes are very visible and should NOT be collapsed.
   if (result.length > 1) {
     const finalXs = result.map(kf => kf.x);
     const minX = Math.min(...finalXs);
     const maxX = Math.max(...finalXs);
-    if (maxX - minX < 5) {
+    const R = (srcRatio && targetRatio) ? srcRatio / targetRatio : 1;
+    const convergenceThreshold = R > 1.5 ? Math.max(2, Math.round(5 / R)) : 5;
+    if (maxX - minX < convergenceThreshold) {
       const medianX = finalXs.slice().sort((a, b) => a - b)[Math.floor(finalXs.length / 2)];
       return [{ t: 0, x: medianX }];
     }
@@ -603,11 +598,12 @@ export function subjectXToCenterPct(sx, srcRatio, targetRatio) {
   const R = srcRatio / targetRatio;
   if (R <= 1.01) return Math.max(0, Math.min(100, sx));
   const pct = (R * sx - 50) / (R - 1);
-
-  // HARD clamp: keep objectPosition in [EDGE_GUARD, 100-EDGE_GUARD]
-  // to prevent exposing baked-in pillarboxing from source video.
-  const EDGE_GUARD = 8;
-  return Math.max(EDGE_GUARD, Math.min(100 - EDGE_GUARD, pct));
+  // Clamp to [0, 100] only — no edge guard. The upstream safeSubjectX()
+  // pipeline already constrains sx to the safe range for the aspect ratio.
+  // Adding an edge guard here breaks preview-export parity because the
+  // backend _center_crop_offset() clamps to [0, max_offset] with no
+  // equivalent edge guard.
+  return Math.max(0, Math.min(100, pct));
 }
 
 /**

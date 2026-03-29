@@ -1386,7 +1386,7 @@ export default function VideoEditor({
     {
       const initRel = video.currentTime - (clipStart || 0);
       const initSx = interpolateSubjectX(subjectKeyframes, initRel);
-      const initPct = subjectXToCenterPct(initSx, srcRatio, targetRatio);
+      const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
       video.style.objectPosition = `${initPct}% 50%`;
       if (lastAppliedPctRef.current === null) lastAppliedPctRef.current = initPct;
     }
@@ -1401,7 +1401,7 @@ export default function VideoEditor({
       const sx = trackingOn
         ? interpolateSubjectX(subjectKeyframes, relTime)
         : (safeSubjectX ? safeSubjectX(subjectX) : subjectX);
-      let centerPct = subjectXToCenterPct(sx, srcRatio, targetRatio);
+      let centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
       // Smooth transition when aspect ratio just changed
       if (transitionStartRef.current !== null && lastAppliedPctRef.current !== null) {
         const elapsed = (performance.now() - transitionStartRef.current) / 1000;

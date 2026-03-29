@@ -2327,59 +2327,53 @@ def _apply_dead_zone(
     src_ratio: float = 0,
     target_ratio: float = 0,
 ) -> list[tuple[float, int]]:
-    """Eliminate jittery micro-movements by snapping small changes to previous value.
-
-    When aspect ratio info is provided, the threshold is computed dynamically
-    so it operates on VISIBLE crop movement (~3% of crop width) rather than
-    raw source-frame movement.
+    """Hysteresis dead zone — higher threshold to start, lower to stop.
 
     Matches frontend applyDeadZone() exactly for preview-export parity.
     """
     if len(keyframes) <= 1:
         return list(keyframes)
 
-    # Compute effective threshold: we want ~3% of VISIBLE crop width as the dead zone
-    VISIBLE_THRESHOLD = 5  # % of visible crop width
+    VISIBLE_THRESHOLD = 5
     effective_threshold = threshold
     if src_ratio > 0 and target_ratio > 0:
         R = src_ratio / target_ratio
         if R > 1.01:
-            # Convert visible threshold back to source-frame units
             effective_threshold = max(2, round(VISIBLE_THRESHOLD * (R - 1) / R))
 
+    engage_threshold = effective_threshold
+    disengage_threshold = effective_threshold * 0.5
+
     result = [keyframes[0]]
-    anchor = keyframes[0][1]  # The position the camera is "committed to"
+    anchor = keyframes[0][1]
+    is_tracking = False
     snapped_count = 0
+
     for i in range(1, len(keyframes)):
         t, sx = keyframes[i]
-        prev_t, prev_sx = keyframes[i - 1]
-        dt = t - prev_t
-        # Velocity-aware dead zone: reduce threshold when subject moves consistently
-        actual_threshold = effective_threshold
-        if dt > 0:
-            velocity = (sx - prev_sx) / dt
-            same_direction = False
-            if i >= 2:
-                prev_prev_t, prev_prev_sx = keyframes[i - 2]
-                prev_dt = prev_t - prev_prev_t
-                if prev_dt > 0:
-                    prev_velocity = (prev_sx - prev_prev_sx) / prev_dt
-                    same_direction = (velocity > 0 and prev_velocity > 0) or (velocity < 0 and prev_velocity < 0)
-            actual_threshold = effective_threshold * (0.6 if same_direction else 1.0)
         drift_from_anchor = abs(sx - anchor)
-        if drift_from_anchor >= actual_threshold:
-            # Subject has drifted far enough from anchor — move to new position
-            result.append((t, sx))
-            anchor = sx  # Reset anchor to new committed position
+
+        if not is_tracking:
+            if drift_from_anchor >= engage_threshold:
+                is_tracking = True
+                result.append((t, sx))
+                anchor = sx
+            else:
+                result.append((t, anchor))
+                snapped_count += 1
         else:
-            # Within dead zone of anchor — hold at anchor
-            result.append((t, anchor))
-            snapped_count += 1
+            if drift_from_anchor <= disengage_threshold:
+                is_tracking = False
+                result.append((t, anchor))
+                snapped_count += 1
+            else:
+                result.append((t, sx))
+                anchor = sx
 
     if snapped_count > 0:
         logger.info(
-            "[SubjectTracking] _apply_dead_zone: %d/%d keyframes snapped to anchor (effective_threshold=%d, base=%d)",
-            snapped_count, len(keyframes) - 1, effective_threshold, threshold,
+            "[SubjectTracking] _apply_dead_zone: %d/%d keyframes snapped (hysteresis engage=%d, disengage=%d)",
+            snapped_count, len(keyframes) - 1, engage_threshold, disengage_threshold,
         )
 
     return result
@@ -2393,37 +2387,29 @@ def _smooth_keyframes_bidirectional(
 ) -> list[tuple[float, int]]:
     """Damped-lerp with hold-then-move for human-like camera motion.
 
-    Mimics a professional camera operator: holds steady, then makes
-    deliberate smooth reframes. No oscillation, no reactive tracking.
-
-    When src_ratio and target_ratio are provided, scales speed, hold time,
-    and ease factor for extreme aspect ratio conversions where the visible
-    crop window is narrow and the camera needs to be more responsive.
-
     Matches frontend smoothKeyframesBidirectional() exactly for preview-export parity.
     """
     if len(keyframes) <= 1:
         return list(keyframes)
 
-    # Scale smoothing parameters for extreme aspect ratio conversions
     effective_max_speed = max_speed
     hold_time = 0.3
-    ease_factor = 0.18
+    base_ease_factor = 0.22
     if src_ratio > 0 and target_ratio > 0:
         R = src_ratio / target_ratio
         if R > 1.5:
             effective_max_speed = min(60, max_speed * math.sqrt(R))
-            hold_time = max(0.1, 0.3 / math.sqrt(R))
-            ease_factor = min(0.4, 0.18 * math.sqrt(R))
+            hold_time = max(0.08, 0.25 / math.sqrt(R))
+            base_ease_factor = min(0.45, 0.22 * math.sqrt(R))
 
     MIN_HOLD_TIME = hold_time
-    EASE_FACTOR = ease_factor
-    dt_step = 0.016        # 16ms simulation step
+    dt_step = 0.016
 
     result = [keyframes[0]]
     pos = float(keyframes[0][1])
     hold_timer = MIN_HOLD_TIME
     last_target = float(keyframes[0][1])
+    last_direction = 0  # Track movement direction: -1, 0, +1
 
     for i in range(1, len(keyframes)):
         target = float(keyframes[i][1])
@@ -2433,12 +2419,17 @@ def _smooth_keyframes_bidirectional(
             pos = target
             hold_timer = MIN_HOLD_TIME
             last_target = target
+            last_direction = 0
             result.append((keyframes[i][0], pos))
             continue
 
-        if abs(target - last_target) > 3:
+        # Only reset hold on DIRECTION REVERSAL
+        new_direction = 1 if target > last_target else (-1 if target < last_target else 0)
+        if new_direction != 0 and last_direction != 0 and new_direction != last_direction:
             hold_timer = MIN_HOLD_TIME
-            last_target = target
+        if new_direction != 0:
+            last_direction = new_direction
+        last_target = target
 
         sim_time = 0.0
         while sim_time < seg_dt:
@@ -2451,10 +2442,14 @@ def _smooth_keyframes_bidirectional(
                 abs_delta = abs(delta)
 
                 if abs_delta > 0.5:
-                    movement = delta * EASE_FACTOR
+                    # Distance-adaptive ease: farther = more responsive
+                    dist_factor = min(1.0, abs_delta / 20.0)
+                    ease_factor = 0.12 + (base_ease_factor - 0.12) * dist_factor
+
+                    movement = delta * ease_factor
                     max_dist = effective_max_speed * step
                     if abs(movement) > max_dist:
-                        movement = (1 if movement > 0 else -1) * effective_max_speed * step
+                        movement = (1 if movement > 0 else -1) * max_dist
                     pos += movement
                 else:
                     pos = target
@@ -2465,7 +2460,7 @@ def _smooth_keyframes_bidirectional(
         result.append((keyframes[i][0], pos))
 
     logger.info(
-        "[SubjectTracking] _smooth_keyframes_bidirectional: %d keyframes processed (max_speed=%.0f/s, damped-lerp + hold)",
+        "[SubjectTracking] _smooth_keyframes_bidirectional: %d keyframes processed (max_speed=%.0f/s, direction-aware hold + adaptive ease)",
         len(keyframes), max_speed,
     )
 
@@ -5124,12 +5119,14 @@ async def export_clip(
                         subject_x = converged_sx
                         keyframes = None
                     else:
-                        # Check for near-convergence: if the range is < 5, the motion
-                        # is imperceptible and will look like jitter, not tracking.
-                        # Collapse to static using the median value.
+                        # Check for near-convergence: collapse to static to avoid jitter.
+                        # Scale threshold by aspect ratio — at high R, small sx changes
+                        # are very visible and should NOT be collapsed.
                         kf_min = min(kf[1] for kf in keyframes)
                         kf_max = max(kf[1] for kf in keyframes)
-                        if kf_max - kf_min < 5:
+                        R_conv = _src_ratio / _target_ratio if _target_ratio > 0 else 1
+                        convergence_threshold = max(2, round(5 / R_conv)) if R_conv > 1.5 else 5
+                        if kf_max - kf_min < convergence_threshold:
                             median_sx = sorted(kf[1] for kf in keyframes)[len(keyframes) // 2]
                             logger.info(
                                 "[SubjectTracking] clip %s: keyframe range too small (%d-%d, Δ=%d) — "
