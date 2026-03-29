@@ -55,6 +55,63 @@ def _get_gpu_vram_mb() -> int:
     return 0
 
 
+def is_whisper_model_cached(model_name: str) -> bool:
+    """Check if a Whisper model is already downloaded/cached locally.
+
+    Returns True if the model files exist in the HuggingFace cache,
+    False if the model would need to be downloaded from HuggingFace.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        # faster-whisper models are stored as "Systran/faster-whisper-{model}"
+        repo_id = f"Systran/faster-whisper-{model_name}"
+        # Check for the model config file — if it's cached, the model is downloaded
+        result = try_to_load_from_cache(repo_id, "config.json")
+        return result is not None and not isinstance(result, type(None))
+    except ImportError:
+        # huggingface_hub not available — can't check
+        pass
+    except Exception:
+        pass
+    # Fallback: check if the model directory exists in the cache
+    try:
+        import os
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        # HuggingFace stores models as models--Systran--faster-whisper-{model}
+        model_dir = os.path.join(cache_dir, f"models--Systran--faster-whisper-{model_name}")
+        return os.path.isdir(model_dir)
+    except Exception:
+        return False
+
+
+def ensure_whisper_model_downloaded(model_name: str, timeout: float = 600) -> bool:
+    """Ensure a Whisper model is downloaded and cached locally.
+
+    If the model is not cached, downloads it from HuggingFace.
+    Returns True if the model is available, False if download failed.
+
+    This should be called BEFORE starting transcription to avoid
+    download timeouts inside the subprocess.
+    """
+    if is_whisper_model_cached(model_name):
+        logger.info("Whisper model '%s' is cached locally", model_name)
+        return True
+
+    logger.info("Whisper model '%s' not cached — downloading from HuggingFace (timeout=%ds)...", model_name, int(timeout))
+    try:
+        from faster_whisper import WhisperModel
+        # Load on CPU with int8 — minimal resources, just triggers download
+        m = WhisperModel(model_name, device="cpu", compute_type="int8")
+        del m
+        import gc
+        gc.collect()
+        logger.info("Whisper model '%s' downloaded and cached successfully", model_name)
+        return True
+    except Exception as e:
+        logger.error("Failed to download Whisper model '%s': %s", model_name, e)
+        return False
+
+
 async def preflight_whisper_check(timeout: float = 90) -> dict:
     """Quick pre-flight check that the Whisper model loads and CUDA works.
 

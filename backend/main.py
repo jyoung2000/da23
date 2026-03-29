@@ -277,7 +277,7 @@ async def _startup_preload():
             cfg.WHISPER_MODEL,
         )
         # Populate whisper_device_info for status display without loading the model
-        from backend.services.transcription import _detect_cuda_available, whisper_device_info
+        from backend.services.transcription import _detect_cuda_available, whisper_device_info, is_whisper_model_cached, ensure_whisper_model_downloaded
         try:
             cuda_ok, cuda_count, gpu_name, best_idx = _detect_cuda_available()
             if cuda_ok:
@@ -290,6 +290,13 @@ async def _startup_preload():
                 logger.info("Whisper will use GPU in subprocess: %s (float16)", gpu_name)
         except Exception:
             pass
+        # Pre-download the configured Whisper model in background if not cached.
+        # This ensures the model is ready when the user starts their first analysis.
+        if not is_whisper_model_cached(cfg.WHISPER_MODEL):
+            logger.info("Whisper model '%s' not cached — starting background download", cfg.WHISPER_MODEL)
+            def _bg_download():
+                ensure_whisper_model_downloaded(cfg.WHISPER_MODEL, timeout=600)
+            threading.Thread(target=_bg_download, daemon=True, name="whisper-startup-download").start()
     else:
         from backend.services.transcription import preload_model
         threading.Thread(target=preload_model, daemon=True).start()

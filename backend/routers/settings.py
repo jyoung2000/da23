@@ -777,6 +777,34 @@ class ToggleOllamaRequest(BaseModel):
     enabled: bool
 
 
+def _pre_download_whisper_model(model_name: str):
+    """Pre-download a Whisper model in a background thread.
+
+    faster-whisper downloads models from HuggingFace on first use. Without
+    pre-downloading, the first transcription attempt triggers a download
+    inside the subprocess, which can timeout and fail. This ensures the
+    model is cached locally before the user starts a video analysis.
+    """
+    import threading
+
+    def _do_download():
+        try:
+            logger.info("Whisper pre-download: downloading '%s' from HuggingFace...", model_name)
+            # Import and instantiate on CPU with int8 — minimal resources,
+            # just triggers the HuggingFace download to cache
+            from faster_whisper import WhisperModel
+            m = WhisperModel(model_name, device="cpu", compute_type="int8")
+            del m
+            import gc
+            gc.collect()
+            logger.info("Whisper pre-download: '%s' is now cached locally", model_name)
+        except Exception as e:
+            logger.warning("Whisper pre-download failed for '%s': %s", model_name, e)
+
+    t = threading.Thread(target=_do_download, daemon=True, name=f"whisper-download-{model_name}")
+    t.start()
+
+
 def _pull_ollama_models_background(models: list[str] | None = None):
     """Pull Ollama models in a background thread.
 
@@ -1480,9 +1508,14 @@ async def save_models(req: SaveModelsRequest):
             from backend.services.transcription import reload_model as reload_whisper
             reload_whisper()
             logger.info(
-                "Whisper model changed: '%s' → '%s' — model will reload on next use",
+                "Whisper model changed: '%s' → '%s' — triggering background download",
                 old_model, req.transcript_model,
             )
+            # Pre-download the new model in background so it's cached before
+            # the user starts a video analysis. Without this, the first
+            # transcription attempt downloads the model inside the subprocess,
+            # which can timeout and fail.
+            _pre_download_whisper_model(req.transcript_model)
 
     if req.vision_model:
         if req.vision_model.startswith("ollama/"):

@@ -1017,10 +1017,28 @@ async def _run_analysis_inner(job_id: str):
         cancel_check()
         lang_label = job.language if job.language else "auto-detect"
 
-        # ── Pre-flight: verify Whisper model loads and CUDA works ──
-        # This catches model download hangs, CUDA OOM, and corrupted models
-        # BEFORE committing to a potentially hour-long transcription.
+        # ── Ensure Whisper model is downloaded before starting ──
+        # Without this, the subprocess tries to download from HuggingFace
+        # during transcription, which can timeout and fail.
         _transcription_phase_start[0] = _time.monotonic()
+        from backend.services.transcription import preflight_whisper_check, is_whisper_model_cached, ensure_whisper_model_downloaded
+        if not is_whisper_model_cached(settings.WHISPER_MODEL):
+            await _update_branch_progress("transcription", 1, JobStatus.TRANSCRIBING,
+                f"Downloading Whisper model ({settings.WHISPER_MODEL})...")
+            logger.info("[%s] Whisper model '%s' not cached — downloading before transcription", job_id, settings.WHISPER_MODEL)
+            # Run download in thread to avoid blocking event loop
+            _dl_ok = await asyncio.get_event_loop().run_in_executor(
+                None, ensure_whisper_model_downloaded, settings.WHISPER_MODEL, 600,
+            )
+            if not _dl_ok:
+                raise RuntimeError(
+                    f"Failed to download Whisper model '{settings.WHISPER_MODEL}'. "
+                    f"Check network connectivity or try a smaller model in Settings."
+                )
+
+        # ── Pre-flight: verify Whisper model loads and CUDA works ──
+        # This catches CUDA OOM and corrupted models BEFORE committing
+        # to a potentially hour-long transcription.
         from backend.services.transcription import preflight_whisper_check
         await _update_branch_progress("transcription", 2, JobStatus.TRANSCRIBING,
             f"Verifying Whisper model ({settings.WHISPER_MODEL})...")
