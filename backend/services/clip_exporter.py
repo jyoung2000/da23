@@ -5192,22 +5192,18 @@ async def export_clip(
                         if is_sparse:
                             convergence_threshold = max(1, round(convergence_threshold * 0.6))
                         if kf_max - kf_min < convergence_threshold:
-                            # Time-weighted average: center on where subject spends most time
+                            # Use keyframe closest to clip midpoint — picks whichever
+                            # speaker the AI detected at the midpoint rather than
+                            # averaging (which would center on the gap between speakers).
                             if len(keyframes) <= 1:
                                 static_sx = keyframes[0][1]
                             else:
-                                total_weight = 0
-                                weighted_sum = 0
-                                for j, (t_j, sx_j) in enumerate(keyframes):
-                                    t_prev = keyframes[0][0] if j == 0 else (keyframes[j-1][0] + t_j) / 2
-                                    t_next = keyframes[-1][0] if j == len(keyframes)-1 else (t_j + keyframes[j+1][0]) / 2
-                                    weight = max(0.001, t_next - t_prev)
-                                    weighted_sum += sx_j * weight
-                                    total_weight += weight
-                                static_sx = round(weighted_sum / total_weight) if total_weight > 0 else keyframes[0][1]
+                                clip_mid_t = keyframes[len(keyframes) // 2][0]
+                                best_idx = min(range(len(keyframes)), key=lambda j: abs(keyframes[j][0] - clip_mid_t))
+                                static_sx = keyframes[best_idx][1]
                             logger.info(
                                 "[SubjectTracking] clip %s: keyframe range too small (%d-%d, Δ=%d) — "
-                                "collapsing to static sx=%d (time-weighted, sparse=%s) to avoid jitter",
+                                "collapsing to static sx=%d (midpoint, sparse=%s) to avoid jitter",
                                 clip_id, kf_min, kf_max, kf_max - kf_min, static_sx, is_sparse,
                             )
                             subject_x = static_sx

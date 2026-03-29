@@ -883,6 +883,21 @@ export default function VideoEditor({
     [isCrop, subjectKeyframes],
   );
 
+  // Tracking status for user feedback
+  const trackingStatus = useMemo(() => {
+    if (!isCrop) return null;
+    if (!scenes?.length) return { mode: 'no-data', label: 'No AI data', color: '#f59e0b' };
+    if (!subjectKeyframes?.length) return { mode: 'error', label: 'Tracking failed', color: '#ef4444' };
+    if (hasDynamicSubject) {
+      return { mode: 'dynamic', label: `Tracking (${subjectKeyframes.length} pts)`, color: '#10b981' };
+    }
+    const sx = subjectKeyframes[0].x;
+    if (Math.abs(sx - 50) < 3) {
+      return { mode: 'center', label: 'Centered', color: '#6b7280' };
+    }
+    return { mode: 'static', label: `Subject at ${sx}%`, color: '#3b82f6' };
+  }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject]);
+
   // ── Segment helpers ────────────────────────────────
   const getActiveSegment = useCallback((t) => {
     return segments.find(s => t >= s.start && t < s.end) || null;
@@ -2370,7 +2385,7 @@ export default function VideoEditor({
 
   const initialObjectPosition = isCrop
     ? `${subjectXToCenterPct(
-        hasDynamicSubject
+        (subjectKeyframes?.length >= 1)
           ? subjectKeyframes[0].x
           : (safeSubjectX ? safeSubjectX(subjectX, srcRatio, targetRatio) : subjectX),
         srcRatio,
@@ -2430,6 +2445,23 @@ export default function VideoEditor({
           }
         }}
       >
+        {/* Subject tracking status indicator */}
+        {trackingStatus && (
+          <div style={{
+            position: 'absolute', top: 8, right: 8, zIndex: 15,
+            display: 'flex', alignItems: 'center', gap: 5,
+            padding: '3px 8px', borderRadius: 6,
+            background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
+            fontSize: 11, color: '#e5e7eb', pointerEvents: 'none',
+          }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: '50%',
+              background: trackingStatus.color,
+              boxShadow: trackingStatus.mode === 'dynamic' ? `0 0 4px ${trackingStatus.color}` : 'none',
+            }} />
+            {trackingStatus.label}
+          </div>
+        )}
         <video
           ref={videoRef}
           src={src}

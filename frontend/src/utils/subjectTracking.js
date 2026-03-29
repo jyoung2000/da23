@@ -512,21 +512,23 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     // With sparse data, even small differences are meaningful — lower threshold
     if (isSparse) convergenceThreshold = Math.max(1, Math.round(convergenceThreshold * 0.6));
     if (maxX - minX < convergenceThreshold) {
-      // Time-weighted average: center on where subject spends most time
+      // Use the keyframe value closest to the clip midpoint — this gives
+      // the best static position for the most common playback moment.
+      // For two-speaker scenarios (e.g. sx=30 and sx=70), this picks
+      // whichever speaker the AI detected at the midpoint rather than
+      // averaging to 50 (the empty gap between them).
       let staticX;
       if (result.length <= 1) {
         staticX = result[0].x;
       } else {
-        let totalWeight = 0;
-        let weightedSum = 0;
+        const clipMid = result[Math.floor(result.length / 2)].t;
+        let bestIdx = 0;
+        let bestDist = Infinity;
         for (let j = 0; j < result.length; j++) {
-          const tPrev = j === 0 ? result[0].t : (result[j - 1].t + result[j].t) / 2;
-          const tNext = j === result.length - 1 ? result[result.length - 1].t : (result[j].t + result[j + 1].t) / 2;
-          const weight = Math.max(0.001, tNext - tPrev);
-          weightedSum += result[j].x * weight;
-          totalWeight += weight;
+          const dist = Math.abs(result[j].t - clipMid);
+          if (dist < bestDist) { bestDist = dist; bestIdx = j; }
         }
-        staticX = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : result[0].x;
+        staticX = result[bestIdx].x;
       }
       return [{ t: 0, x: staticX }];
     }
