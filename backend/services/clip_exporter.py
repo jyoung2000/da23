@@ -2334,15 +2334,15 @@ def _apply_dead_zone(
     if len(keyframes) <= 1:
         return list(keyframes)
 
-    VISIBLE_THRESHOLD = 5
+    VISIBLE_THRESHOLD = 6
     effective_threshold = threshold
     if src_ratio > 0 and target_ratio > 0:
         R = src_ratio / target_ratio
         if R > 1.01:
-            effective_threshold = max(2, round(VISIBLE_THRESHOLD * (R - 1) / R))
+            effective_threshold = max(3, round(VISIBLE_THRESHOLD * (R - 1) / R))
 
     engage_threshold = effective_threshold
-    disengage_threshold = effective_threshold * 0.5
+    disengage_threshold = max(1, round(effective_threshold * 0.4))
 
     result = [keyframes[0]]
     anchor = keyframes[0][1]
@@ -2385,74 +2385,90 @@ def _smooth_keyframes_bidirectional(
     src_ratio: float = 0,
     target_ratio: float = 0,
 ) -> list[tuple[float, int]]:
-    """Damped-lerp with hold-then-move for human-like camera motion.
+    """Hold-then-snap smoother for human-edited camera feel.
+
+    Holds camera COMPLETELY STILL until the subject drifts far enough to
+    warrant a reframe, then snaps FAST (200-400ms) with ease-out curve.
+    Pattern: HOLD -> SNAP -> HOLD -> SNAP (never continuous drift).
 
     Matches frontend smoothKeyframesBidirectional() exactly for preview-export parity.
     """
     if len(keyframes) <= 1:
         return list(keyframes)
 
+    # Scale parameters for aspect ratio magnification
+    reframe_threshold = 8
+    reframe_duration = 0.30
     effective_max_speed = max_speed
-    hold_time = 0.3
-    base_ease_factor = 0.22
+
     if src_ratio > 0 and target_ratio > 0:
         R = src_ratio / target_ratio
         if R > 1.5:
-            effective_max_speed = min(60, max_speed * math.sqrt(R))
-            hold_time = max(0.08, 0.25 / math.sqrt(R))
-            base_ease_factor = min(0.45, 0.22 * math.sqrt(R))
+            reframe_threshold = max(3, round(8 / math.sqrt(R)))
+            reframe_duration = max(0.15, 0.30 / math.sqrt(R))
+            effective_max_speed = min(80, max_speed * math.sqrt(R))
 
-    MIN_HOLD_TIME = hold_time
     dt_step = 0.016
-
     result = [keyframes[0]]
+    hold_pos = float(keyframes[0][1])
     pos = float(keyframes[0][1])
-    hold_timer = MIN_HOLD_TIME
-    last_target = float(keyframes[0][1])
-    last_direction = 0  # Track movement direction: -1, 0, +1
+    reframing = False
+    reframe_target = float(keyframes[0][1])
+    reframe_progress = 0.0
+    reframe_start_pos = float(keyframes[0][1])
+    last_direction = 0
 
     for i in range(1, len(keyframes)):
         target = float(keyframes[i][1])
         seg_dt = keyframes[i][0] - keyframes[i - 1][0]
 
         if seg_dt <= 0.002:
+            # Scene cut — instant snap
             pos = target
-            hold_timer = MIN_HOLD_TIME
-            last_target = target
+            hold_pos = target
+            reframing = False
+            reframe_progress = 0.0
             last_direction = 0
             result.append((keyframes[i][0], pos))
             continue
 
-        # Only reset hold on DIRECTION REVERSAL
-        new_direction = 1 if target > last_target else (-1 if target < last_target else 0)
-        if new_direction != 0 and last_direction != 0 and new_direction != last_direction:
-            hold_timer = MIN_HOLD_TIME
+        # Track direction for hold-on-reversal logic
+        new_direction = 1 if target > hold_pos else (-1 if target < hold_pos else 0)
+
+        # Decide whether to start a reframe
+        drift_from_hold = abs(target - hold_pos)
+        if not reframing and drift_from_hold >= reframe_threshold:
+            reframing = True
+            reframe_target = target
+            reframe_start_pos = pos
+            reframe_progress = 0.0
+        elif reframing:
+            # Already reframing — update target if same direction
+            if new_direction != 0 and last_direction != 0 and new_direction != last_direction:
+                pass  # Direction reversed mid-reframe — finish current, don't chase
+            else:
+                reframe_target = target
+
         if new_direction != 0:
             last_direction = new_direction
-        last_target = target
 
+        # Simulate movement
         sim_time = 0.0
         while sim_time < seg_dt:
             step = min(dt_step, seg_dt - sim_time)
 
-            if hold_timer > 0:
-                hold_timer -= step
-            else:
-                delta = target - pos
-                abs_delta = abs(delta)
+            if reframing:
+                reframe_progress += step / reframe_duration
 
-                if abs_delta > 0.5:
-                    # Distance-adaptive ease: farther = more responsive
-                    dist_factor = min(1.0, abs_delta / 20.0)
-                    ease_factor = 0.12 + (base_ease_factor - 0.12) * dist_factor
-
-                    movement = delta * ease_factor
-                    max_dist = effective_max_speed * step
-                    if abs(movement) > max_dist:
-                        movement = (1 if movement > 0 else -1) * max_dist
-                    pos += movement
+                if reframe_progress >= 1.0:
+                    pos = reframe_target
+                    hold_pos = reframe_target
+                    reframing = False
+                    reframe_progress = 0.0
                 else:
-                    pos = target
+                    # Ease-out: 1 - (1-t)^3
+                    eased = 1.0 - (1.0 - min(1.0, reframe_progress)) ** 3
+                    pos = reframe_start_pos + (reframe_target - reframe_start_pos) * eased
 
             sim_time += step
 
@@ -2460,8 +2476,8 @@ def _smooth_keyframes_bidirectional(
         result.append((keyframes[i][0], pos))
 
     logger.info(
-        "[SubjectTracking] _smooth_keyframes_bidirectional: %d keyframes processed (max_speed=%.0f/s, direction-aware hold + adaptive ease)",
-        len(keyframes), max_speed,
+        "[SubjectTracking] _smooth_keyframes_bidirectional: %d keyframes processed (hold-then-snap, reframe_threshold=%d, reframe_duration=%.2fs)",
+        len(keyframes), reframe_threshold, reframe_duration,
     )
 
     return result

@@ -259,20 +259,20 @@ export function compressRange(keyframes, maxRange = 30, srcRatio = null, targetR
 export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetRatio = null) {
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
 
-  const VISIBLE_THRESHOLD = 5;
+  // We want about 3-4% of VISIBLE crop width as the dead zone
+  const VISIBLE_THRESHOLD = 6;
   let effectiveThreshold = threshold;
   if (srcRatio && targetRatio) {
     const R = srcRatio / targetRatio;
     if (R > 1.01) {
-      effectiveThreshold = Math.max(2, Math.round(VISIBLE_THRESHOLD * (R - 1) / R));
+      effectiveThreshold = Math.max(3, Math.round(VISIBLE_THRESHOLD * (R - 1) / R));
     }
   }
 
-  // Two-threshold hysteresis: higher to START moving, lower to STOP.
-  // This prevents the "move-pause-move" stutter from the old velocity-aware
-  // threshold that would trigger/untrigger on tiny velocity changes.
+  // Two-threshold hysteresis: must exceed threshold to START tracking,
+  // must drop below 40% to STOP tracking. This eliminates stutter.
   const engageThreshold = effectiveThreshold;
-  const disengageThreshold = effectiveThreshold * 0.5;
+  const disengageThreshold = Math.max(1, Math.round(effectiveThreshold * 0.4));
 
   const result = [{ ...keyframes[0] }];
   let anchor = keyframes[0].x;
@@ -305,10 +305,14 @@ export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetR
 }
 
 /**
- * Damped-lerp with hold-then-move for human-like camera motion.
+ * Hold-then-snap smoother for human-edited camera feel.
  *
- * Mimics a professional camera operator: holds steady, then makes
- * deliberate smooth reframes. No oscillation, no reactive tracking.
+ * Instead of continuously drifting toward the target (damped-lerp),
+ * this holds the camera COMPLETELY STILL until the subject drifts far
+ * enough to warrant a reframe, then snaps FAST (200-400ms) to the new
+ * position with an ease-out curve (fast start, gentle landing).
+ *
+ * Pattern: HOLD → SNAP → HOLD → SNAP (never continuous drift)
  *
  * Matches backend _smooth_keyframes_bidirectional() exactly for preview-export parity.
  *
@@ -321,79 +325,90 @@ export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetR
 export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio = null, targetRatio = null) {
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
 
+  // Scale parameters for aspect ratio magnification
+  let reframeThreshold = 8;   // Must drift this far from hold to trigger reframe
+  let reframeDuration = 0.30; // How long a reframe takes (seconds)
   let effectiveMaxSpeed = maxSpeed;
-  let holdTime = 0.3;
-  let baseEaseFactor = 0.22;
+
   if (srcRatio && targetRatio) {
     const R = srcRatio / targetRatio;
     if (R > 1.5) {
-      effectiveMaxSpeed = Math.min(60, maxSpeed * Math.sqrt(R));
-      holdTime = Math.max(0.08, 0.25 / Math.sqrt(R));
-      baseEaseFactor = Math.min(0.45, 0.22 * Math.sqrt(R));
+      // Narrower crop = smaller movements are more visible
+      reframeThreshold = Math.max(3, Math.round(8 / Math.sqrt(R)));
+      reframeDuration = Math.max(0.15, 0.30 / Math.sqrt(R));
+      effectiveMaxSpeed = Math.min(80, maxSpeed * Math.sqrt(R));
     }
   }
 
-  const MIN_HOLD_TIME = holdTime;
   const dt_step = 0.016;
-
   const result = [{ t: keyframes[0].t, x: keyframes[0].x }];
-  let pos = keyframes[0].x;
-  let holdTimer = MIN_HOLD_TIME;
-  let lastTarget = keyframes[0].x;
-  let lastDirection = 0; // Track movement direction: -1, 0, +1
+  let holdPos = keyframes[0].x;       // Where the camera is holding
+  let pos = keyframes[0].x;            // Current actual position
+  let reframing = false;                // Are we mid-reframe?
+  let reframeTarget = keyframes[0].x;
+  let reframeProgress = 0;             // 0 to 1 progress through current reframe
+  let reframeStartPos = keyframes[0].x;
+  let lastDirection = 0;
 
   for (let i = 1; i < keyframes.length; i++) {
     const target = keyframes[i].x;
     const segDt = keyframes[i].t - keyframes[i - 1].t;
 
     if (segDt <= 0.002) {
-      // Instant cut (scene cut keyframes are 1ms apart) — snap, reset hold
+      // Scene cut — instant snap, no smoothing
       pos = target;
-      holdTimer = MIN_HOLD_TIME;
-      lastTarget = target;
+      holdPos = target;
+      reframing = false;
+      reframeProgress = 0;
       lastDirection = 0;
       result.push({ t: keyframes[i].t, x: pos });
       continue;
     }
 
-    // Only reset hold on DIRECTION REVERSAL, not on every target change.
-    // This prevents hold timer starvation during sustained movement.
-    const newDirection = target > lastTarget ? 1 : (target < lastTarget ? -1 : 0);
-    if (newDirection !== 0 && lastDirection !== 0 && newDirection !== lastDirection) {
-      holdTimer = MIN_HOLD_TIME;
-    }
-    if (newDirection !== 0) lastDirection = newDirection;
-    lastTarget = target;
+    // Track direction for hold-on-reversal logic
+    const newDirection = target > holdPos ? 1 : (target < holdPos ? -1 : 0);
 
-    // Simulate per-step
+    // Decide whether to start a reframe
+    const driftFromHold = Math.abs(target - holdPos);
+    if (!reframing && driftFromHold >= reframeThreshold) {
+      // Subject has drifted far enough — commit to a reframe
+      reframing = true;
+      reframeTarget = target;
+      reframeStartPos = pos;
+      reframeProgress = 0;
+    } else if (reframing) {
+      // Already reframing — update target if same direction, else keep current
+      if (newDirection !== 0 && lastDirection !== 0 && newDirection !== lastDirection) {
+        // Direction reversed mid-reframe — finish current reframe, don't chase
+      } else {
+        reframeTarget = target;
+      }
+    }
+
+    if (newDirection !== 0) lastDirection = newDirection;
+
+    // Simulate movement over this segment
     let simTime = 0;
     while (simTime < segDt) {
       const step = Math.min(dt_step, segDt - simTime);
 
-      if (holdTimer > 0) {
-        holdTimer -= step;
-      } else {
-        const delta = target - pos;
-        const absDelta = Math.abs(delta);
+      if (reframing) {
+        // Move DECISIVELY toward target using ease-out (fast start, gentle end)
+        reframeProgress += step / reframeDuration;
 
-        if (absDelta > 0.5) {
-          // Distance-adaptive ease: farther = more responsive
-          const distFactor = Math.min(1, absDelta / 20);
-          const easeFactor = 0.12 + (baseEaseFactor - 0.12) * distFactor;
-
-          let movement = delta * easeFactor;
-
-          // Speed limit
-          const maxDist = effectiveMaxSpeed * step;
-          if (Math.abs(movement) > maxDist) {
-            movement = (movement > 0 ? 1 : -1) * maxDist;
-          }
-
-          pos += movement;
+        if (reframeProgress >= 1.0) {
+          // Reframe complete — lock into new hold
+          pos = reframeTarget;
+          holdPos = reframeTarget;
+          reframing = false;
+          reframeProgress = 0;
         } else {
-          pos = target;
+          // Ease-out curve: 1 - (1-t)^3 — fast start, smooth deceleration
+          const eased = 1 - Math.pow(1 - Math.min(1, reframeProgress), 3);
+          pos = reframeStartPos + (reframeTarget - reframeStartPos) * eased;
         }
       }
+      // When NOT reframing, pos stays at holdPos — camera is locked still
 
       simTime += step;
     }
