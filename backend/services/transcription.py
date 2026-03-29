@@ -150,11 +150,20 @@ async def preflight_whisper_check(timeout: float = 90) -> dict:
         ]
         logger.info("Whisper preflight check: model=%s device=%s timeout=%ds", model_name, device, int(timeout))
 
+        # Restore real CUDA_VISIBLE_DEVICES for the subprocess so it can use the GPU.
+        # The main process hides CUDA to prevent PyTorch from poisoning the driver.
+        _subprocess_env = {**os.environ}
+        _real_cuda = os.environ.get("_CLIPAI_REAL_CUDA_VISIBLE_DEVICES")
+        if _real_cuda is not None:
+            _subprocess_env["CUDA_VISIBLE_DEVICES"] = _real_cuda
+        elif "CUDA_VISIBLE_DEVICES" in _subprocess_env and _subprocess_env["CUDA_VISIBLE_DEVICES"] == "":
+            del _subprocess_env["CUDA_VISIBLE_DEVICES"]
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ},
+            env=_subprocess_env,
         )
 
         try:
@@ -398,11 +407,20 @@ async def transcribe_audio_subprocess(
 
         logger.info("Starting Whisper subprocess: model=%s device=%s", model_name, device)
 
+        # Restore real CUDA_VISIBLE_DEVICES for the subprocess so it can use the GPU.
+        # The main process hides CUDA to prevent PyTorch from poisoning the driver.
+        _subprocess_env = {**os.environ}
+        _real_cuda = os.environ.get("_CLIPAI_REAL_CUDA_VISIBLE_DEVICES")
+        if _real_cuda is not None:
+            _subprocess_env["CUDA_VISIBLE_DEVICES"] = _real_cuda
+        elif "CUDA_VISIBLE_DEVICES" in _subprocess_env and _subprocess_env["CUDA_VISIBLE_DEVICES"] == "":
+            del _subprocess_env["CUDA_VISIBLE_DEVICES"]
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ},
+            env=_subprocess_env,
         )
 
         # Stream stderr line by line for real-time progress updates.

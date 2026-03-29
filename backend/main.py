@@ -4,6 +4,25 @@ import logging.handlers
 import subprocess
 import threading
 
+# ── Prevent PyTorch from poisoning CUDA for Whisper subprocess ──
+# PyTorch 2.11.0 ships with CUDA 13.0 bindings but the host driver is CUDA 12.9.
+# When PyTorch calls torch.cuda.is_available(), it triggers CUDA initialization
+# which FAILS with "The NVIDIA driver on your system is too old". This failed init
+# corrupts the CUDA driver state for the entire process tree, causing CTranslate2
+# in the Whisper subprocess to fail with "CUDA failed with error unknown error".
+#
+# Fix: Hide CUDA from the MAIN process so PyTorch never touches the GPU driver.
+# The Whisper subprocess sets its own CUDA_VISIBLE_DEVICES correctly (inherited
+# from the container's NVIDIA_VISIBLE_DEVICES=all). GPU detection in the main
+# process uses /dev/nvidia* device nodes instead of CUDA APIs.
+#
+# Save the real value so the subprocess can use it.
+_REAL_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+# Store the real value under a different key so subprocess code can restore it
+if _REAL_CUDA_VISIBLE_DEVICES is not None:
+    os.environ["_CLIPAI_REAL_CUDA_VISIBLE_DEVICES"] = _REAL_CUDA_VISIBLE_DEVICES
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Hide GPU from main process PyTorch
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
