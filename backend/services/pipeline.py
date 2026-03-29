@@ -1138,7 +1138,13 @@ async def _run_analysis_inner(job_id: str):
         # CTranslate2's CUDA context (~1.6GB) after Whisper completes.
         # torch.cuda.empty_cache() is a no-op (CUDA version mismatch).
         # Subprocess exit is the ONLY way to reclaim CTranslate2's VRAM.
-        _use_subprocess_whisper = settings.GPU_ACCELERATION_ENABLED and is_ollama_primary
+        # Always use subprocess for Whisper when GPU is available.
+        # The subprocess isolates CTranslate2's CUDA context and releases
+        # ALL GPU memory when it exits. This matters for both Ollama (needs
+        # GPU for vision/text) and cloud providers (GPU still used for
+        # Whisper transcription + NVENC encoding). Without subprocess,
+        # the in-process path on CPU is 10-30x slower.
+        _use_subprocess_whisper = settings.GPU_ACCELERATION_ENABLED
         _subprocess_whisper_used[0] = _use_subprocess_whisper
         if _use_subprocess_whisper:
             logger.info("[%s] Using subprocess Whisper (GPU mode) to release CUDA memory after", job_id)
