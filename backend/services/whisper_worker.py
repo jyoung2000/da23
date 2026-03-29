@@ -204,10 +204,26 @@ def main():
             # isn't working properly. Fall back to CPU automatically.
             err_str = str(cuda_err).lower()
             if args.device == "cuda" and ("cuda" in err_str or "unknown error" in err_str):
+                # Log detailed CUDA diagnostics before falling back
+                _diag = []
+                try:
+                    import ctranslate2
+                    _diag.append(f"ctranslate2_cuda_devices={ctranslate2.get_cuda_device_count()}")
+                except Exception as _de:
+                    _diag.append(f"ctranslate2_cuda_check_failed={_de}")
+                try:
+                    import glob as _gl
+                    _nv = _gl.glob("/dev/nvidia[0-9]*")
+                    _diag.append(f"nvidia_devices={_nv}")
+                except Exception:
+                    pass
+                _diag.append(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
                 logger.warning(
                     "CUDA failed (%s) — falling back to CPU (int8). "
-                    "GPU may not be properly passed through to container.",
-                    cuda_err,
+                    "Diagnostics: %s. "
+                    "This usually means another process (e.g. Ollama) is holding the GPU, "
+                    "or GPU passthrough is broken in this container restart.",
+                    cuda_err, ", ".join(_diag),
                 )
                 model_kwargs["device"] = "cpu"
                 model_kwargs["compute_type"] = "int8"
@@ -220,9 +236,10 @@ def main():
 
         # ── Preflight mode: verify model loads then exit ──
         if args.preflight:
-            logger.info("Preflight check passed: model=%s device=%s load_time=%dms", args.model, args.device, _load_ms)
+            actual_device = model_kwargs.get("device", args.device)
+            logger.info("Preflight check passed: model=%s requested=%s actual=%s load_time=%dms", args.model, args.device, actual_device, _load_ms)
             with open(args.output, "w") as f:
-                json.dump({"status": "ok", "load_time_ms": _load_ms}, f)
+                json.dump({"status": "ok", "load_time_ms": _load_ms, "actual_device": actual_device}, f)
             del model
             gc.collect()
             sys.exit(0)

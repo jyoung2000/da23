@@ -198,11 +198,15 @@ async def preflight_whisper_check(timeout: float = 90) -> dict:
         try:
             with open(output_path, "r") as f:
                 result = json.load(f)
+            # Report the ACTUAL device used, not the requested one.
+            # The subprocess may have fallen back from cuda to cpu.
+            actual_device = result.get("actual_device", device)
             return {
                 "ok": result.get("status") == "ok",
                 "error": result.get("error"),
                 "model": model_name,
-                "device": device,
+                "device": actual_device,
+                "requested_device": device,
                 "load_time_ms": result.get("load_time_ms", 0),
             }
         except Exception as e:
@@ -276,7 +280,17 @@ async def transcribe_audio_subprocess(
             min_vram = _VRAM_REQUIREMENTS[model_name]
             user_explicitly_set = getattr(settings, 'WHISPER_MODEL_USER_SET', False)
 
-            if 0 < vram_mb < min_vram:
+            if vram_mb == 0:
+                # VRAM detection failed (nvidia-smi unavailable in container).
+                # Don't block — the subprocess will try CUDA and fall back to CPU
+                # if it fails. Log a warning so the user knows VRAM wasn't checked.
+                logger.warning(
+                    "SUBPROCESS VRAM UNKNOWN: Could not detect GPU VRAM (nvidia-smi unavailable). "
+                    "Whisper will attempt CUDA and fall back to CPU if it fails. "
+                    "Model='%s', min_vram=%dMB.",
+                    model_name, min_vram,
+                )
+            elif vram_mb < min_vram:
                 if user_explicitly_set:
                     # User explicitly chose this model — DON'T downgrade.
                     # Force beam_size=1 (greedy) to minimize VRAM usage.

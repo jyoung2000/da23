@@ -1044,9 +1044,12 @@ async def _run_analysis_inner(job_id: str):
             f"Verifying Whisper model ({settings.WHISPER_MODEL})...")
         _preflight = await preflight_whisper_check(timeout=90)
         if _preflight["ok"]:
+            _requested = _preflight.get("requested_device", _preflight["device"])
+            _actual = _preflight["device"]
+            _device_msg = f"device={_actual}" if _requested == _actual else f"requested={_requested} actual={_actual}"
             logger.info(
-                "[%s] Whisper preflight passed: model=%s device=%s load_time=%dms",
-                job_id, _preflight["model"], _preflight["device"],
+                "[%s] Whisper preflight passed: model=%s %s load_time=%dms",
+                job_id, _preflight["model"], _device_msg,
                 _preflight.get("load_time_ms", 0),
             )
         else:
