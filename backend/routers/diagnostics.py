@@ -83,7 +83,30 @@ async def _get_gpu_info() -> dict:
         except Exception:
             pass
 
-    # Method 3: PyTorch CUDA
+    # Method 3: /dev/nvidia* device nodes (fast, no CUDA context needed)
+    # This catches the common Docker case where nvidia-smi misreports VRAM
+    # (256MB iGPU) but the discrete GPU is available to the subprocess.
+    if not info["cuda_available"]:
+        try:
+            import glob as _glob
+            nvidia_devs = _glob.glob("/dev/nvidia[0-9]*")
+            if nvidia_devs and settings.GPU_ACCELERATION_ENABLED:
+                info["gpu_available"] = True
+                info["cuda_available"] = True
+                if not info["gpu_name"]:
+                    info["gpu_name"] = f"NVIDIA GPU ({len(nvidia_devs)} device{'s' if len(nvidia_devs) > 1 else ''})"
+                # Try to get VRAM from transcription module's detection
+                try:
+                    from backend.services.transcription import _get_gpu_vram_mb
+                    vram_mb = _get_gpu_vram_mb()
+                    if vram_mb > 0 and info["vram_total_bytes"] == 0:
+                        info["vram_total_bytes"] = vram_mb * 1024 * 1024
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Method 4: PyTorch CUDA
     if not info["gpu_available"]:
         try:
             import torch
@@ -95,7 +118,7 @@ async def _get_gpu_info() -> dict:
         except Exception:
             pass
 
-    # Method 4: Probe Ollama — load a model with GPU request, check if it gets GPU
+    # Method 5: Probe Ollama — load a model with GPU request, check if it gets GPU
     if not info["gpu_available"]:
         try:
             async with httpx.AsyncClient(timeout=60) as client:
@@ -699,47 +722,55 @@ async def test_pipeline(request: Request):
             yield _phase("torch_vram", "Checking Whisper GPU runtime (CTranslate2 / PyTorch)...")
             whisper_device = "cpu"
             try:
-                import torch
-                if torch.cuda.is_available():
-                    torch_reserved = torch.cuda.memory_reserved() / 1024 / 1024
-                    if torch_reserved > 100:
-                        from backend.services.pipeline import release_torch_gpu_memory
-                        release_torch_gpu_memory()
-                        await asyncio.sleep(2)
-                        torch_after = torch.cuda.memory_reserved() / 1024 / 1024
-                        yield _sse_event("phase_result", {
-                            "phase": "torch_vram",
-                            "status": "warn" if torch_after > 100 else "pass",
-                            "message": f"Torch was holding {torch_reserved:.0f}MB, released to {torch_after:.0f}MB",
-                        })
-                    else:
-                        yield _sse_event("phase_result", {
-                            "phase": "torch_vram", "status": "pass",
-                            "message": f"Torch GPU memory OK ({torch_reserved:.0f}MB reserved)",
-                        })
+                # Use the same GPU detection as the actual transcription subprocess.
+                # This checks /dev/nvidia* device nodes FIRST (fast, no CUDA context),
+                # then falls back to CTranslate2 and PyTorch.  The main process may not
+                # have a working torch.cuda, but the subprocess can still use CUDA via
+                # CTranslate2's own CUDA context.
+                from backend.services.transcription import _detect_cuda_available
+                cuda_ok, cuda_count, gpu_name, best_idx = _detect_cuda_available()
+                if cuda_ok and settings.GPU_ACCELERATION_ENABLED:
                     whisper_device = "cuda"
-                else:
-                    ct2_devices = 0
+                    # Check if torch is holding stale VRAM
                     try:
-                        import ctranslate2
-                        ct2_devices = ctranslate2.get_cuda_device_count()
-                    except Exception:
-                        pass
-                    if ct2_devices > 0:
-                        whisper_device = "cuda"
-                        yield _sse_event("phase_result", {
-                            "phase": "torch_vram", "status": "warn",
-                            "message": f"PyTorch CUDA unavailable but CTranslate2 sees {ct2_devices} GPU(s) — Whisper uses subprocess mode",
-                        })
-                    else:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch_reserved = torch.cuda.memory_reserved() / 1024 / 1024
+                            if torch_reserved > 100:
+                                from backend.services.pipeline import release_torch_gpu_memory
+                                release_torch_gpu_memory()
+                                await asyncio.sleep(2)
+                                torch_after = torch.cuda.memory_reserved() / 1024 / 1024
+                                yield _sse_event("phase_result", {
+                                    "phase": "torch_vram",
+                                    "status": "warn" if torch_after > 100 else "pass",
+                                    "message": f"GPU detected: {gpu_name}. Torch was holding {torch_reserved:.0f}MB, released to {torch_after:.0f}MB",
+                                })
+                            else:
+                                yield _sse_event("phase_result", {
+                                    "phase": "torch_vram", "status": "pass",
+                                    "message": f"GPU detected: {gpu_name}. Torch memory OK ({torch_reserved:.0f}MB reserved)",
+                                })
+                        else:
+                            yield _sse_event("phase_result", {
+                                "phase": "torch_vram", "status": "pass",
+                                "message": f"GPU detected: {gpu_name} — Whisper runs on CUDA via subprocess (CTranslate2)",
+                            })
+                    except ImportError:
                         yield _sse_event("phase_result", {
                             "phase": "torch_vram", "status": "pass",
-                            "message": "No CUDA — Whisper will run on CPU (slower but functional)",
+                            "message": f"GPU detected: {gpu_name} — Whisper runs on CUDA via subprocess",
                         })
-            except ImportError:
+                else:
+                    yield _sse_event("phase_result", {
+                        "phase": "torch_vram", "status": "pass",
+                        "message": "No CUDA GPU detected — Whisper will run on CPU (slower but functional)",
+                    })
+            except Exception as e:
+                logger.warning("Whisper GPU detection failed: %s", e)
                 yield _sse_event("phase_result", {
                     "phase": "torch_vram", "status": "pass",
-                    "message": "Torch not loaded — Whisper uses CTranslate2 runtime",
+                    "message": "GPU detection error — Whisper will use CPU fallback",
                 })
 
             # ══════════════════════════════════════════════════════════
