@@ -5141,12 +5141,19 @@ async def export_clip(
                     clip_id, len(raw_kf), len(subject_scenes),
                 )
                 if len(raw_kf) > 1:
-                    # Full pipeline: build → compress range → dead zone → scene cuts → damped-lerp smooth → merge holds
-                    after_compress = _compress_range(raw_kf, src_ratio=_src_ratio, target_ratio=_target_ratio)
-                    after_dead_zone = _apply_dead_zone(after_compress, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                    # Sparse data detection: relax thresholds when we have ≤4 keyframes
+                    is_sparse = len(raw_kf) <= 4
+                    dz_threshold = 3 if is_sparse else 5
+                    compress_max = 60 if is_sparse else 30
+                    smooth_speed = 30 if is_sparse else 22
+                    hold_tolerance = 2 if is_sparse else 3
+
+                    # Full pipeline: build → compress range → dead zone → scene cuts → smooth → merge holds
+                    after_compress = _compress_range(raw_kf, max_range=compress_max, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                    after_dead_zone = _apply_dead_zone(after_compress, threshold=dz_threshold, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_cuts = _handle_scene_cuts(after_dead_zone)
-                    after_smooth = _smooth_keyframes_bidirectional(after_cuts, src_ratio=_src_ratio, target_ratio=_target_ratio)
-                    after_holds = _merge_holds(after_smooth)
+                    after_smooth = _smooth_keyframes_bidirectional(after_cuts, max_speed=smooth_speed, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                    after_holds = _merge_holds(after_smooth, tolerance=hold_tolerance)
 
                     # Final bounds enforcement — clamp every keyframe to safe range
                     # to prevent any pipeline stage from producing values that push
@@ -5177,20 +5184,33 @@ async def export_clip(
                         keyframes = None
                     else:
                         # Check for near-convergence: collapse to static to avoid jitter.
-                        # Scale threshold by aspect ratio — at high R, small sx changes
-                        # are very visible and should NOT be collapsed.
+                        # Scale threshold by aspect ratio and data density.
                         kf_min = min(kf[1] for kf in keyframes)
                         kf_max = max(kf[1] for kf in keyframes)
                         R_conv = _src_ratio / _target_ratio if _target_ratio > 0 else 1
                         convergence_threshold = max(2, round(5 / R_conv)) if R_conv > 1.5 else 5
+                        if is_sparse:
+                            convergence_threshold = max(1, round(convergence_threshold * 0.6))
                         if kf_max - kf_min < convergence_threshold:
-                            median_sx = sorted(kf[1] for kf in keyframes)[len(keyframes) // 2]
+                            # Time-weighted average: center on where subject spends most time
+                            if len(keyframes) <= 1:
+                                static_sx = keyframes[0][1]
+                            else:
+                                total_weight = 0
+                                weighted_sum = 0
+                                for j, (t_j, sx_j) in enumerate(keyframes):
+                                    t_prev = keyframes[0][0] if j == 0 else (keyframes[j-1][0] + t_j) / 2
+                                    t_next = keyframes[-1][0] if j == len(keyframes)-1 else (t_j + keyframes[j+1][0]) / 2
+                                    weight = max(0.001, t_next - t_prev)
+                                    weighted_sum += sx_j * weight
+                                    total_weight += weight
+                                static_sx = round(weighted_sum / total_weight) if total_weight > 0 else keyframes[0][1]
                             logger.info(
                                 "[SubjectTracking] clip %s: keyframe range too small (%d-%d, Δ=%d) — "
-                                "collapsing to static sx=%d to avoid jitter",
-                                clip_id, kf_min, kf_max, kf_max - kf_min, median_sx,
+                                "collapsing to static sx=%d (time-weighted, sparse=%s) to avoid jitter",
+                                clip_id, kf_min, kf_max, kf_max - kf_min, static_sx, is_sparse,
                             )
-                            subject_x = median_sx
+                            subject_x = static_sx
                             keyframes = None
                         else:
                             logger.info(

@@ -465,14 +465,24 @@ export function mergeHolds(keyframes, tolerance = 3) {
  */
 export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null) {
   const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
-  if (!raw || raw.length <= 1) return raw;
+  if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];
+  // Single keyframe is still useful — return it as static position
+  if (raw.length === 1) return raw;
 
-  // NEW ORDER: compress → dead zone → scene cuts → smooth → merge holds
-  const afterCompress = compressRange(raw, 30, srcRatio, targetRatio);
-  const afterDeadZone = applyDeadZone(afterCompress, 5, srcRatio, targetRatio);
+  // Sparse data detection: when we have very few keyframes (≤ 4),
+  // relax pipeline thresholds so the little tracking data we have
+  // doesn't get killed by dead zones and convergence checks.
+  const isSparse = raw.length <= 4;
+  const deadZoneThreshold = isSparse ? 3 : 5;
+  const compressMaxRange = isSparse ? 60 : 30;
+  const smoothMaxSpeed = isSparse ? 30 : 22;
+  const holdTolerance = isSparse ? 2 : 3;
+
+  const afterCompress = compressRange(raw, compressMaxRange, srcRatio, targetRatio);
+  const afterDeadZone = applyDeadZone(afterCompress, deadZoneThreshold, srcRatio, targetRatio);
   const afterCuts = handleSceneCuts(afterDeadZone);
-  const afterSmooth = smoothKeyframesBidirectional(afterCuts, 22, srcRatio, targetRatio);
-  const afterHolds = mergeHolds(afterSmooth);
+  const afterSmooth = smoothKeyframesBidirectional(afterCuts, smoothMaxSpeed, srcRatio, targetRatio);
+  const afterHolds = mergeHolds(afterSmooth, holdTolerance);
 
   // Final bounds enforcement — ensure every keyframe x is clamped to [0, 100]
   // and within the safe range for the aspect ratio. This prevents any pipeline
@@ -492,17 +502,33 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   }
 
   // Check for near-convergence: collapse to static to avoid jitter.
-  // Scale threshold by aspect ratio — at high R (narrow crop), small sx
-  // changes are very visible and should NOT be collapsed.
+  // Scale threshold by aspect ratio and data density.
   if (result.length > 1) {
     const finalXs = result.map(kf => kf.x);
     const minX = Math.min(...finalXs);
     const maxX = Math.max(...finalXs);
     const R = (srcRatio && targetRatio) ? srcRatio / targetRatio : 1;
-    const convergenceThreshold = R > 1.5 ? Math.max(2, Math.round(5 / R)) : 5;
+    let convergenceThreshold = R > 1.5 ? Math.max(2, Math.round(5 / R)) : 5;
+    // With sparse data, even small differences are meaningful — lower threshold
+    if (isSparse) convergenceThreshold = Math.max(1, Math.round(convergenceThreshold * 0.6));
     if (maxX - minX < convergenceThreshold) {
-      const medianX = finalXs.slice().sort((a, b) => a - b)[Math.floor(finalXs.length / 2)];
-      return [{ t: 0, x: medianX }];
+      // Time-weighted average: center on where subject spends most time
+      let staticX;
+      if (result.length <= 1) {
+        staticX = result[0].x;
+      } else {
+        let totalWeight = 0;
+        let weightedSum = 0;
+        for (let j = 0; j < result.length; j++) {
+          const tPrev = j === 0 ? result[0].t : (result[j - 1].t + result[j].t) / 2;
+          const tNext = j === result.length - 1 ? result[result.length - 1].t : (result[j].t + result[j + 1].t) / 2;
+          const weight = Math.max(0.001, tNext - tPrev);
+          weightedSum += result[j].x * weight;
+          totalWeight += weight;
+        }
+        staticX = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : result[0].x;
+      }
+      return [{ t: 0, x: staticX }];
     }
   }
   return result;

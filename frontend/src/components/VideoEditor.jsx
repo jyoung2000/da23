@@ -1436,11 +1436,15 @@ export default function VideoEditor({
     if (hasDynamicSubject || !isCrop) return;
     const video = videoRef.current;
     if (!video) return;
-    // Pass aspect ratio params for dynamic safe range (matches keyframe pipeline)
-    const sx = safeSubjectX ? safeSubjectX(subjectX, srcRatio, targetRatio) : subjectX;
+    // Use processed keyframe value if available — it interpolates from nearby
+    // scenes and is more accurate than the subjectX prop (which may be 50)
+    const effectiveSx = (subjectKeyframes?.length >= 1)
+      ? subjectKeyframes[0].x
+      : subjectX;
+    const sx = safeSubjectX ? safeSubjectX(effectiveSx, srcRatio, targetRatio) : effectiveSx;
     const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
     video.style.objectPosition = `${centerPct}% 50%`;
-  }, [hasDynamicSubject, isCrop, subjectX, srcRatio, targetRatio]);
+  }, [hasDynamicSubject, isCrop, subjectX, subjectKeyframes, srcRatio, targetRatio]);
 
   // ── Web Audio API for volume > 100% ────────────────
   useEffect(() => {

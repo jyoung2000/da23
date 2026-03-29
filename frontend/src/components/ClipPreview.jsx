@@ -657,12 +657,17 @@ export default function ClipPreview({
     if (hasDynamicSubject || !isCrop) return;
     const video = fgVideoRef.current;
     if (!video) return;
-    const sx = safeSubjectX(subjectX, srcRatio, targetRatio);
+    // Use processed keyframe value if available — it interpolates from nearby
+    // scenes and is more accurate than the subjectX prop (which may be 50)
+    const effectiveSx = (subjectKeyframes?.length >= 1)
+      ? subjectKeyframes[0].x
+      : subjectX;
+    const sx = safeSubjectX(effectiveSx, srcRatio, targetRatio);
     const centerPct = subjectXToCenterPct(
       Math.max(0, Math.min(100, sx)), srcRatio, targetRatio,
     );
     video.style.objectPosition = `${centerPct}% 50%`;
-  }, [hasDynamicSubject, isCrop, subjectX, srcRatio, targetRatio]);
+  }, [hasDynamicSubject, isCrop, subjectX, subjectKeyframes, srcRatio, targetRatio]);
 
   // --- Controls ---
   const togglePlay = useCallback(() => {
@@ -958,7 +963,9 @@ export default function ClipPreview({
     };
 
     if (isCrop) {
-      const initialSx = hasDynamicSubject ? subjectKeyframes[0].x : safeSubjectX(subjectX, srcRatioLocal, targetRatio);
+      const initialSx = hasDynamicSubject
+        ? subjectKeyframes[0].x
+        : (subjectKeyframes?.length >= 1 ? subjectKeyframes[0].x : safeSubjectX(subjectX, srcRatioLocal, targetRatio));
       const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, initialSx)), srcRatioLocal, targetRatio);
       Object.assign(videoStyle, {
         objectFit: 'cover',
