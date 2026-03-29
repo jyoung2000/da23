@@ -2071,11 +2071,18 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             f"You MUST return exactly {num_clips} viral clip candidates, ranked by viral potential from highest to lowest. "
             f"Do NOT return fewer than {num_clips} clips — find {num_clips} distinct moments even if some score lower. "
             f"Each clip must be between {dur_min} and {dur_max} seconds long.\n\n"
-            'Return JSON: {"clips": [{"id": 1, "title": "...", "start_time": 0.0, '
+            'Return JSON: {"clips": [{"id": 1, "title": "SEO social media title (no speaker names, describe the TOPIC not the speakers)", "start_time": 0.0, '
             '"end_time": 60.0, "duration": 60.0, "viral_score": 50, '
             '"viral_score_reasoning": "...", "clip_type": "highlight", '
             '"platform": "both", "suggested_caption": "...", '
-            '"hook_text": "...", "why_this_works": "..."}]}'
+            '"hook_text": "...", "why_this_works": "..."}]}\n\n'
+            "TITLE RULES (critical):\n"
+            "- Title must be an SEO-optimized social media title about the SUBJECT/TOPIC of the clip\n"
+            "- NEVER mention speaker names, 'Speaker 1', 'Speaker 2', or any speaker references\n"
+            "- NEVER use internal labels like [317-405] or timestamps in titles\n"
+            "- Write titles that would work as a YouTube Shorts or TikTok caption\n"
+            "- Examples of GOOD titles: '50 Cent News Reaction', 'The Truth About Fast Food Prices', 'This Workout Changed Everything'\n"
+            "- Examples of BAD titles: 'Speaker 1 discusses food', '[100-200] Speaker 1: rapid_exchange', 'Bold statement about mother'"
         )
 
         logger.info("Ollama clip detection prompt: system=%d chars, prompt=%d chars", len(system), len(prompt))

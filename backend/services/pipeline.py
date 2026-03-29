@@ -1261,7 +1261,10 @@ async def _run_analysis_inner(job_id: str):
             batch = frames[batch_start:batch_end]
 
             def _encode(path):
-                return frame_to_base64(path, skip_resize=True)
+                # Don't skip resize — 4K frames (3840x2160) overwhelm small
+                # vision models like moondream:1.8b on 4GB GPUs. MAX_DIMENSION
+                # (1568px) is plenty for scene understanding.
+                return frame_to_base64(path, skip_resize=False)
 
             try:
                 results = await asyncio.wait_for(

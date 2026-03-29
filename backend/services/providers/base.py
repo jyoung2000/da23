@@ -534,7 +534,11 @@ class ChunkedClipDetectionMixin:
 
     @staticmethod
     def _deduplicate_clips(clips: list[ClipCandidate], max_overlap: float = 0.5) -> list[ClipCandidate]:
-        """Remove clips that overlap or are adjacent covering the same region."""
+        """Remove clips that overlap or are adjacent covering the same region.
+
+        Only drops a clip when the overlap with an existing HIGHER-SCORED clip
+        exceeds max_overlap (default 50%) of the shorter clip's duration.
+        """
         if len(clips) <= 1:
             return clips
 
@@ -565,14 +569,17 @@ class ChunkedClipDetectionMixin:
                     )
                     break
 
-                # Proximity check: adjacent clips covering the same region
+                # Proximity check: only treat as duplicate if clips are nearly
+                # identical in span (gap < 5s AND combined span barely exceeds
+                # single clip). The old gap<10 + ratio<1.3 was too aggressive
+                # for short videos where different clips naturally sit close.
                 gap = min(
                     abs(clip.start_time - existing.end_time),
                     abs(existing.start_time - clip.end_time),
                 )
                 combined_span = max(clip.end_time, existing.end_time) - min(clip.start_time, existing.start_time)
                 combined_dur = clip.duration + existing.duration
-                if gap < 10 and combined_dur > 0 and combined_span / combined_dur < 1.3:
+                if gap < 5 and combined_dur > 0 and combined_span / combined_dur < 1.15:
                     is_duplicate = True
                     _mixin_logger.info(
                         "De-dup (proximity): dropping '%s' (%.0f-%.0fs) — adjacent to '%s' (%.0f-%.0fs), gap=%.0fs",
@@ -811,7 +818,7 @@ class ChunkedClipDetectionMixin:
             for existing in kept:
                 existing_title_words = _word_set(existing.title)
                 title_sim = _jaccard(clip_title_words, existing_title_words)
-                if title_sim > 0.6:
+                if title_sim > 0.75:
                     similar_count += 1
             if similar_count < max_similar:
                 kept.append(clip)
@@ -1183,10 +1190,14 @@ class ChunkedClipDetectionMixin:
         if progress_callback:
             await progress_callback("pass3_merge", {"raw": len(all_clips)})
         raw_count = len(all_clips)
-        all_clips = self._deduplicate_clips(all_clips, max_overlap=0.6)
+        # Only drop clips that overlap >70% with a higher-scored clip.
+        # The old 60% threshold was too aggressive for short videos where
+        # clips from different windows naturally overlap.
+        all_clips = self._deduplicate_clips(all_clips, max_overlap=0.7)
         after_overlap = len(all_clips)
-        # Scale thematic dedup tolerance with video length
-        _thematic_max = 2 if video_duration < 1800 else 3 if video_duration < 5400 else 4
+        # Scale thematic dedup tolerance with video length.
+        # Short videos naturally produce clips about the same topic — allow more.
+        _thematic_max = 3 if video_duration < 1800 else 4 if video_duration < 5400 else 5
         all_clips = self._deduplicate_thematic(all_clips, max_similar=_thematic_max)
         after_thematic = len(all_clips)
         all_clips.sort(key=lambda c: c.viral_score, reverse=True)

@@ -74,7 +74,7 @@ def analyze_transcript_energy(
 
         if energy_signals:
             energy_moments.append(
-                f"[{seg.start:.0f}s] {seg.speaker}: {', '.join(energy_signals)}"
+                f"[{seg.start:.0f}s] {', '.join(energy_signals)}"
             )
 
     if not energy_moments:

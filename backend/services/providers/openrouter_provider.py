@@ -773,7 +773,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             "high-scoring zones (score >50). These zones have verified audio energy spikes, "
             "rapid dialogue, visual peaks, or speaker dynamics that indicate viral moments.\n\n"
             "Return ONLY valid JSON, no other text:\n"
-            '{"clips": [{"id": 1, "title": "Hook-driven title under 60 chars", '
+            '{"clips": [{"id": 1, "title": "SEO social media title about the topic (no speaker names)", '
             '"start_time": 45.2, "end_time": 112.8, "duration": 67.6, '
             '"viral_score": 87, "viral_score_reasoning": "Strong hook...", '
             '"clip_type": "informative|funny|emotional|shocking|tutorial|highlight|debate|reveal", '
