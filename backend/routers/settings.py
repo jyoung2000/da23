@@ -78,7 +78,22 @@ def _persist_user_settings() -> bool:
     Returns True if settings were persisted successfully, False otherwise.
     The file is stored on a Docker volume mount (/data/logs) so it
     survives container stop/restart/recreate cycles.
+
+    IMPORTANT: Merges with existing file to prevent API key loss.
+    If the current in-memory value for an API key is empty but the
+    existing file has a real key, the persisted key is preserved.
+    This prevents non-key setting changes from wiping out API keys
+    that were saved earlier but not restored into memory.
     """
+    # Load existing persisted data to preserve API keys we might not have in memory
+    existing_data = {}
+    try:
+        if os.path.exists(USER_SETTINGS_PATH):
+            with open(USER_SETTINGS_PATH, "r") as f:
+                existing_data = json.load(f)
+    except Exception:
+        pass
+
     data = {}
     for key in _PERSISTABLE_KEYS:
         val = getattr(settings, key, "")
@@ -86,7 +101,16 @@ def _persist_user_settings() -> bool:
         if isinstance(val, (bool, int)):
             data[key] = val
             continue
-        # Skip empty values and placeholder API keys
+        # For API keys: if current in-memory value is empty/placeholder but
+        # the existing file has a real key, preserve the persisted key.
+        # This prevents non-key setting changes from wiping out saved keys.
+        if key in _API_KEY_FIELDS:
+            if _is_real_value(key, val):
+                data[key] = val
+            elif key in existing_data and _is_real_value(key, existing_data[key]):
+                data[key] = existing_data[key]
+            continue
+        # Skip empty values for non-key settings
         if not _is_real_value(key, val):
             continue
         data[key] = val
