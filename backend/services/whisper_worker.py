@@ -196,9 +196,27 @@ def main():
         )
 
         _load_t0 = _time.monotonic()
-        model = WhisperModel(args.model, **model_kwargs)
+        try:
+            model = WhisperModel(args.model, **model_kwargs)
+        except RuntimeError as cuda_err:
+            # CUDA initialization can fail with "unknown error" when the GPU
+            # driver is broken, VRAM is exhausted, or Docker GPU passthrough
+            # isn't working properly. Fall back to CPU automatically.
+            err_str = str(cuda_err).lower()
+            if args.device == "cuda" and ("cuda" in err_str or "unknown error" in err_str):
+                logger.warning(
+                    "CUDA failed (%s) — falling back to CPU (int8). "
+                    "GPU may not be properly passed through to container.",
+                    cuda_err,
+                )
+                model_kwargs["device"] = "cpu"
+                model_kwargs["compute_type"] = "int8"
+                model_kwargs.pop("device_index", None)
+                model = WhisperModel(args.model, **model_kwargs)
+            else:
+                raise
         _load_ms = int((_time.monotonic() - _load_t0) * 1000)
-        logger.info("Whisper model loaded in %dms", _load_ms)
+        logger.info("Whisper model loaded in %dms (device=%s)", _load_ms, model_kwargs.get("device", args.device))
 
         # ── Preflight mode: verify model loads then exit ──
         if args.preflight:
