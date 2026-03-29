@@ -419,6 +419,83 @@ async def _test_text_model(model: str) -> dict:
         }
 
 
+async def _test_cloud_vision(model: str, provider: str) -> dict:
+    """Test a cloud vision model via AIOrchestrator.analyze_frames()."""
+    start = time.time()
+    try:
+        from backend.services.ai_orchestrator import AIOrchestrator
+        from backend.models import FrameData
+        orch = AIOrchestrator()
+        test_image_b64 = _generate_test_image()
+
+        # Create a minimal FrameData for the orchestrator
+        frame = FrameData(path="", timestamp=0.0)
+        frame.base64 = test_image_b64
+
+        scenes, used_provider = await asyncio.wait_for(
+            orch.analyze_frames([frame], job_id="pipeline-test"),
+            timeout=90,
+        )
+        elapsed_ms = int((time.time() - start) * 1000)
+        desc = scenes[0].description[:100] if scenes and hasattr(scenes[0], 'description') else ""
+        return {
+            "status": "pass",
+            "message": f"Vision model OK — {elapsed_ms}ms via {used_provider}",
+            "duration_ms": elapsed_ms,
+            "gpu_status": f"cloud ({used_provider})",
+            "sample_output": desc,
+        }
+    except asyncio.TimeoutError:
+        return {
+            "status": "fail",
+            "message": f"Vision model timed out (>90s) via {provider}",
+            "duration_ms": 90000, "gpu_status": "timeout",
+        }
+    except Exception as e:
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {
+            "status": "fail",
+            "message": f"Vision model error via {provider}: {str(e)[:200]}",
+            "duration_ms": elapsed_ms, "gpu_status": "error",
+        }
+
+
+async def _test_cloud_text(model: str, provider: str) -> dict:
+    """Test a cloud text model via AIOrchestrator."""
+    start = time.time()
+    try:
+        from backend.services.ai_orchestrator import AIOrchestrator
+        orch = AIOrchestrator()
+        raw = await asyncio.wait_for(
+            orch.text_completion(
+                "Summarize in one sentence: A customer orders a latte at a coffee shop.",
+                max_tokens=50, timeout=60,
+            ),
+            timeout=60,
+        )
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {
+            "status": "pass",
+            "message": f"Text model OK — {elapsed_ms}ms via {provider}",
+            "duration_ms": elapsed_ms,
+            "gpu_status": f"cloud ({provider})",
+            "sample_output": str(raw)[:100] if raw else "",
+        }
+    except asyncio.TimeoutError:
+        return {
+            "status": "fail",
+            "message": f"Text model timed out (>60s) via {provider}",
+            "duration_ms": 60000, "gpu_status": "timeout",
+        }
+    except Exception as e:
+        elapsed_ms = int((time.time() - start) * 1000)
+        return {
+            "status": "fail",
+            "message": f"Text model error via {provider}: {str(e)[:200]}",
+            "duration_ms": elapsed_ms, "gpu_status": "error",
+        }
+
+
 async def _check_model_gpu(client: httpx.AsyncClient, model: str) -> tuple[str, int]:
     """Check if a model is on GPU via /api/ps. Returns (gpu_status_str, vram_bytes)."""
     try:
@@ -581,8 +658,38 @@ async def test_pipeline(request: Request):
     test_translation = body.get("test_translation", False)
 
     is_ollama = "ollama" in settings.active_provider_chain
-    vision_model = settings.OLLAMA_VISION_MODEL
-    text_model = settings.OLLAMA_TEXT_MODEL
+
+    # Determine the active provider and model names
+    # Use the FIRST provider in the chain as the primary
+    _chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+    _primary_provider = _chain[0] if _chain else "ollama"
+
+    if _primary_provider == "ollama":
+        vision_model = settings.OLLAMA_VISION_MODEL
+        text_model = settings.OLLAMA_TEXT_MODEL
+        provider_label = "ollama"
+    elif _primary_provider == "openrouter":
+        vision_model = settings.OPENROUTER_VISION_MODEL or "openrouter/default"
+        text_model = settings.OPENROUTER_TEXT_MODEL or "openrouter/default"
+        provider_label = "openrouter"
+    elif _primary_provider == "anthropic":
+        vision_model = "claude-3-haiku"
+        text_model = "claude-3-haiku"
+        provider_label = "anthropic"
+    elif _primary_provider == "gemini":
+        vision_model = "gemini-2.5-flash"
+        text_model = "gemini-2.5-flash"
+        provider_label = "gemini"
+    elif _primary_provider == "groq":
+        vision_model = "llava-v1.5-7b-4096-preview"
+        text_model = settings.GROQ_TEXT_MODEL if hasattr(settings, 'GROQ_TEXT_MODEL') else "llama3-8b-8192"
+        provider_label = "groq"
+    else:
+        vision_model = settings.OLLAMA_VISION_MODEL
+        text_model = settings.OLLAMA_TEXT_MODEL
+        provider_label = "ollama"
+
+    uses_ollama = _primary_provider == "ollama"
 
     async def event_stream() -> AsyncGenerator[str, None]:
         import tempfile
@@ -590,7 +697,7 @@ async def test_pipeline(request: Request):
 
         tmp_dir = None
         # Track total phases dynamically
-        total_phases = 2 if not is_ollama else (11 + (1 if include_whisper else 0) + (1 if include_whisper and test_translation else 0))
+        total_phases = 2 if not uses_ollama else (11 + (1 if include_whisper else 0) + (1 if include_whisper and test_translation else 0))
         phase_counter = [0]
 
         def _phase(phase_id, label):
@@ -607,7 +714,7 @@ async def test_pipeline(request: Request):
             # ══════════════════════════════════════════════════════════
             yield _phase("provider_gpu_check", "Checking AI provider + GPU hardware...")
 
-            if not is_ollama:
+            if not uses_ollama:
                 yield _sse_event("phase_result", {
                     "phase": "provider_gpu_check", "status": "pass",
                     "message": "Cloud provider selected — no local GPU needed",
@@ -978,35 +1085,50 @@ async def test_pipeline(request: Request):
             # ══════════════════════════════════════════════════════════
             # Phase: Vision model test (scene analysis)
             # ══════════════════════════════════════════════════════════
-            yield _phase("vision_model", f"Testing vision model — {vision_model} (scene analysis)...")
-            vision_result = await _test_vision_model(vision_model)
+            yield _phase("vision_model", f"Testing vision model — {vision_model} (scene analysis) via {provider_label}...")
+            if uses_ollama:
+                vision_result = await _test_vision_model(vision_model)
+            else:
+                # Non-Ollama: test via AIOrchestrator
+                vision_result = await _test_cloud_vision(vision_model, provider_label)
             yield _sse_event("phase_result", {"phase": "vision_model", **vision_result})
 
             # ══════════════════════════════════════════════════════════
             # Phase: Unload vision, wait for VRAM
             # CRITICAL: vision + text can't coexist on 4GB GPU
             # ══════════════════════════════════════════════════════════
-            yield _phase("vision_unload", f"Unloading {vision_model} — waiting for VRAM release...")
-            freed = await _unload_and_wait(15)
-            if freed:
-                await asyncio.sleep(3)
-            yield _sse_event("phase_result", {
-                "phase": "vision_unload",
-                "status": "pass" if freed else "warn",
-                "message": "Vision model unloaded — VRAM freed for text model" if freed else "Vision model may still be resident",
-            })
+            if uses_ollama:
+                yield _phase("vision_unload", f"Unloading {vision_model} — waiting for VRAM release...")
+                freed = await _unload_and_wait(15)
+                if freed:
+                    await asyncio.sleep(3)
+                yield _sse_event("phase_result", {
+                    "phase": "vision_unload",
+                    "status": "pass" if freed else "warn",
+                    "message": "Vision model unloaded — VRAM freed for text model" if freed else "Vision model may still be resident",
+                })
+            else:
+                yield _phase("vision_unload", "Cloud provider — no VRAM to release")
+                yield _sse_event("phase_result", {
+                    "phase": "vision_unload", "status": "pass",
+                    "message": f"{provider_label} uses cloud inference — no local VRAM management needed",
+                })
 
             # ══════════════════════════════════════════════════════════
             # Phase: Text model — summary generation
             # ══════════════════════════════════════════════════════════
-            yield _phase("text_summary", f"Testing text model — {text_model} (summary generation)...")
-            summary_result = await _test_text_model(text_model)
+            yield _phase("text_summary", f"Testing text model — {text_model} (summary generation) via {provider_label}...")
+            if uses_ollama:
+                summary_result = await _test_text_model(text_model)
+            else:
+                # Non-Ollama: test via AIOrchestrator
+                summary_result = await _test_cloud_text(text_model, provider_label)
             yield _sse_event("phase_result", {"phase": "text_summary", **summary_result})
 
             # ══════════════════════════════════════════════════════════
             # Phase: Text model — clip detection JSON
             # ══════════════════════════════════════════════════════════
-            yield _phase("text_clips", f"Testing clip detection — JSON output from {text_model}...")
+            yield _phase("text_clips", f"Testing clip detection — JSON output from {text_model} via {provider_label}...")
             t0 = time.time()
             try:
                 clip_prompt = (
@@ -1064,11 +1186,17 @@ async def test_pipeline(request: Request):
             # Phase: Final cleanup
             # ══════════════════════════════════════════════════════════
             yield _phase("final_cleanup", "Final cleanup — unloading all models...")
-            await _unload_all_models()
-            yield _sse_event("phase_result", {
-                "phase": "final_cleanup", "status": "pass",
-                "message": "All models unloaded — GPU memory released",
-            })
+            if uses_ollama:
+                await _unload_all_models()
+                yield _sse_event("phase_result", {
+                    "phase": "final_cleanup", "status": "pass",
+                    "message": "All models unloaded — GPU memory released",
+                })
+            else:
+                yield _sse_event("phase_result", {
+                    "phase": "final_cleanup", "status": "pass",
+                    "message": f"Cloud provider ({provider_label}) — no local models to unload",
+                })
 
             # ── Overall result ──
             all_ok = (
@@ -1083,6 +1211,7 @@ async def test_pipeline(request: Request):
                     "whisper_device": whisper_device,
                     "whisper_tested": include_whisper,
                     "translation_tested": test_translation,
+                    "provider": provider_label,
                     "vision_model": vision_model,
                     "text_model": text_model,
                     "gpu_name": gpu.get("gpu_name", "CPU") if gpu else "CPU",
