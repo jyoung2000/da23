@@ -875,8 +875,8 @@ export default function VideoEditor({
 
   const subjectKeyframes = useMemo(() => {
     if (!scenes?.length || clipStart == null || clipEnd == null) return null;
-    return processKeyframes(scenes, clipStart, clipEnd, isCrop ? srcRatio : null, isCrop ? targetRatio : null);
-  }, [scenes, clipStart, clipEnd, isCrop, srcRatio, targetRatio]);
+    return processKeyframes(scenes, clipStart, clipEnd, isCrop ? srcRatio : null, isCrop ? targetRatio : null, transcript || null);
+  }, [scenes, clipStart, clipEnd, isCrop, srcRatio, targetRatio, transcript]);
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),

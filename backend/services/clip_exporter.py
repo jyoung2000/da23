@@ -2138,6 +2138,71 @@ def _center_crop_offset(sx: int, src_w: int, crop_w: int) -> int:
     return max(0, min(max_offset, x_offset))
 
 
+def _build_speaker_position_map(scenes: list, transcript: list | None) -> dict[str, int]:
+    """Correlate scene positions with transcript speaker labels.
+    Matches frontend buildSpeakerPositionMap() exactly."""
+    if not scenes or not transcript:
+        return {}
+    speaker_x_values: dict[str, list[int]] = {}
+    for scene in scenes:
+        ts = float(scene.timestamp if hasattr(scene, "timestamp") else scene.get("timestamp", 0))
+        sx = int(scene.subject_x if hasattr(scene, "subject_x") else scene.get("subject_x", 50))
+        active_seg = None
+        for seg in transcript:
+            seg_start = float(seg.get("start", seg.get("start_time", 0)))
+            seg_end = float(seg.get("end", seg.get("end_time", 0)))
+            if ts >= seg_start - 0.5 and ts <= seg_end + 0.5:
+                active_seg = seg
+                break
+        if active_seg and active_seg.get("speaker"):
+            speaker = active_seg["speaker"]
+            if speaker not in speaker_x_values:
+                speaker_x_values[speaker] = []
+            speaker_x_values[speaker].append(sx)
+    return {sp: round(sum(vs) / len(vs)) for sp, vs in speaker_x_values.items() if vs}
+
+
+def _build_speaker_keyframes(
+    transcript: list, speaker_map: dict[str, int],
+    clip_start: float, clip_end: float,
+    src_ratio: float = 0, target_ratio: float = 0,
+) -> list[tuple[float, int]] | None:
+    """Build dense keyframes at every speaker change.
+    Matches frontend buildSpeakerKeyframes() exactly."""
+    if not transcript or len(speaker_map) < 2:
+        return None
+    clip_dur = clip_end - clip_start
+    if clip_dur <= 0:
+        return None
+    overlapping = sorted(
+        [s for s in transcript
+         if float(s.get("end", s.get("end_time", 0))) > clip_start
+         and float(s.get("start", s.get("start_time", 0))) < clip_end],
+        key=lambda s: float(s.get("start", s.get("start_time", 0))),
+    )
+    if not overlapping:
+        return None
+    keyframes = []
+    last_speaker = None
+    for seg in overlapping:
+        seg_start = max(clip_start, float(seg.get("start", seg.get("start_time", 0))))
+        speaker = seg.get("speaker")
+        if not speaker or speaker not in speaker_map:
+            continue
+        if speaker == last_speaker:
+            continue
+        sx = _safe_subject_x(speaker_map[speaker], src_ratio=src_ratio, target_ratio=target_ratio)
+        keyframes.append((max(0.0, seg_start - clip_start), sx))
+        last_speaker = speaker
+    if not keyframes:
+        return None
+    if keyframes[0][0] > 0:
+        keyframes.insert(0, (0.0, keyframes[0][1]))
+    if keyframes[-1][0] < clip_dur:
+        keyframes.append((clip_dur, keyframes[-1][1]))
+    return keyframes if len(keyframes) >= 2 else None
+
+
 def _build_subject_keyframes(
     scenes: list,
     clip_start: float,
@@ -5135,12 +5200,38 @@ async def export_clip(
                 )
 
             if subject_scenes and aspect_ratio and not all_tracking_off:
-                raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
-                logger.info(
-                    "[SubjectTracking] clip %s: %d raw keyframes from %d scenes",
-                    clip_id, len(raw_kf), len(subject_scenes),
-                )
-                if len(raw_kf) > 1:
+                # ── PHASE 1: Try speaker-aware tracking ──
+                _speaker_kf_used = False
+                if transcript:
+                    _spk_map = _build_speaker_position_map(subject_scenes, transcript)
+                    if len(_spk_map) >= 2:
+                        _spk_kf = _build_speaker_keyframes(transcript, _spk_map, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                        if _spk_kf and len(_spk_kf) >= 2:
+                            after_cuts = _handle_scene_cuts(_spk_kf)
+                            safe_lo, safe_hi = _compute_safe_range(_src_ratio, _target_ratio)
+                            keyframes = [(t, max(safe_lo, min(safe_hi, round(sx)))) for t, sx in after_cuts]
+                            kf_xs = [kf[1] for kf in keyframes]
+                            if max(kf_xs) - min(kf_xs) >= 5:
+                                _speaker_kf_used = True
+                                logger.info(
+                                    "[SubjectTracking] clip %s: SPEAKER-AWARE tracking — %d keyframes, %d speakers, map=%s",
+                                    clip_id, len(keyframes), len(_spk_map), _spk_map,
+                                )
+                            else:
+                                keyframes = None
+
+                # ── PHASE 2: Fall back to scene-based tracking ──
+                if not _speaker_kf_used:
+                    keyframes = None
+                    raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                    logger.info(
+                        "[SubjectTracking] clip %s: %d raw keyframes from %d scenes",
+                        clip_id, len(raw_kf), len(subject_scenes),
+                    )
+                else:
+                    raw_kf = []  # Speaker tracking already set keyframes
+
+                if not _speaker_kf_used and len(raw_kf) > 1:
                     # Sparse data detection: relax thresholds when we have ≤4 keyframes
                     is_sparse = len(raw_kf) <= 4
                     dz_threshold = 3 if is_sparse else 5

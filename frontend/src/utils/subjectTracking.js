@@ -63,6 +63,95 @@ export function safeSubjectX(sx, srcRatio = null, targetRatio = null) {
 }
 
 /**
+ * Build a map of speaker → average subject_x position by correlating
+ * scene analysis data with transcript speaker labels.
+ *
+ * @param {Array} scenes - Scene objects with {timestamp, subject_x}
+ * @param {Array} transcript - Transcript segments with {start, end, speaker}
+ * @returns {Object} Map of speaker name → average subject_x
+ */
+export function buildSpeakerPositionMap(scenes, transcript) {
+  if (!scenes?.length || !transcript?.length) return {};
+
+  const speakerXValues = {};
+
+  for (const scene of scenes) {
+    const ts = scene.timestamp;
+    const sx = scene.subject_x ?? 50;
+
+    const activeSeg = transcript.find(seg => {
+      const segStart = seg.start ?? seg.start_time ?? 0;
+      const segEnd = seg.end ?? seg.end_time ?? 0;
+      return ts >= segStart - 0.5 && ts <= segEnd + 0.5;
+    });
+
+    if (activeSeg?.speaker) {
+      if (!speakerXValues[activeSeg.speaker]) {
+        speakerXValues[activeSeg.speaker] = [];
+      }
+      speakerXValues[activeSeg.speaker].push(sx);
+    }
+  }
+
+  const speakerMap = {};
+  for (const [speaker, values] of Object.entries(speakerXValues)) {
+    if (values.length > 0) {
+      speakerMap[speaker] = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
+    }
+  }
+  return speakerMap;
+}
+
+/**
+ * Build dense keyframes at every speaker change using the speaker-position map.
+ *
+ * @param {Array} transcript - Transcript segments with {start, end, speaker}
+ * @param {Object} speakerMap - Speaker → subject_x map
+ * @param {number} clipStart - Clip start time in seconds
+ * @param {number} clipEnd - Clip end time in seconds
+ * @param {number|null} srcRatio - Source video aspect ratio
+ * @param {number|null} targetRatio - Target crop aspect ratio
+ * @returns {Array<{t: number, x: number}>|null} Dense keyframes, or null if insufficient data
+ */
+export function buildSpeakerKeyframes(transcript, speakerMap, clipStart, clipEnd, srcRatio = null, targetRatio = null) {
+  if (!transcript?.length || !speakerMap || Object.keys(speakerMap).length < 2) return null;
+
+  const clipDur = clipEnd - clipStart;
+  if (clipDur <= 0) return null;
+
+  const overlapping = transcript
+    .filter(seg => {
+      const segStart = seg.start ?? seg.start_time ?? 0;
+      const segEnd = seg.end ?? seg.end_time ?? 0;
+      return segEnd > clipStart && segStart < clipEnd;
+    })
+    .sort((a, b) => (a.start ?? a.start_time ?? 0) - (b.start ?? b.start_time ?? 0));
+
+  if (overlapping.length === 0) return null;
+
+  const keyframes = [];
+  let lastSpeaker = null;
+
+  for (const seg of overlapping) {
+    const segStart = Math.max(clipStart, seg.start ?? seg.start_time ?? 0);
+    const speaker = seg.speaker;
+    if (!speaker || !speakerMap[speaker]) continue;
+    if (speaker === lastSpeaker) continue;
+
+    const sx = safeSubjectX(speakerMap[speaker], srcRatio, targetRatio);
+    keyframes.push({ t: Math.max(0, segStart - clipStart), x: sx });
+    lastSpeaker = speaker;
+  }
+
+  if (keyframes.length === 0) return null;
+  if (keyframes[0].t > 0) keyframes.unshift({ t: 0, x: keyframes[0].x });
+  if (keyframes[keyframes.length - 1].t < clipDur) {
+    keyframes.push({ t: clipDur, x: keyframes[keyframes.length - 1].x });
+  }
+  return keyframes.length >= 2 ? keyframes : null;
+}
+
+/**
  * Build sorted keyframes from scenes for a clip range.
  *
  * Uses scenes both within and outside the clip range.  Scenes outside the
@@ -463,7 +552,30 @@ export function mergeHolds(keyframes, tolerance = 3) {
  * @param {number|null} targetRatio - Target crop aspect ratio (optional)
  * @returns {Array<{t: number, x: number}>} Fully processed keyframes
  */
-export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null) {
+export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null, transcript = null) {
+  // ── PHASE 1: Try speaker-aware tracking ──
+  if (transcript?.length && scenes?.length) {
+    const speakerMap = buildSpeakerPositionMap(scenes, transcript);
+    if (Object.keys(speakerMap).length >= 2) {
+      const speakerKf = buildSpeakerKeyframes(transcript, speakerMap, clipStart, clipEnd, srcRatio, targetRatio);
+      if (speakerKf && speakerKf.length >= 2) {
+        const afterCuts = handleSceneCuts(speakerKf);
+        let result;
+        if (srcRatio && targetRatio) {
+          const range = computeSafeRange(srcRatio, targetRatio);
+          result = afterCuts.map(kf => ({ t: kf.t, x: Math.max(range.min, Math.min(range.max, Math.round(kf.x))) }));
+        } else {
+          result = afterCuts.map(kf => ({ t: kf.t, x: Math.max(0, Math.min(100, Math.round(kf.x))) }));
+        }
+        if (result.length > 1) {
+          const xs = result.map(kf => kf.x);
+          if (Math.max(...xs) - Math.min(...xs) >= 5) return result;
+        }
+      }
+    }
+  }
+
+  // ── PHASE 2: Fall back to scene-based tracking ──
   const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
   if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];
   // Single keyframe is still useful — return it as static position

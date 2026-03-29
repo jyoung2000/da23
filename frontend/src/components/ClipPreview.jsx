@@ -286,7 +286,7 @@ export default function ClipPreview({
       const _srcRatio = sourceWidth / sourceHeight;
       const _targetRatio = (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) ? ASPECT_RATIO_VALUES[aspectRatio] : _srcRatio;
       const _isCrop = Math.abs(_srcRatio - _targetRatio) > 0.01;
-      const processed = processKeyframes(scenes, clipStart, clipEnd, _isCrop ? _srcRatio : null, _isCrop ? _targetRatio : null);
+      const processed = processKeyframes(scenes, clipStart, clipEnd, _isCrop ? _srcRatio : null, _isCrop ? _targetRatio : null, transcript || null);
       const dynamic = processed && isDynamic(processed);
       console.log(
         `[SubjectTracking] ClipPreview: ${processed?.length || 0} keyframes (pipeline: build→compress→deadzone→cuts→smooth→holds) ` +
@@ -297,7 +297,7 @@ export default function ClipPreview({
       );
       return processed;
     },
-    [scenes, clipStart, clipEnd, aspectRatio, sourceWidth, sourceHeight],
+    [scenes, clipStart, clipEnd, aspectRatio, sourceWidth, sourceHeight, transcript],
   );
   const hasDynamicSubject = useMemo(
     () => subjectKeyframes && isDynamic(subjectKeyframes),
