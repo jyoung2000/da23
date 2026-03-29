@@ -835,10 +835,11 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 timeout=self._get_clip_timeout(len(transcript_text)),
             )
             try:
-                raw = raw.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-                data = json.loads(raw)
+                # Use extract_json() which handles thinking tags (<think>...</think>),
+                # markdown code fences, literal newlines in strings, and other
+                # common wrappers from models like Qwen, Reka, and Gemini.
+                from backend.services.providers.base import extract_json
+                data = extract_json(raw)
                 clips_data = data.get("clips", [])
                 if not clips_data:
                     logger.warning(f"Attempt {attempt + 1}: Model returned empty clips array, raw={raw[:300]}")

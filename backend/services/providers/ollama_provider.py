@@ -2109,16 +2109,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 logger.warning("Attempt %d: Ollama returned empty response for clip detection", attempt + 1)
                 continue
             try:
-                raw = raw.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-                start = raw.find("{")
-                end = raw.rfind("}") + 1
-                if start >= 0 and end > start:
-                    data = json.loads(raw[start:end])
-                else:
-                    logger.warning("Attempt %d: Ollama response has no JSON object. Raw: %s", attempt + 1, raw[:300])
-                    continue
+                # Use extract_json() which handles thinking tags, markdown,
+                # literal newlines, and other common LLM output wrappers
+                data = extract_json(raw)
                 clips = []
                 for c in data.get("clips", []):
                     st = float(c.get("start_time", 0))

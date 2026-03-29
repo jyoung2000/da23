@@ -48,8 +48,11 @@ def extract_json(raw: str) -> dict:
     markdown code blocks, literal newlines in strings, and other common
     wrappers."""
     text = raw.strip()
-    # Strip <think>...</think> or <reasoning>...</reasoning> blocks
+    # Strip <think>...</think> or <reasoning>...</reasoning> blocks (complete)
     text = re.sub(r'<(?:think|reasoning)>.*?</(?:think|reasoning)>', '', text, flags=re.DOTALL).strip()
+    # Strip unclosed thinking tags (model timed out mid-think)
+    # e.g. "<think>reasoning text\n\n{"clips": [...]}"
+    text = re.sub(r'<(?:think|reasoning)>.*?(?=\{)', '', text, flags=re.DOTALL).strip()
     # Strip markdown code fences
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -517,6 +520,8 @@ class AIProvider(ABC):
             "o4-mini",
             "deepseek-r1",
             "qwq",
+            "qwen3",        # Qwen 3.x models use extended thinking
+            "reka",         # Reka models may use reasoning blocks
         ]
         return any(pattern in model for pattern in thinking_patterns)
 
