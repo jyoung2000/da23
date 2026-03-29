@@ -697,10 +697,11 @@ async def test_pipeline(request: Request):
 
         tmp_dir = None
         # Track total phases dynamically
-        # Cloud providers: provider check + cloud test + ffmpeg + whisper phases + vision + text + clips + cleanup
+        # Cloud providers with Ollama fallback: add pre-whisper VRAM clear phase
         # Ollama providers: same phases + GPU rediscovery + VRAM management
         _whisper_phases = (1 if include_whisper else 0) + (1 if include_whisper and test_translation else 0)
-        total_phases = (8 + _whisper_phases) if not uses_ollama else (11 + _whisper_phases)
+        _vram_phase = 1 if (is_ollama and not uses_ollama) else 0  # Pre-whisper unload for cloud+ollama fallback
+        total_phases = (8 + _whisper_phases + _vram_phase) if not uses_ollama else (11 + _whisper_phases)
         phase_counter = [0]
 
         def _phase(phase_id, label):
@@ -888,9 +889,12 @@ async def test_pipeline(request: Request):
                 })
 
             # ══════════════════════════════════════════════════════════
-            # Phase: Clear VRAM (pre-Whisper) — Ollama only
+            # Phase: Clear VRAM before Whisper — ALWAYS run if Ollama container exists
+            # Whisper needs exclusive GPU access regardless of which AI provider
+            # is used for vision/text. Ollama may have loaded models from
+            # startup pulls, diagnostics polling, or previous pipeline runs.
             # ══════════════════════════════════════════════════════════
-            if uses_ollama:
+            if is_ollama:
                 yield _phase("pre_whisper_vram_clear", "Unloading Ollama models (free GPU for Whisper)...")
                 cleared = await _unload_and_wait(10)
                 yield _sse_event("phase_result", {

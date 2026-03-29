@@ -302,14 +302,26 @@ async def _startup_preload():
         threading.Thread(target=preload_model, daemon=True).start()
 
     # Pull Ollama models in the background only if Ollama is in the fallback chain.
+    # When cloud providers are primary, only pull the configured Ollama models
+    # (not the extras like llava, llama3.2) to minimize unnecessary downloads.
     if "ollama" in cfg.active_provider_chain:
+        _chain = [p.strip() for p in cfg.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+        _ollama_is_primary = _chain and _chain[0] == "ollama"
+
         def _pull_ollama_models():
             import httpx
             host = cfg.OLLAMA_HOST
-            models = [cfg.OLLAMA_VISION_MODEL, cfg.OLLAMA_TEXT_MODEL]
-            for extra in ("llava", "llama3.2:3b", cfg.OLLAMA_TRANSLATION_MODEL):
-                if extra and extra not in models:
-                    models.append(extra)
+            if _ollama_is_primary:
+                # Ollama is primary — pull all configured models + extras
+                models = [cfg.OLLAMA_VISION_MODEL, cfg.OLLAMA_TEXT_MODEL]
+                for extra in ("llava", "llama3.2:3b", cfg.OLLAMA_TRANSLATION_MODEL):
+                    if extra and extra not in models:
+                        models.append(extra)
+            else:
+                # Cloud provider is primary — only pull the configured fallback models
+                # Don't pull extras to save bandwidth and avoid unnecessary GPU loading
+                models = [cfg.OLLAMA_VISION_MODEL, cfg.OLLAMA_TEXT_MODEL]
+                logger.info("Cloud provider is primary — pulling only Ollama fallback models: %s", models)
             for model in models:
                 try:
                     logger.info("Background pull: requesting %s from Ollama...", model)
