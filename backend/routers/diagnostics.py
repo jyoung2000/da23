@@ -697,7 +697,10 @@ async def test_pipeline(request: Request):
 
         tmp_dir = None
         # Track total phases dynamically
-        total_phases = 2 if not uses_ollama else (11 + (1 if include_whisper else 0) + (1 if include_whisper and test_translation else 0))
+        # Cloud providers: provider check + cloud test + ffmpeg + whisper phases + vision + text + clips + cleanup
+        # Ollama providers: same phases + GPU rediscovery + VRAM management
+        _whisper_phases = (1 if include_whisper else 0) + (1 if include_whisper and test_translation else 0)
+        total_phases = (8 + _whisper_phases) if not uses_ollama else (11 + _whisper_phases)
         phase_counter = [0]
 
         def _phase(phase_id, label):
@@ -717,9 +720,10 @@ async def test_pipeline(request: Request):
             if not uses_ollama:
                 yield _sse_event("phase_result", {
                     "phase": "provider_gpu_check", "status": "pass",
-                    "message": "Cloud provider selected — no local GPU needed",
+                    "message": f"Cloud provider ({provider_label}) selected — using cloud AI for vision/text",
                 })
-                yield _phase("cloud_test", "Testing cloud API connection...")
+                # Test cloud API connectivity before proceeding
+                yield _phase("cloud_test", f"Testing {provider_label} API connection...")
                 try:
                     from backend.services.ai_orchestrator import AIOrchestrator
                     orch = AIOrchestrator()
@@ -731,43 +735,46 @@ async def test_pipeline(request: Request):
                     ms = int((time.time() - t0) * 1000)
                     yield _sse_event("phase_result", {
                         "phase": "cloud_test", "status": "pass",
-                        "message": f"Cloud API responded in {ms}ms",
+                        "message": f"{provider_label} API responded in {ms}ms",
                     })
                 except Exception as e:
                     yield _sse_event("phase_result", {
                         "phase": "cloud_test", "status": "fail",
-                        "message": f"Cloud API error: {str(e)[:200]}",
+                        "message": f"{provider_label} API error: {str(e)[:200]}",
                     })
-                yield _sse_event("complete", {"overall_status": "pass"})
-                return
-
-            # ── Ollama local pipeline ──
-            gpu = None
-            try:
-                async with httpx.AsyncClient(timeout=5) as client:
-                    resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
-                    if resp.status_code != 200:
-                        raise Exception(f"HTTP {resp.status_code}")
-
+                    yield _sse_event("complete", {"overall_status": "fail"})
+                    return
+                # Continue to test remaining pipeline stages (Whisper, vision, text, etc.)
                 gpu = await _get_gpu_info()
-                vram_mb = gpu.get("vram_total_bytes", 0) // 1024 // 1024 if gpu else 0
-                gpu_msg = (
-                    f"CUDA available, {gpu.get('gpu_name', 'GPU')} ({vram_mb}MB)"
-                    if gpu.get("cuda_available")
-                    else "No GPU detected — running on CPU"
-                )
-                yield _sse_event("phase_result", {
-                    "phase": "provider_gpu_check", "status": "pass",
-                    "message": f"Ollama connected. {gpu_msg}",
-                    "gpu": gpu,
-                })
-            except Exception as e:
-                yield _sse_event("phase_result", {
-                    "phase": "provider_gpu_check", "status": "fail",
-                    "message": f"Ollama not available: {e}",
-                })
-                yield _sse_event("complete", {"overall_status": "fail"})
-                return
+
+            if uses_ollama:
+                # ── Ollama local pipeline — check connectivity and GPU ──
+                gpu = None
+                try:
+                    async with httpx.AsyncClient(timeout=5) as client:
+                        resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
+                        if resp.status_code != 200:
+                            raise Exception(f"HTTP {resp.status_code}")
+
+                    gpu = await _get_gpu_info()
+                    vram_mb = gpu.get("vram_total_bytes", 0) // 1024 // 1024 if gpu else 0
+                    gpu_msg = (
+                        f"CUDA available, {gpu.get('gpu_name', 'GPU')} ({vram_mb}MB)"
+                        if gpu.get("cuda_available")
+                        else "No GPU detected — running on CPU"
+                    )
+                    yield _sse_event("phase_result", {
+                        "phase": "provider_gpu_check", "status": "pass",
+                        "message": f"Ollama connected. {gpu_msg}",
+                        "gpu": gpu,
+                    })
+                except Exception as e:
+                    yield _sse_event("phase_result", {
+                        "phase": "provider_gpu_check", "status": "fail",
+                        "message": f"Ollama not available: {e}",
+                    })
+                    yield _sse_event("complete", {"overall_status": "fail"})
+                    return
 
             # ══════════════════════════════════════════════════════════
             # Phase: FFmpeg availability
@@ -881,16 +888,16 @@ async def test_pipeline(request: Request):
                 })
 
             # ══════════════════════════════════════════════════════════
-            # Phase: Clear Ollama VRAM (pre-Whisper)
-            # Real pipeline: unload_models() before Whisper gets exclusive GPU
+            # Phase: Clear VRAM (pre-Whisper) — Ollama only
             # ══════════════════════════════════════════════════════════
-            yield _phase("pre_whisper_vram_clear", "Unloading Ollama models (free GPU for Whisper)...")
-            cleared = await _unload_and_wait(10)
-            yield _sse_event("phase_result", {
-                "phase": "pre_whisper_vram_clear",
-                "status": "pass" if cleared else "warn",
-                "message": "Ollama models unloaded — GPU freed for Whisper" if cleared else "Models may still be unloading",
-            })
+            if uses_ollama:
+                yield _phase("pre_whisper_vram_clear", "Unloading Ollama models (free GPU for Whisper)...")
+                cleared = await _unload_and_wait(10)
+                yield _sse_event("phase_result", {
+                    "phase": "pre_whisper_vram_clear",
+                    "status": "pass" if cleared else "warn",
+                    "message": "Ollama models unloaded — GPU freed for Whisper" if cleared else "Models may still be unloading",
+                })
 
             # ══════════════════════════════════════════════════════════
             # Phase: Whisper transcription test
@@ -1030,57 +1037,50 @@ async def test_pipeline(request: Request):
                     })
 
             # ══════════════════════════════════════════════════════════
-            # Phase: Ollama GPU rediscovery
-            # Real pipeline: _trigger_ollama_gpu_rediscovery()
-            # After Whisper releases CUDA, Ollama's cached GPU state is stale.
-            # Must load a model with num_gpu=99 to trigger fresh GPU scan.
+            # Phase: Ollama GPU rediscovery (Ollama-only)
             # ══════════════════════════════════════════════════════════
-            yield _phase("ollama_gpu_rediscovery", "Triggering Ollama GPU rediscovery...")
+            if uses_ollama:
+                yield _phase("ollama_gpu_rediscovery", "Triggering Ollama GPU rediscovery...")
 
-            # Step 1: Ensure all models unloaded first
-            await _unload_and_wait(10)
-            await asyncio.sleep(2)  # CUDA driver settle
+                await _unload_and_wait(10)
+                await asyncio.sleep(2)
 
-            # Step 2: Load vision model with num_gpu=99 to trigger GPU re-scan
-            # This is exactly what _trigger_ollama_gpu_rediscovery() does
-            gpu_rediscovered = False
-            try:
-                async with httpx.AsyncClient(timeout=120) as _rc:
-                    _probe = await _rc.post(
-                        f"{settings.OLLAMA_HOST}/api/generate",
-                        json={
-                            "model": vision_model,
-                            "prompt": "test",
-                            "stream": False,
-                            "options": {"num_gpu": 99, "num_predict": 1},
-                        },
-                        timeout=120,
-                    )
-                    if _probe.status_code == 200:
-                        # Check if it actually loaded on GPU
-                        _ps = await _rc.get(f"{settings.OLLAMA_HOST}/api/ps", timeout=10)
-                        if _ps.status_code == 200:
-                            for m in _ps.json().get("models", []):
-                                if m.get("size_vram", 0) > 0:
-                                    gpu_rediscovered = True
-                                    vram_mb = m.get("size_vram", 0) // 1024 // 1024
-                                    break
-                        # Unload the probe model
-                        await _rc.post(f"{settings.OLLAMA_HOST}/api/generate",
-                            json={"model": vision_model, "keep_alive": 0}, timeout=10)
-            except Exception as e:
-                logger.warning("GPU rediscovery probe failed: %s", e)
+                gpu_rediscovered = False
+                try:
+                    async with httpx.AsyncClient(timeout=120) as _rc:
+                        _probe = await _rc.post(
+                            f"{settings.OLLAMA_HOST}/api/generate",
+                            json={
+                                "model": vision_model,
+                                "prompt": "test",
+                                "stream": False,
+                                "options": {"num_gpu": 99, "num_predict": 1},
+                            },
+                            timeout=120,
+                        )
+                        if _probe.status_code == 200:
+                            _ps = await _rc.get(f"{settings.OLLAMA_HOST}/api/ps", timeout=10)
+                            if _ps.status_code == 200:
+                                for m in _ps.json().get("models", []):
+                                    if m.get("size_vram", 0) > 0:
+                                        gpu_rediscovered = True
+                                        vram_mb = m.get("size_vram", 0) // 1024 // 1024
+                                        break
+                            await _rc.post(f"{settings.OLLAMA_HOST}/api/generate",
+                                json={"model": vision_model, "keep_alive": 0}, timeout=10)
+                except Exception as e:
+                    logger.warning("GPU rediscovery probe failed: %s", e)
 
-            if gpu_rediscovered:
-                yield _sse_event("phase_result", {
-                    "phase": "ollama_gpu_rediscovery", "status": "pass",
-                    "message": f"GPU rediscovered — {vision_model} loaded on GPU ({vram_mb}MB VRAM)",
-                })
-            else:
-                yield _sse_event("phase_result", {
-                    "phase": "ollama_gpu_rediscovery", "status": "warn",
-                    "message": "GPU rediscovery: model loaded on CPU — GPU may be poisoned. Try restarting Ollama container.",
-                })
+                if gpu_rediscovered:
+                    yield _sse_event("phase_result", {
+                        "phase": "ollama_gpu_rediscovery", "status": "pass",
+                        "message": f"GPU rediscovered — {vision_model} loaded on GPU ({vram_mb}MB VRAM)",
+                    })
+                else:
+                    yield _sse_event("phase_result", {
+                        "phase": "ollama_gpu_rediscovery", "status": "warn",
+                        "message": "GPU rediscovery: model loaded on CPU — GPU may be poisoned. Try restarting Ollama container.",
+                    })
 
             # ══════════════════════════════════════════════════════════
             # Phase: Vision model test (scene analysis)
