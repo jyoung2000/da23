@@ -156,8 +156,11 @@ async def preflight_whisper_check(timeout: float = 90) -> dict:
         _real_cuda = os.environ.get("_CLIPAI_REAL_CUDA_VISIBLE_DEVICES")
         if _real_cuda is not None:
             _subprocess_env["CUDA_VISIBLE_DEVICES"] = _real_cuda
-        elif "CUDA_VISIBLE_DEVICES" in _subprocess_env and _subprocess_env["CUDA_VISIBLE_DEVICES"] == "":
-            del _subprocess_env["CUDA_VISIBLE_DEVICES"]
+        else:
+            # No original CUDA_VISIBLE_DEVICES was set — the NVIDIA Container Toolkit
+            # maps GPUs via NVIDIA_VISIBLE_DEVICES instead. Set CUDA_VISIBLE_DEVICES
+            # to "0" so CTranslate2 can find the GPU in the subprocess.
+            _subprocess_env["CUDA_VISIBLE_DEVICES"] = "0"
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -413,8 +416,11 @@ async def transcribe_audio_subprocess(
         _real_cuda = os.environ.get("_CLIPAI_REAL_CUDA_VISIBLE_DEVICES")
         if _real_cuda is not None:
             _subprocess_env["CUDA_VISIBLE_DEVICES"] = _real_cuda
-        elif "CUDA_VISIBLE_DEVICES" in _subprocess_env and _subprocess_env["CUDA_VISIBLE_DEVICES"] == "":
-            del _subprocess_env["CUDA_VISIBLE_DEVICES"]
+        else:
+            # No original CUDA_VISIBLE_DEVICES was set — the NVIDIA Container Toolkit
+            # maps GPUs via NVIDIA_VISIBLE_DEVICES instead. Set CUDA_VISIBLE_DEVICES
+            # to "0" so CTranslate2 can find the GPU in the subprocess.
+            _subprocess_env["CUDA_VISIBLE_DEVICES"] = "0"
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
