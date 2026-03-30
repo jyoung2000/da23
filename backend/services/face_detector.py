@@ -37,6 +37,7 @@ class FaceInfo:
     width: float          # Face bbox width as % of frame
     height: float         # Face bbox height as % of frame
     nose_x: float         # Nose tip x position, 0-100
+    nose_y: float         # Nose tip y position, 0-100
     confidence: float     # Detection confidence, 0-1
 
 
@@ -94,6 +95,7 @@ def detect_faces_batch(
                         det, mp.solutions.face_detection.FaceKeyPoint.NOSE_TIP,
                     )
                     nose_x = nose.x * 100 if nose else face_cx
+                    nose_y = nose.y * 100 if nose else face_cy
 
                     conf = det.score[0] if det.score else 0.0
                     faces.append(FaceInfo(
@@ -102,6 +104,7 @@ def detect_faces_batch(
                         width=round(face_w, 1),
                         height=round(face_h, 1),
                         nose_x=round(nose_x, 1),
+                        nose_y=round(nose_y, 1),
                         confidence=round(conf, 3),
                     ))
 

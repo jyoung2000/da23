@@ -787,24 +787,17 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             content: list[dict] = [
                 {"type": "text", "text": (
                     instruction + "\n\n"
-                    "Return ONLY a valid JSON array. No markdown, no explanation.\n"
+                    "Return ONLY a valid JSON array. No markdown.\n"
                     '[{"timestamp": <float>, "description": "<text>", '
-                    '"importance_score": <1-10>, "subject_x": <0-100>}]\n\n'
-                    "subject_x = horizontal position of the FACE CENTER of the main person.\n"
-                    "Imagine the frame divided into a 10-column grid:\n"
-                    "  columns 1-2 = far left (subject_x 10-20)\n"
-                    "  columns 3-4 = left side (subject_x 30-40)\n"
-                    "  column 5 = center-left (subject_x 45)\n"
-                    "  column 6 = center-right (subject_x 55)\n"
-                    "  columns 7-8 = right side (subject_x 60-70)\n"
-                    "  columns 9-10 = far right (subject_x 80-90)\n\n"
-                    "RULES:\n"
-                    "- Track the face of whoever is TALKING (lips moving, gesturing)\n"
-                    "- If nobody talking, track the most prominent face\n"
-                    "- Estimate which COLUMN their face center falls in\n"
-                    "- Interview subjects are almost always in columns 3-4 or 7-8\n"
-                    "- If no people visible (title card/graphic), use 30 or 70 based on layout\n"
-                    "- VARY your subject_x per frame — do not repeat the same value"
+                    '"importance_score": <1-10>, "subject_x": <0-100>, '
+                    '"active_face": <1-based index or 0>}]\n\n'
+                    "Face positions are shown in brackets after each frame timestamp.\n"
+                    "subject_x: USE the provided face x-position of whoever is SPEAKING.\n"
+                    "active_face: which face number is talking (1=first, 2=second, 0=unsure/none).\n\n"
+                    "If 1 face: set subject_x to that face's x value, active_face=1.\n"
+                    "If 2+ faces: pick who is TALKING, use their x value.\n"
+                    "If 0 faces: estimate position from content (30=left-weighted, 70=right).\n"
+                    "The face positions are pixel-accurate. TRUST them over your own estimate."
                 )},
             ]
             for frame in batch:
@@ -909,10 +902,18 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     # ── Position fusion: prefer face detection over AI estimate ──
                     fd = getattr(frame_ref, 'face_data', None)
                     if fd and hasattr(fd, 'faces') and fd.faces:
-                        # Face detection data available — use pixel-accurate position
-                        active_idx = item.get("active_face_index")
-                        if isinstance(active_idx, int) and 0 <= active_idx < len(fd.faces):
-                            sx = round(fd.faces[active_idx].nose_x)
+                        # Resolve active face index (1-based "active_face" or 0-based "active_face_index")
+                        afi = -1
+                        af_val = item.get("active_face") or item.get("active_face_index")
+                        if af_val is not None:
+                            try:
+                                af_int = int(af_val)
+                                # 1-based (active_face) if > 0, 0-based (active_face_index) if schema used
+                                afi = af_int - 1 if af_int > 0 else af_int
+                            except (ValueError, TypeError):
+                                pass
+                        if 0 <= afi < len(fd.faces):
+                            sx = round(fd.faces[afi].nose_x)
                         elif len(fd.faces) == 1:
                             sx = round(fd.faces[0].nose_x)
                         elif fd.primary_face_idx >= 0:
