@@ -10,7 +10,11 @@ COPY frontend/ ./
 RUN npm run build
 
 ## Stage 2: GPU Runtime
-FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+# Use CUDA 12.0 to match host driver version 12090 (CUDA 12.0.x).
+# The previous 12.3.2 base required driver 545+ but the host has ~530.
+# CTranslate2 and PyTorch CUDA init failed with "unknown error" due to
+# this version mismatch. CUDA 12.0 is compatible with driver 12.0.x.
+FROM nvidia/cuda:12.0.1-cudnn8-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
@@ -108,7 +112,7 @@ WORKDIR /app
 COPY backend/requirements.txt .
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt && \
-    pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
+    pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12 && \
     pip3 install --no-cache-dir pyannote.audio>=3.1.0 torch>=2.0.0 && \
     # Register pip-installed NVIDIA libs so ctranslate2/torch can find them at runtime
     # (path varies by Python version — 3.10 on Ubuntu 22.04, 3.11 if installed from apt)
