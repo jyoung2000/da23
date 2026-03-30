@@ -805,9 +805,19 @@ def _get_whisper_model():
                 if vram_mb >= 8000:
                     settings.WHISPER_MODEL = "large-v3"
                     logger.info("Auto-upgraded Whisper to large-v3 (%dMB VRAM)", vram_mb)
+                    try:
+                        from backend.routers.settings import _persist_user_settings
+                        _persist_user_settings()
+                    except Exception:
+                        pass
                 elif vram_mb >= 6000:
                     settings.WHISPER_MODEL = "large-v3-turbo"
                     logger.info("Auto-upgraded Whisper to large-v3-turbo (%dMB VRAM)", vram_mb)
+                    try:
+                        from backend.routers.settings import _persist_user_settings
+                        _persist_user_settings()
+                    except Exception:
+                        pass
                 else:
                     # 4GB or less: keep 'small' (~500MB VRAM) to avoid CUDA OOM.
                     # large-v3-turbo crashed at 4:31 on a 113-min Japanese video

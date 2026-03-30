@@ -347,6 +347,18 @@ async def _startup_preload():
     else:
         logger.info("Ollama not in fallback chain — skipping background model pull")
 
+    # ── Persist combined settings state ──
+    # At this point, settings contain: (1) code defaults, (2) .env overrides,
+    # (3) restored user_settings.json values, (4) GPU auto-detection results.
+    # Persist everything so that ALL of these survive the next container rebuild,
+    # including API keys that were only set via .env and never saved through the UI.
+    try:
+        from backend.routers.settings import _persist_user_settings
+        _persist_user_settings()
+        logger.info("Settings persisted after startup initialization")
+    except Exception as e:
+        logger.warning("Failed to persist settings after startup: %s", e)
+
 @app.on_event("startup")
 async def warmup_ollama():
     """Detect Ollama model capabilities (without loading into VRAM).
