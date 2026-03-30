@@ -37,6 +37,8 @@ RUN apt-get update && apt-get install -y \
     libass-dev libfreetype6-dev libfontconfig1-dev libfribidi-dev \
     libmp3lame-dev libopus-dev libvorbis-dev libx264-dev libx265-dev \
     libnuma-dev libvpx-dev libfdk-aac-dev \
+    # MediaPipe face detection dependencies
+    libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install nv-codec-headers for NVENC/NVDEC support

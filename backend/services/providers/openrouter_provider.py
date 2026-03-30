@@ -813,9 +813,18 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{frame.base64}"},
                     })
+                    # Include face detection data if available
+                    face_hint = ""
+                    fd = getattr(frame, 'face_data', None)
+                    if fd and hasattr(fd, 'faces') and fd.faces:
+                        if len(fd.faces) == 1:
+                            face_hint = f" | 1 face at x={fd.faces[0].nose_x:.0f}%"
+                        else:
+                            descs = [f"face{i+1}@x={f.nose_x:.0f}%" for i, f in enumerate(fd.faces)]
+                            face_hint = f" | {len(fd.faces)} faces: {', '.join(descs)}"
                     content.append({
                         "type": "text",
-                        "text": f"[Frame at {frame.timestamp:.1f}s]",
+                        "text": f"[Frame at {frame.timestamp:.1f}s{face_hint}]",
                     })
 
             messages = [{"role": "user", "content": content}]
@@ -895,16 +904,23 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             sx = max(0, min(100, round(sx)))
                         except (ValueError, TypeError):
                             sx = 50
-                    # If model returned center (50) or omitted subject_x,
-                    # try extracting position from description text.
                     desc_text = item.get("description", "")
-                    if sx == 50 and desc_text:
+
+                    # ── Position fusion: prefer face detection over AI estimate ──
+                    fd = getattr(frame_ref, 'face_data', None)
+                    if fd and hasattr(fd, 'faces') and fd.faces:
+                        # Face detection data available — use pixel-accurate position
+                        active_idx = item.get("active_face_index")
+                        if isinstance(active_idx, int) and 0 <= active_idx < len(fd.faces):
+                            sx = round(fd.faces[active_idx].nose_x)
+                        elif len(fd.faces) == 1:
+                            sx = round(fd.faces[0].nose_x)
+                        elif fd.primary_face_idx >= 0:
+                            sx = round(fd.faces[fd.primary_face_idx].nose_x)
+                    elif sx == 50 and desc_text:
+                        # No face data — fall back to text extraction
                         text_sx = _extract_position_from_text(desc_text)
                         if text_sx is not None:
-                            logger.debug(
-                                "Batch %d frame %d: extracted subject_x=%d from description (was 50)",
-                                batch_idx, idx, text_sx,
-                            )
                             sx = text_sx
                     active_sx = item.get("active_speaker_x")
                     if active_sx is not None:

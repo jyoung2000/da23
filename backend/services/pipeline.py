@@ -963,6 +963,26 @@ async def _run_analysis_inner(job_id: str):
                 "The video file may be very large or the container is under heavy load."
             )
     total_frames = len(frames)
+
+    # ── Face detection (CPU-only, ~0.5s for 60 frames) ──
+    # Runs pixel-accurate face detection on extracted frames to augment
+    # the AI vision model's subject_x estimates. No GPU needed.
+    if settings.SUBJECT_TRACKING_ENABLED:
+        try:
+            from backend.services.face_detector import detect_faces_batch
+            frame_list = [(f.timestamp, f.path) for f in frames]
+            logger.info("[%s] Running face detection on %d frames...", job_id, len(frame_list))
+            face_results = detect_faces_batch(frame_list)
+            # Attach face data to each frame
+            for frame, face_data in zip(frames, face_results):
+                frame.face_data = face_data
+            faces_found = sum(1 for fd in face_results if fd.faces)
+            logger.info("[%s] Face detection complete: %d/%d frames have faces", job_id, faces_found, len(frames))
+        except ImportError:
+            logger.info("[%s] Face detection unavailable (mediapipe not installed) — using AI estimates only", job_id)
+        except Exception as e:
+            logger.warning("[%s] Face detection failed (non-fatal): %s", job_id, e)
+
     _phase_timings["extraction"] = _pipeline_elapsed()
     logger.info("[%s] Extracted %d frames + audio track", job_id, total_frames)
     await _update_progress(

@@ -19,6 +19,10 @@ class FrameData(BaseModel):
     timestamp: float
     path: str
     base64: Optional[str] = None
+    face_data: Optional[object] = None  # FrameFaces from face_detector (set after extraction)
+
+    class Config:
+        arbitrary_types_allowed = True
 
 
 class SceneDescription(BaseModel):
