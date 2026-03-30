@@ -906,8 +906,10 @@ class ChunkedClipDetectionMixin:
         )
 
         async def _process_window(idx: int, w_start: float, w_end: float):
-            # Override clip_count for per-window calls
-            window_kwargs = dict(kwargs)
+            # Override clip_count for per-window calls.
+            # Strip progress_callback — it's handled by the multi-pass orchestrator,
+            # not individual _single_pass_clip_detection calls.
+            window_kwargs = {k: v for k, v in kwargs.items() if k != "progress_callback"}
             window_kwargs["clip_count"] = _clips_per_window
             window_transcript = [
                 seg for seg in transcript

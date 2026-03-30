@@ -230,9 +230,15 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     _DEFAULT_MAX_IMAGES = 8            # most models handle 8 images fine
     _DEFAULT_VISION_MAX_TOKENS = 4096
 
-    # How many tokens an image takes (approximate; varies by resolution).
+    # How many tokens an image takes (approximate; varies by model/resolution).
     # Used to compute safe max_tokens from the remaining context budget.
+    # Models tokenize images very differently: reka ~5800/img, gemini ~800/img.
     _TOKENS_PER_IMAGE_ESTIMATE = 1500
+    _MODEL_TOKENS_PER_IMAGE = {
+        "reka": 6000,          # Reka: ~5780 tokens per JPEG image
+        "llama-3.2": 4000,     # Llama 3.2 vision: high token cost per image
+        "moondream": 4000,     # Moondream: single-image, high token cost
+    }
 
     def _get_context_budget(self, model: str) -> int:
         """Return the approximate char budget for prompt content.
@@ -254,12 +260,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 return budget
         return self._DEFAULT_CONTEXT_BUDGET
 
+    def _get_tokens_per_image(self, model: str) -> int:
+        """Return the estimated token cost per image for the model."""
+        model_lower = model.lower()
+        for pattern, tokens in self._MODEL_TOKENS_PER_IMAGE.items():
+            if pattern in model_lower:
+                return tokens
+        return self._TOKENS_PER_IMAGE_ESTIMATE
+
     def _get_max_images(self, model: str) -> int:
         """Return the max images per vision call for the given model.
 
         Uses known image limits first, then estimates from the model's
-        context window: images ≈ 1500 tokens each, and we need room for
-        the text prompt (~800 tokens) and output (~1024-4096 tokens).
+        context window using model-specific image token costs.
         """
         model_lower = model.lower()
 
@@ -269,6 +282,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 return limit
 
         # Estimate from context window
+        tokens_per_image = self._get_tokens_per_image(model)
         caps = self._model_caps.get(model_lower)
         if caps and caps["context_length"] > 0:
             ctx = caps["context_length"]
@@ -276,7 +290,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             output_reserve = min(max_out, 4096)
             prompt_overhead = 800  # instruction text
             available_for_images = ctx - output_reserve - prompt_overhead
-            estimated_max = max(1, available_for_images // self._TOKENS_PER_IMAGE_ESTIMATE)
+            estimated_max = max(1, available_for_images // tokens_per_image)
             # Cap at 8 (diminishing returns beyond that) and leave 1 image of headroom
             return min(8, max(1, estimated_max - 1))
 
@@ -293,13 +307,14 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         capped to leave room for images within the context window.
         """
         model_lower = model.lower()
+        tokens_per_image = self._get_tokens_per_image(model)
         caps = self._model_caps.get(model_lower)
         if caps and caps["context_length"] > 0:
             ctx = caps["context_length"]
             max_comp = caps.get("max_completion_tokens", 0) or 4096
             # For vision: assume batch_size images + prompt text
             batch_size = self._get_max_images(model)
-            image_tokens = batch_size * self._TOKENS_PER_IMAGE_ESTIMATE
+            image_tokens = batch_size * tokens_per_image
             prompt_tokens = 800
             available_for_output = ctx - image_tokens - prompt_tokens
             # Clamp between 512 and model's max, don't exceed available budget
@@ -903,6 +918,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         max_duration: Optional[float] = None,
         video_summary: Optional[str] = None,
         existing_clips: Optional[str] = None,
+        hot_zones=None,
+        **_extra,
     ) -> list[ClipCandidate]:
         instruction = custom_prompt if custom_prompt else DEFAULT_VIRAL_CLIP_PROMPT
 
