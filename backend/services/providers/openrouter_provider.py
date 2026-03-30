@@ -787,18 +787,20 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             content: list[dict] = [
                 {"type": "text", "text": (
                     instruction + "\n\n"
-                    "Return ONLY valid JSON array:\n"
-                    '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>}]\n'
-                    "CRITICAL RULES FOR subject_x:\n"
-                    "- subject_x = horizontal position of the ACTIVE SPEAKER (lips moving)\n"
-                    "- If multiple people: pick who is TALKING\n"
-                    "- If nobody speaking: pick the most prominent person's face\n"
-                    "- 0=left edge, 25=left quarter, 50=center, 75=right quarter, 100=right\n"
-                    "- NEVER return 50 unless a face is TRULY at exact center\n"
-                    "- Title cards/logos with no people: use the position of the nearest person "
-                    "from surrounding frames, or use 30 for left-side content, 70 for right-side\n"
-                    "- Interview subjects are almost ALWAYS off-center (30-45 or 55-70)\n"
-                    "- Returning 50 for every frame is WRONG — vary your answer"
+                    "Return ONLY a valid JSON array. No markdown, no explanation.\n"
+                    '[{"timestamp": <float>, "description": "<text>", '
+                    '"importance_score": <1-10>, "subject_x": <0-100>}]\n\n'
+                    "subject_x = horizontal position of the MAIN PERSON on screen.\n"
+                    "Pick the person who is TALKING (lips moving, gesturing).\n"
+                    "If nobody is talking, pick the most prominent face.\n\n"
+                    "SCALE: 0=left edge, 25=left quarter, 50=center, 75=right quarter, 100=right edge\n"
+                    "EXAMPLES: person on far left=15, slightly left=35, center=50, slightly right=65, far right=85\n\n"
+                    "RULES:\n"
+                    "- Look at where the person's FACE is, not the overall scene\n"
+                    "- Interview/podcast subjects are usually at 30-45 or 55-70, rarely at exactly 50\n"
+                    "- If you see a title card or graphic with NO people, estimate where the nearest "
+                    "person WOULD be based on the scene layout (30 for left-weighted, 70 for right-weighted)\n"
+                    "- VARY your subject_x — do not return 50 for every frame"
                 )},
             ]
             for frame in batch:
@@ -881,7 +883,14 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     if sx is None:
                         sx = 50
                     else:
-                        sx = max(0, min(100, int(sx)))
+                        try:
+                            sx = float(str(sx).strip().rstrip('%'))
+                            # Some models return pixel coords instead of percentages
+                            if sx > 100:
+                                sx = (sx / 1024) * 100
+                            sx = max(0, min(100, round(sx)))
+                        except (ValueError, TypeError):
+                            sx = 50
                     # If model returned center (50) or omitted subject_x,
                     # try extracting position from description text.
                     desc_text = item.get("description", "")
@@ -896,7 +905,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     active_sx = item.get("active_speaker_x")
                     if active_sx is not None:
                         try:
-                            active_sx = max(0, min(100, int(active_sx)))
+                            active_sx = max(0, min(100, int(float(str(active_sx).strip()))))
                         except (ValueError, TypeError):
                             active_sx = None
                     batch_results[batch_idx].append(SceneDescription(
@@ -952,6 +961,23 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         scenes = []
         for batch_scene_list in batch_results:
             scenes.extend(batch_scene_list)
+
+        # ── Center-default quality logging ──
+        all_sx = [s.subject_x for s in scenes]
+        center_count = sum(1 for x in all_sx if 47 <= x <= 53)
+        if all_sx:
+            center_pct_log = center_count / len(all_sx) * 100
+            if center_pct_log > 30:
+                logger.warning(
+                    "Vision quality: %.0f%% of frames (%d/%d) returned center defaults "
+                    "(subject_x 47-53). Model '%s' may have poor spatial reasoning.",
+                    center_pct_log, center_count, len(all_sx), self._vision_model,
+                )
+            else:
+                logger.info(
+                    "Vision quality: center-default rate %.0f%% (%d/%d) — acceptable",
+                    center_pct_log, center_count, len(all_sx),
+                )
 
         # ── Quality check: if most frames defaulted to center, re-analyze ──
         # Skip re-analysis if the initial analysis failed due to auth/billing errors —
