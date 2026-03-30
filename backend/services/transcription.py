@@ -804,20 +804,10 @@ def _get_whisper_model():
                 vram_mb = gpus[0]["vram_mb"] if gpus else 0
                 if vram_mb >= 8000:
                     settings.WHISPER_MODEL = "large-v3"
-                    logger.info("Auto-upgraded Whisper to large-v3 (%dMB VRAM)", vram_mb)
-                    try:
-                        from backend.routers.settings import _persist_user_settings
-                        _persist_user_settings()
-                    except Exception:
-                        pass
+                    logger.info("Auto-upgraded Whisper to large-v3 (%dMB VRAM) — session only, not persisted", vram_mb)
                 elif vram_mb >= 6000:
                     settings.WHISPER_MODEL = "large-v3-turbo"
-                    logger.info("Auto-upgraded Whisper to large-v3-turbo (%dMB VRAM)", vram_mb)
-                    try:
-                        from backend.routers.settings import _persist_user_settings
-                        _persist_user_settings()
-                    except Exception:
-                        pass
+                    logger.info("Auto-upgraded Whisper to large-v3-turbo (%dMB VRAM) — session only, not persisted", vram_mb)
                 else:
                     # 4GB or less: keep 'small' (~500MB VRAM) to avoid CUDA OOM.
                     # large-v3-turbo crashed at 4:31 on a 113-min Japanese video
@@ -869,11 +859,14 @@ def _get_whisper_model():
                         whisper_device_info["recommended_beam_size"] = 1
                     else:
                         original = settings.WHISPER_MODEL
+                        # Downgrade the LOCAL model name only — do NOT modify
+                        # settings.WHISPER_MODEL because subsequent _persist_user_settings()
+                        # calls would overwrite the user's saved model choice.
                         settings.WHISPER_MODEL = "medium"  # NEVER small on GPU
                         logger.warning(
-                            "AUTO-DOWNGRADE: Whisper '%s' needs ~%dMB VRAM but GPU only has %dMB. "
-                            "Downgrading to 'medium' (not small — medium has much better "
-                            "translation accuracy). To force '%s', select it in Settings.",
+                            "AUTO-DOWNGRADE (session only): Whisper '%s' needs ~%dMB VRAM but GPU only has %dMB. "
+                            "Downgrading to 'medium' for this session. Saved model preference is preserved. "
+                            "To force '%s', select it in Settings.",
                             original, min_vram, vram_mb, original,
                         )
 

@@ -95,6 +95,15 @@ def _persist_user_settings() -> bool:
         pass
 
     data = {}
+    skipped_keys = []
+
+    # Protect user-set WHISPER_MODEL from being overwritten by runtime auto-upgrades/downgrades.
+    # If WHISPER_MODEL_USER_SET is True in the existing file, keep the file's WHISPER_MODEL
+    # unless the user explicitly changed it via the save_models endpoint (which sets
+    # WHISPER_MODEL_USER_SET = True in the current settings too).
+    _whisper_user_set_in_file = existing_data.get("WHISPER_MODEL_USER_SET", False)
+    _whisper_model_in_file = existing_data.get("WHISPER_MODEL")
+
     for key in _PERSISTABLE_KEYS:
         val = getattr(settings, key, "")
         # Non-string types (bool, int) are always persisted
@@ -109,11 +118,40 @@ def _persist_user_settings() -> bool:
                 data[key] = val
             elif key in existing_data and _is_real_value(key, existing_data[key]):
                 data[key] = existing_data[key]
+                logger.debug("Preserving %s from existing file (in-memory is empty)", key)
+            else:
+                skipped_keys.append(key)
             continue
+
+        # Protect WHISPER_MODEL: if the user explicitly set a model in the file
+        # but the in-memory value differs (due to auto-upgrade/downgrade), keep
+        # the user's saved choice. The auto-upgrade only affects the current session.
+        if key == "WHISPER_MODEL" and _whisper_user_set_in_file and _whisper_model_in_file:
+            if _is_real_value(key, val) and val != _whisper_model_in_file:
+                # In-memory value differs from user's saved choice — check if the
+                # current settings object also has WHISPER_MODEL_USER_SET=True
+                # (meaning the user just changed it via the UI in this session)
+                if not getattr(settings, "WHISPER_MODEL_USER_SET", False):
+                    # Auto-change, not user change — preserve the file value
+                    data[key] = _whisper_model_in_file
+                    logger.info(
+                        "Preserving user's saved WHISPER_MODEL='%s' (runtime has '%s' from auto-upgrade/downgrade)",
+                        _whisper_model_in_file, val,
+                    )
+                    continue
+
         # Skip empty values for non-key settings
         if not _is_real_value(key, val):
             continue
         data[key] = val
+
+    # Log what API keys are being saved (or not)
+    for key in _API_KEY_FIELDS:
+        if key in data:
+            logger.info("Persisting %s: YES (value present, %d chars)", key, len(str(data[key])))
+        elif key in skipped_keys:
+            logger.debug("Persisting %s: NO (empty in memory and file)", key)
+
     try:
         os.makedirs(os.path.dirname(USER_SETTINGS_PATH), exist_ok=True)
         with open(USER_SETTINGS_PATH, "w") as f:
@@ -139,6 +177,21 @@ def _restore_user_settings():
         with open(USER_SETTINGS_PATH, "r") as f:
             data = json.load(f)
         restored = 0
+
+        # Log what's in the file for diagnostics
+        api_keys_in_file = [k for k in _API_KEY_FIELDS if k in data and _is_real_value(k, data[k])]
+        model_keys_in_file = [
+            k for k in ["WHISPER_MODEL", "OPENROUTER_VISION_MODEL", "OPENROUTER_TEXT_MODEL",
+                         "AI_FALLBACK_CHAIN", "WHISPER_MODEL_USER_SET"]
+            if k in data
+        ]
+        logger.info(
+            "Restoring from %s: %d keys total, API keys: %s, model settings: %s",
+            USER_SETTINGS_PATH, len(data),
+            api_keys_in_file or "none",
+            {k: data[k] for k in model_keys_in_file},
+        )
+
         for key, val in data.items():
             if key not in _PERSISTABLE_KEYS:
                 continue
@@ -155,7 +208,7 @@ def _restore_user_settings():
             # (the user explicitly saved via the UI after the env was set).
             if key in _API_KEY_FIELDS:
                 setattr(settings, key, val)
-                logger.info(f"Restored API key: {key}")
+                logger.info(f"Restored API key: {key} ({len(val)} chars)")
                 restored += 1
             else:
                 # For model/preset settings: always restore persisted values.
