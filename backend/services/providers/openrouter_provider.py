@@ -763,8 +763,27 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # while the previous response is in flight.
         sem = asyncio.Semaphore(2)
 
+        # Track consecutive non-retryable failures (403 auth/billing, 401 unauthorized).
+        # When ALL models fail with the same error, further batches will too — abort early.
+        _consecutive_auth_failures = 0
+        _AUTH_FAILURE_ABORT_THRESHOLD = 2  # Abort after 2 consecutive auth/billing failures
+
         async def _analyze_batch(batch, batch_idx, _depth=0):
+            nonlocal _consecutive_auth_failures
             """Process a vision batch with auto-split on limit errors (max depth 2)."""
+            # Early abort: if all models are failing with auth/billing errors,
+            # skip remaining batches to avoid hammering a dead API for minutes.
+            if _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD and _depth == 0:
+                for frame in batch:
+                    batch_results[batch_idx].append(SceneDescription(
+                        timestamp=frame.timestamp,
+                        description="Frame analysis unavailable — API key limit exceeded",
+                        importance_score=5,
+                        thumbnail_path=frame.path,
+                        subject_x=50,
+                    ))
+                return
+
             content: list[dict] = [
                 {"type": "text", "text": (
                     instruction + "\n\n"
@@ -802,8 +821,23 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     or ("image" in err_str and ("limit" in err_str or "at most" in err_str))
                     or "too many" in err_str
                 )
+                # Detect non-retryable auth/billing errors (403 key limit, 401 unauthorized)
+                is_auth_error = (
+                    "key limit exceeded" in err_str
+                    or "unauthorized" in err_str
+                    or "invalid api key" in err_str
+                    or "all openrouter models failed" in err_str and "403" in err_str
+                )
+                if is_auth_error:
+                    _consecutive_auth_failures += 1
+                    if _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD:
+                        logger.warning(
+                            "Batch %d/%d: %d consecutive auth/billing failures — "
+                            "aborting remaining batches (API key likely exhausted)",
+                            batch_idx + 1, num_batches, _consecutive_auth_failures,
+                        )
                 # Auto-split: if limit error and batch has 2+ images, halve and retry
-                if is_limit_error and len(batch) > 1 and _depth < 2:
+                if is_limit_error and not is_auth_error and len(batch) > 1 and _depth < 2:
                     mid = len(batch) // 2
                     logger.info(
                         "Batch %d: limit error with %d images — splitting to %d+%d (depth %d)",
@@ -826,6 +860,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         subject_x=50,
                     ))
                 return
+            # Success — reset the auth failure counter
+            _consecutive_auth_failures = 0
             # Parse successful response
             try:
                 raw = raw.strip()
@@ -913,10 +949,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             scenes.extend(batch_scene_list)
 
         # ── Quality check: if most frames defaulted to center, re-analyze ──
+        # Skip re-analysis if the initial analysis failed due to auth/billing errors —
+        # re-trying the same dead API would just waste time.
         center_count = sum(1 for s in scenes if s.subject_x == 50)
         center_pct = center_count / len(scenes) * 100 if scenes else 0
+        api_is_dead = _consecutive_auth_failures >= _AUTH_FAILURE_ABORT_THRESHOLD
 
-        if center_pct > 70 and len(scenes) > 5:
+        if api_is_dead and center_pct > 70:
+            logger.warning(
+                "Skipping position re-analysis — API key exhausted (%d auth failures). "
+                "%d/%d frames (%.0f%%) stuck at center.",
+                _consecutive_auth_failures, center_count, len(scenes), center_pct,
+            )
+        elif center_pct > 70 and len(scenes) > 5:
             logger.warning(
                 "Subject tracking quality poor: %d/%d (%.0f%%) at center — "
                 "running targeted position re-analysis",
@@ -943,9 +988,17 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 )
 
                 reanalyzed = 0
+                consecutive_failures = 0
                 for frame in center_frames:
                     if not frame.base64:
                         continue
+                    # Abort re-analysis early if API keeps failing
+                    if consecutive_failures >= 3:
+                        logger.warning(
+                            "Re-analysis: %d consecutive failures — aborting remaining %d frames",
+                            consecutive_failures, len(center_frames) - center_frames.index(frame),
+                        )
+                        break
                     content = [
                         {"type": "text", "text": position_prompt},
                         {"type": "image_url", "image_url": {
@@ -958,6 +1011,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             [{"role": "user", "content": content}],
                             max_tokens=256, is_vision=True, cancel_check=cancel_check,
                         )
+                        consecutive_failures = 0  # Reset on success
                         reraw = reraw.strip()
                         if reraw.startswith("```"):
                             reraw = reraw.split("\n", 1)[1].rsplit("```", 1)[0]
@@ -981,6 +1035,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                                         reanalyzed += 1
                                         break
                     except Exception as e:
+                        consecutive_failures += 1
                         logger.debug("Position re-analysis failed for frame %.1fs: %s", frame.timestamp, e)
 
                 if reanalyzed > 0:
