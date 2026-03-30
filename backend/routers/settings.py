@@ -330,6 +330,10 @@ _MODEL_SPEED_PROFILES = {
     "gpt-4-turbo": {"speed": "slow", "est_minutes_vision": 5.0, "est_minutes_text": 2.0, "quality": "excellent", "quality_score": 4},
     "o1": {"speed": "slow", "est_minutes_vision": 6.0, "est_minutes_text": 3.0, "quality": "excellent", "quality_score": 4},
     "o3": {"speed": "slow", "est_minutes_vision": 7.0, "est_minutes_text": 3.5, "quality": "best", "quality_score": 5},
+    # --- Models with limited/no vision tracking ---
+    "reka-edge": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.5, "quality": "poor", "quality_score": 1},
+    "reka-core": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.0, "quality": "basic", "quality_score": 2},
+    "gemini-2.5-flash-lite": {"speed": "fast", "est_minutes_vision": 1.0, "est_minutes_text": 0.3, "quality": "basic", "quality_score": 2},
 }
 
 # Free tier models are rate-limited (~20 RPM), multiply time by 3x
@@ -1397,6 +1401,68 @@ def _cost_per_hour(model_data: dict, role: str) -> float:
     return _estimate_cost(model_data, role) * 6  # 6 × 10-min segments
 
 
+# ── Vision model compatibility for subject tracking ──
+# Models need sufficient context for at least 1 image + prompt + output.
+_MIN_VISION_CONTEXT = 16000  # Absolute minimum context length
+
+# Models known to be incompatible with subject tracking despite having vision.
+_VISION_BLOCKLIST_PATTERNS = [
+    "reka/reka-edge",      # 16K context, ~5800 tok/img, can't fit 2 images, 94% default to center
+    "reka-edge",           # Catch any variant
+    "firellava",           # Poor JSON compliance, no spatial reasoning
+    "llava:7b",            # Too small for reliable subject_x
+    "nanollava",           # Too small for structured output
+]
+
+# Models known to work well for subject tracking — used for quality scoring
+_VISION_TRACKING_SCORES = {
+    "gemini-2.5-flash": 5,
+    "gemini-2.5-pro": 5,
+    "gemini-2.0-flash": 4,
+    "gpt-4o": 4,
+    "gpt-4o-mini": 3,
+    "claude-sonnet": 4,
+    "claude-haiku": 3,
+    "qwen2.5-vl-72b": 4,
+    "qwen2.5-vl-32b": 3,
+    "pixtral": 3,
+    "llama-3.2-90b": 3,
+    "llama-3.2-11b": 2,
+    "gemma-3-27b": 3,
+    "mistral-small-3.1": 2,
+    "moondream": 2,
+}
+
+
+def _vision_tracking_compat(model_id: str, context_length: int) -> tuple[bool, int]:
+    """Check if a vision model is compatible with subject tracking.
+
+    Returns (is_compatible, tracking_quality_score 0-5).
+    """
+    mid_lower = model_id.lower()
+
+    for pattern in _VISION_BLOCKLIST_PATTERNS:
+        if pattern in mid_lower:
+            return False, 0
+
+    # Skip context check for Ollama local models (context_length=0 means unknown)
+    if context_length > 0 and context_length < _MIN_VISION_CONTEXT:
+        return False, 0
+
+    for pattern, score in _VISION_TRACKING_SCORES.items():
+        if pattern in mid_lower:
+            return True, score
+
+    # Unknown model — score by context size
+    if context_length == 0:
+        return True, 2  # Ollama local, allow with basic score
+    if context_length >= 128000:
+        return True, 3
+    if context_length >= 32000:
+        return True, 2
+    return True, 1  # 16K-32K range — marginal
+
+
 @router.get("/providers/models/available")
 async def available_models():
     """Return all available models grouped by task (transcript, vision, text).
@@ -1441,10 +1507,18 @@ async def available_models():
             }
 
             if has_vision:
+                compatible, tracking_score = _vision_tracking_compat(mid, ctx)
+                if not compatible:
+                    continue  # Skip models that can't do subject tracking
                 v_cost = _cost_per_hour(m, "vision")
                 v_speed = _estimate_speed(mid, "vision", is_free)
+                # Use tracking-specific score when it's higher
+                if tracking_score > v_speed.get("quality_score", 0):
+                    v_speed["quality_score"] = tracking_score
+                    v_speed["quality"] = {1: "minimal", 2: "basic", 3: "good", 4: "excellent", 5: "best"}.get(tracking_score, "good")
                 vision.append({**entry_base, "cost_per_hour": round(v_cost, 4),
                                "desc": f"{'FREE' if is_free else f'~${v_cost:.3f}/hr'} — {ctx:,} ctx",
+                               "tracking_score": tracking_score,
                                **v_speed})
 
             t_cost = _cost_per_hour(m, "text")
@@ -1518,7 +1592,10 @@ async def available_models():
 
                         _ollama_seen_ids.add(f"ollama/{model_name}")
                         if has_vision:
-                            vision.append(entry)
+                            compatible, tracking_score = _vision_tracking_compat(f"ollama/{model_name}", 0)
+                            if compatible:
+                                entry["tracking_score"] = tracking_score
+                                vision.append(entry)
                         # All models can do text
                         text.append(entry)
         except Exception as e:

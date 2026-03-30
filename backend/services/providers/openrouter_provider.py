@@ -29,8 +29,13 @@ logger = logging.getLogger(__name__)
 # Models with known per-request image limits (not available from the API).
 # key = model ID substring (lowercase), value = max images per request.
 _KNOWN_IMAGE_LIMITS: dict[str, int] = {
-    "reka": 1,             # Reka: 16K context, ~5800 tok/img → only 1 image fits safely
-    "llama-3.2": 4,        # Llama 3.2 vision: best with fewer images
+    "reka-core": 2,        # Reka Core: 128K context, can handle 2 images
+    "reka-edge": 1,        # Reka Edge: 16K context, only 1 image fits safely
+    "reka-flash": 1,       # Reka Flash: small context
+    "reka": 1,             # Catch-all for other Reka variants
+    "llama-3.2-90b": 4,    # Llama 3.2 90B vision: larger, handles 4
+    "llama-3.2-11b": 3,    # Llama 3.2 11B vision: works with 3 images
+    "llama-3.2": 3,        # Catch-all for Llama 3.2 vision
     "moondream": 1,        # Moondream: single-image model
 }
 

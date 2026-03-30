@@ -34,6 +34,14 @@ export default function ModelBrowser({ onSelect, type = 'text' }) {
 
   const filtered = useMemo(() => {
     let result = list || [];
+    // For vision models, filter out those with context too small for subject tracking
+    if (type === 'vision') {
+      result = result.filter((m) => {
+        const ctx = m.context_length || 0;
+        // Allow models with unknown context (Ollama, auto-routers) or >= 16K
+        return ctx === 0 || ctx >= 16000;
+      });
+    }
     if (search.trim()) {
       const q = search.toLowerCase();
       result = result.filter((m) => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
@@ -42,7 +50,7 @@ export default function ModelBrowser({ onSelect, type = 'text' }) {
       result = result.filter((m) => m.id.includes(':free') || (m.pricing?.prompt === '0' && m.pricing?.completion === '0'));
     }
     return result.slice(0, 50);
-  }, [list, search, freeOnly]);
+  }, [list, search, freeOnly, type]);
 
   if (loading) {
     return <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>Loading models...</div>;

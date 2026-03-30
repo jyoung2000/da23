@@ -805,9 +805,12 @@ export default function Settings() {
               const provider = m.provider !== 'local' ? ` (${m.provider})` : '';
               const speed = speedBadge(m);
               const stars = m.quality_score ? qualityStars(m.quality_score) : '';
+              const tracking = task === 'vision' && m.tracking_score
+                ? m.tracking_score >= 4 ? '[TRACK:\u2605\u2605]' : m.tracking_score >= 2 ? '[TRACK:\u2605]' : '[TRACK:\u26A0]'
+                : '';
               return (
                 <option key={m.id} value={m.id}>
-                  {[stars, speed, price, released, m.name + provider].filter(Boolean).join(' ')}
+                  {[stars, speed, tracking, price, released, m.name + provider].filter(Boolean).join(' ')}
                 </option>
               );
             })}
