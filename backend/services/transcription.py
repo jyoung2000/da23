@@ -150,23 +150,11 @@ async def preflight_whisper_check(timeout: float = 90) -> dict:
         ]
         logger.info("Whisper preflight check: model=%s device=%s timeout=%ds", model_name, device, int(timeout))
 
-        # Restore real CUDA_VISIBLE_DEVICES for the subprocess so it can use the GPU.
-        # The main process hides CUDA to prevent PyTorch from poisoning the driver.
-        _subprocess_env = {**os.environ}
-        _real_cuda = os.environ.get("_CLIPAI_REAL_CUDA_VISIBLE_DEVICES")
-        if _real_cuda is not None:
-            _subprocess_env["CUDA_VISIBLE_DEVICES"] = _real_cuda
-        else:
-            # No original CUDA_VISIBLE_DEVICES was set — the NVIDIA Container Toolkit
-            # maps GPUs via NVIDIA_VISIBLE_DEVICES instead. Set CUDA_VISIBLE_DEVICES
-            # to "0" so CTranslate2 can find the GPU in the subprocess.
-            _subprocess_env["CUDA_VISIBLE_DEVICES"] = "0"
-
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_subprocess_env,
+            env={**os.environ},
         )
 
         try:
@@ -424,23 +412,11 @@ async def transcribe_audio_subprocess(
 
         logger.info("Starting Whisper subprocess: model=%s device=%s", model_name, device)
 
-        # Restore real CUDA_VISIBLE_DEVICES for the subprocess so it can use the GPU.
-        # The main process hides CUDA to prevent PyTorch from poisoning the driver.
-        _subprocess_env = {**os.environ}
-        _real_cuda = os.environ.get("_CLIPAI_REAL_CUDA_VISIBLE_DEVICES")
-        if _real_cuda is not None:
-            _subprocess_env["CUDA_VISIBLE_DEVICES"] = _real_cuda
-        else:
-            # No original CUDA_VISIBLE_DEVICES was set — the NVIDIA Container Toolkit
-            # maps GPUs via NVIDIA_VISIBLE_DEVICES instead. Set CUDA_VISIBLE_DEVICES
-            # to "0" so CTranslate2 can find the GPU in the subprocess.
-            _subprocess_env["CUDA_VISIBLE_DEVICES"] = "0"
-
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_subprocess_env,
+            env={**os.environ},
         )
 
         # Stream stderr line by line for real-time progress updates.
