@@ -68,8 +68,9 @@ services:
       - OLLAMA_KV_CACHE_TYPE=q8_0
       # Increase GPU discovery timeout (default 30s can fail on slow CUDA init)
       - OLLAMA_LOAD_TIMEOUT=5m
-      # Ensure CUDA device is visible
-      - CUDA_VISIBLE_DEVICES=0
+      # DO NOT set CUDA_VISIBLE_DEVICES here — it causes intermittent GPU
+      # discovery failures. The NVIDIA Container Toolkit handles device
+      # mapping via NVIDIA_VISIBLE_DEVICES=all + deploy.resources.
       # Help Ollama find CUDA libraries faster (prevents GPU discovery timeout)
       - LD_LIBRARY_PATH=/usr/lib/ollama/cuda_v12:/usr/local/cuda/lib64
     # Enable GPU passthrough so Ollama can use NVIDIA GPUs for inference.

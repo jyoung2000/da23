@@ -1463,18 +1463,26 @@ async def _run_analysis_inner(job_id: str):
     if _uses_local_gpu:
         logger.info("[%s] Sequential mode: transcription first, then scene analysis (local GPU)", job_id)
 
-        # Safety: ensure Ollama models are unloaded before Whisper.
-        # On a 4GB GPU, qwen2.5:3b (2.3GB) + Whisper small (1GB) = OOM.
-        if is_ollama_primary and _primary_provider:
-            try:
-                logger.info("[%s] Pre-transcription: ensuring Ollama models are unloaded...", job_id)
-                await asyncio.wait_for(_primary_provider.unload_models(), timeout=15)
-                logger.info("[%s] Pre-transcription: Ollama models unloaded from GPU", job_id)
-                await asyncio.sleep(1)
-            except asyncio.TimeoutError:
-                logger.warning("[%s] Pre-transcription: Ollama unload timed out after 15s — proceeding", job_id)
-            except Exception:
-                pass
+        # Safety: ALWAYS unload Ollama models before Whisper, regardless of
+        # which AI provider is primary. The Ollama sidecar container shares the
+        # GPU and may have models loaded from startup pulls, diagnostic checks,
+        # or previous pipeline runs. On a 4GB GPU, there's no room for both.
+        try:
+            import httpx as _httpx
+            _ollama_host = settings.OLLAMA_HOST
+            logger.info("[%s] Pre-transcription: ensuring ALL Ollama models are unloaded...", job_id)
+            async with _httpx.AsyncClient(timeout=15) as _uc:
+                _ps = await _uc.get(f"{_ollama_host}/api/ps")
+                if _ps.status_code == 200:
+                    for _m in _ps.json().get("models", []):
+                        _mn = _m.get("name", "")
+                        if _mn:
+                            await _uc.post(f"{_ollama_host}/api/generate",
+                                json={"model": _mn, "keep_alive": 0}, timeout=10)
+                            logger.info("[%s] Unloaded Ollama model '%s' to free GPU for Whisper", job_id, _mn)
+            await asyncio.sleep(2)  # Let CUDA driver release memory
+        except Exception as _unload_err:
+            logger.warning("[%s] Pre-transcription: Ollama unload failed (%s) — proceeding anyway", job_id, _unload_err)
 
         # Log VRAM state so we can verify GPU is actually free
         try:
