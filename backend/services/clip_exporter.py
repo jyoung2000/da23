@@ -2207,15 +2207,12 @@ def _detect_position_clusters(
     keyframes: list[tuple[float, int]],
     gap_threshold: int = 10,
     min_cluster_size: int = 2,
-    max_clusters: int = 6,
 ) -> list[dict] | None:
-    """Detect N distinct position clusters in keyframe values.
+    """Detect N position clusters using recursive gap splitting.
 
-    Uses recursive gap splitting to find 2-6 natural groupings.
+    No cap on cluster count — finds as many natural groups as exist.
     Returns sorted list of {"center": int, "count": int} dicts,
     or None if < 2 clusters found.
-
-    Matches frontend detectPositionClusters() exactly for preview-export parity.
 
     Matches frontend detectPositionClusters() exactly for preview-export parity.
     """
@@ -2244,18 +2241,6 @@ def _detect_position_clusters(
         return _split(left) + _split(right)
 
     clusters = _split(xs)
-
-    while len(clusters) > max_clusters:
-        min_dist = float('inf')
-        merge_idx = 0
-        for i in range(len(clusters) - 1):
-            c1 = sum(clusters[i]) / len(clusters[i])
-            c2 = sum(clusters[i + 1]) / len(clusters[i + 1])
-            if abs(c2 - c1) < min_dist:
-                min_dist = abs(c2 - c1)
-                merge_idx = i
-        clusters[merge_idx] = clusters[merge_idx] + clusters[merge_idx + 1]
-        del clusters[merge_idx + 1]
 
     if len(clusters) < 2:
         return None

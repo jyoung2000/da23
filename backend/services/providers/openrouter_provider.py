@@ -340,10 +340,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             max_out = caps.get("max_completion_tokens", 0) or 4096
             output_reserve = min(max_out, 4096)
             prompt_overhead = 800  # instruction text
-            available_for_images = ctx - output_reserve - prompt_overhead
+            # 10% safety margin — avoids off-by-10-token context overflow errors
+            available_for_images = int((ctx - output_reserve - prompt_overhead) * 0.90)
             estimated_max = max(1, available_for_images // tokens_per_image)
-            # Cap at 8 (diminishing returns beyond that) and leave 1 image of headroom
-            return min(8, max(1, estimated_max - 1))
+            return min(8, max(1, estimated_max))
 
         # Special cases for free routing
         if "openrouter/free" in model_lower:
@@ -367,10 +367,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             batch_size = self._get_max_images(model)
             image_tokens = batch_size * tokens_per_image
             prompt_tokens = 800
-            available_for_output = ctx - image_tokens - prompt_tokens
-            # Clamp between 512 and model's max, don't exceed available budget
+            # 10% safety margin to avoid context-length-exceeded errors
+            available_for_output = int((ctx - image_tokens - prompt_tokens) * 0.90)
             safe_max = max(512, min(max_comp, available_for_output))
-            return min(safe_max, 8192)  # never request more than 8K for vision
+            return min(safe_max, 8192)
 
         # Fallback for models not in cache
         if "openrouter/free" in model_lower:
@@ -732,6 +732,111 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # while the previous response is in flight.
         sem = asyncio.Semaphore(2)
 
+        async def _analyze_batch(batch, batch_idx, _depth=0):
+            """Process a vision batch with auto-split on limit errors (max depth 2)."""
+            content: list[dict] = [
+                {"type": "text", "text": (
+                    instruction + "\n\n"
+                    "Return ONLY valid JSON array:\n"
+                    '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>, "active_speaker_x": <0-100 or null>}]\n'
+                    "IMPORTANT: subject_x = horizontal position of the ACTIVE SPEAKER (the person "
+                    "whose lips are moving or who is currently talking). If you can tell who is "
+                    "speaking, use THEIR face position. If no one is clearly speaking, use the most "
+                    "prominent person. active_speaker_x = same value if confident someone is speaking, "
+                    "null otherwise. 0=left edge, 50=center, 100=right edge. "
+                    "Do NOT default to 50 — carefully estimate the actual horizontal position."
+                )},
+            ]
+            for frame in batch:
+                if frame.base64:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{frame.base64}"},
+                    })
+                    content.append({
+                        "type": "text",
+                        "text": f"[Frame at {frame.timestamp:.1f}s]",
+                    })
+
+            messages = [{"role": "user", "content": content}]
+            try:
+                raw = await self._call_with_fallback(
+                    self._vision_model, self._vision_fallbacks, messages,
+                    max_tokens=vision_max_tokens,
+                    is_vision=True, cancel_check=cancel_check,
+                )
+            except (ProviderError, ProviderRateLimitError) as api_err:
+                err_str = str(api_err).lower()
+                is_limit_error = (
+                    "context length" in err_str
+                    or ("image" in err_str and ("limit" in err_str or "at most" in err_str))
+                    or "too many" in err_str
+                )
+                # Auto-split: if limit error and batch has 2+ images, halve and retry
+                if is_limit_error and len(batch) > 1 and _depth < 2:
+                    mid = len(batch) // 2
+                    logger.info(
+                        "Batch %d: limit error with %d images — splitting to %d+%d (depth %d)",
+                        batch_idx, len(batch), mid, len(batch) - mid, _depth + 1,
+                    )
+                    await _analyze_batch(batch[:mid], batch_idx, _depth + 1)
+                    await _analyze_batch(batch[mid:], batch_idx, _depth + 1)
+                    return
+                # Non-limit error or single image — use fallback descriptions
+                logger.warning(
+                    "Batch %d/%d failed (%d frames), using fallback descriptions: %s",
+                    batch_idx + 1, num_batches, len(batch), api_err,
+                )
+                for frame in batch:
+                    batch_results[batch_idx].append(SceneDescription(
+                        timestamp=frame.timestamp,
+                        description="Frame analysis unavailable",
+                        importance_score=5,
+                        thumbnail_path=frame.path,
+                        subject_x=50,
+                    ))
+                return
+            # Parse successful response
+            try:
+                raw = raw.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+                parsed = json.loads(raw)
+                if not isinstance(parsed, list):
+                    parsed = [parsed]
+                for idx, item in enumerate(parsed):
+                    frame_ref = batch[idx] if idx < len(batch) else batch[-1]
+                    sx = item.get("subject_x")
+                    if sx is None:
+                        sx = 50
+                    else:
+                        sx = max(0, min(100, int(sx)))
+                    active_sx = item.get("active_speaker_x")
+                    if active_sx is not None:
+                        try:
+                            active_sx = max(0, min(100, int(active_sx)))
+                        except (ValueError, TypeError):
+                            active_sx = None
+                    batch_results[batch_idx].append(SceneDescription(
+                        timestamp=item.get("timestamp", frame_ref.timestamp),
+                        description=item.get("description", ""),
+                        importance_score=max(1, min(10, int(item.get("importance_score", 5)))),
+                        thumbnail_path=frame_ref.path,
+                        subject_x=sx,
+                        active_speaker_x=active_sx,
+                    ))
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                logger.warning(f"Failed to parse frame analysis: {e}")
+                fallback_desc = extract_description_fallback(raw) if raw else "Analysis failed"
+                for frame in batch:
+                    batch_results[batch_idx].append(SceneDescription(
+                        timestamp=frame.timestamp,
+                        description=fallback_desc[:200],
+                        importance_score=5,
+                        thumbnail_path=frame.path,
+                        subject_x=50,
+                    ))
+
         async def _process_batch(batch_idx: int):
             nonlocal frames_completed
             async with sem:
@@ -739,99 +844,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     cancel_check()
                 start = batch_idx * batch_size
                 batch = frames[start : start + batch_size]
-                content: list[dict] = [
-                    {"type": "text", "text": (
-                        instruction + "\n\n"
-                        "Return ONLY valid JSON array:\n"
-                        '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>, "active_speaker_x": <0-100 or null>}]\n'
-                        "IMPORTANT: subject_x = horizontal position of the ACTIVE SPEAKER (the person "
-                        "whose lips are moving or who is currently talking). If you can tell who is "
-                        "speaking, use THEIR face position. If no one is clearly speaking, use the most "
-                        "prominent person. active_speaker_x = same value if confident someone is speaking, "
-                        "null otherwise. 0=left edge, 50=center, 100=right edge. "
-                        "Do NOT default to 50 — carefully estimate the actual horizontal position."
-                    )},
-                ]
-                for frame in batch:
-                    if frame.base64:
-                        content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{frame.base64}"},
-                        })
-                        content.append({
-                            "type": "text",
-                            "text": f"[Frame at {frame.timestamp:.1f}s]",
-                        })
-
-                messages = [{"role": "user", "content": content}]
-                try:
-                    raw = await self._call_with_fallback(
-                        self._vision_model, self._vision_fallbacks, messages,
-                        max_tokens=vision_max_tokens,
-                        is_vision=True, cancel_check=cancel_check,
-                    )
-                except (ProviderError, ProviderRateLimitError) as api_err:
-                    # Single batch failure: use fallback descriptions instead of
-                    # crashing the entire analysis and losing all other batches.
-                    logger.warning(
-                        "Batch %d/%d failed (frames %d-%d), using fallback descriptions: %s",
-                        batch_idx + 1, num_batches, start, start + len(batch) - 1, api_err,
-                    )
-                    for frame in batch:
-                        batch_results[batch_idx].append(SceneDescription(
-                            timestamp=frame.timestamp,
-                            description="Frame analysis unavailable",
-                            importance_score=5,
-                            thumbnail_path=frame.path,
-                            subject_x=50,
-                        ))
-                    frames_completed += len(batch)
-                    if progress_callback:
-                        await progress_callback(min(frames_completed, total), total)
-                    return
-                try:
-                    raw = raw.strip()
-                    if raw.startswith("```"):
-                        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-                    parsed = json.loads(raw)
-                    if not isinstance(parsed, list):
-                        parsed = [parsed]
-                    for idx, item in enumerate(parsed):
-                        frame_ref = batch[idx] if idx < len(batch) else batch[-1]
-                        sx = item.get("subject_x")
-                        if sx is None:
-                            logger.warning(
-                                "Batch %d frame %d: AI response missing subject_x field, defaulting to 50",
-                                batch_idx, idx,
-                            )
-                            sx = 50
-                        else:
-                            sx = max(0, min(100, int(sx)))
-                        active_sx = item.get("active_speaker_x")
-                        if active_sx is not None:
-                            try:
-                                active_sx = max(0, min(100, int(active_sx)))
-                            except (ValueError, TypeError):
-                                active_sx = None
-                        batch_results[batch_idx].append(SceneDescription(
-                            timestamp=item.get("timestamp", frame_ref.timestamp),
-                            description=item.get("description", ""),
-                            importance_score=max(1, min(10, int(item.get("importance_score", 5)))),
-                            thumbnail_path=frame_ref.path,
-                            subject_x=sx,
-                            active_speaker_x=active_sx,
-                        ))
-                except (json.JSONDecodeError, KeyError, IndexError) as e:
-                    logger.warning(f"Failed to parse frame analysis: {e}")
-                    fallback_desc = extract_description_fallback(raw) if raw else "Analysis failed"
-                    for frame in batch:
-                        batch_results[batch_idx].append(SceneDescription(
-                            timestamp=frame.timestamp,
-                            description=fallback_desc[:200],
-                            importance_score=5,
-                            thumbnail_path=frame.path,
-                            subject_x=50,
-                        ))
+                await _analyze_batch(batch, batch_idx)
                 frames_completed += len(batch)
                 if progress_callback:
                     await progress_callback(min(frames_completed, total), total)

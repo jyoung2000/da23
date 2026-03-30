@@ -906,10 +906,14 @@ class ChunkedClipDetectionMixin:
         )
 
         async def _process_window(idx: int, w_start: float, w_end: float):
-            # Override clip_count for per-window calls.
-            # Strip progress_callback — it's handled by the multi-pass orchestrator,
-            # not individual _single_pass_clip_detection calls.
-            window_kwargs = {k: v for k, v in kwargs.items() if k != "progress_callback"}
+            # Only pass kwargs that _single_pass_clip_detection accepts.
+            # Strip orchestration-only params to avoid TypeError.
+            _pass_through = {
+                "custom_prompt", "cancel_check", "clip_count",
+                "min_duration", "max_duration", "video_summary",
+                "existing_clips", "hot_zones",
+            }
+            window_kwargs = {k: v for k, v in kwargs.items() if k in _pass_through}
             window_kwargs["clip_count"] = _clips_per_window
             window_transcript = [
                 seg for seg in transcript
@@ -1093,10 +1097,10 @@ class ChunkedClipDetectionMixin:
             _partial_results=_partial_results,
             sequential=sequential,
             custom_prompt=custom_prompt, cancel_check=cancel_check,
-            # Scale per-window: longer videos need more candidates to survive dedup
             clip_count=min(8, max(3, num_clips // 3)),
             min_duration=min_duration, max_duration=max_duration,
             video_summary=video_summary, existing_clips=existing_clips,
+            hot_zones=hot_zones,
             progress_callback=progress_callback,
         )
         all_clips.extend(pass1_clips)
@@ -1163,6 +1167,7 @@ class ChunkedClipDetectionMixin:
                                     clip_count=max(3, num_clips // 2),
                                     min_duration=min_duration, max_duration=max_duration,
                                     video_summary=video_summary, existing_clips=existing_desc,
+                                    hot_zones=hot_zones,
                                 )
                             else:
                                 return await self._single_pass_clip_detection(
@@ -1171,6 +1176,7 @@ class ChunkedClipDetectionMixin:
                                     clip_count=3,
                                     min_duration=min_duration, max_duration=max_duration,
                                     video_summary=video_summary, existing_clips=existing_desc,
+                                    hot_zones=hot_zones,
                                 )
                         except Exception as e:
                             _mixin_logger.warning("Pass 2 gap scan failed: %s", e)

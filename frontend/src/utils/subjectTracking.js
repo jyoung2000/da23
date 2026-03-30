@@ -170,12 +170,12 @@ export function buildSpeakerKeyframes(transcript, speakerMap, clipStart, clipEnd
  * @param {number} maxClusters - Maximum clusters to detect (default 6)
  * @returns {Array<{center: number, count: number}>|null} Sorted clusters or null
  */
-export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterSize = 2, maxClusters = 6) {
+export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterSize = 2) {
   if (!keyframes || keyframes.length < 4) return null;
 
   const xs = keyframes.map(k => k.x);
 
-  // Recursive gap-based splitting
+  // Recursive gap-based splitting — no cap, finds as many clusters as exist
   function splitCluster(values) {
     if (values.length < minClusterSize * 2) return [values];
     const sorted = [...values].sort((a, b) => a - b);
@@ -195,23 +195,7 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
     return [...splitCluster(left), ...splitCluster(right)];
   }
 
-  let clusters = splitCluster(xs);
-
-  // Cap at maxClusters by merging the two closest clusters
-  while (clusters.length > maxClusters) {
-    let minDist = Infinity;
-    let mergeIdx = 0;
-    for (let i = 0; i < clusters.length - 1; i++) {
-      const c1 = clusters[i].reduce((a, b) => a + b, 0) / clusters[i].length;
-      const c2 = clusters[i + 1].reduce((a, b) => a + b, 0) / clusters[i + 1].length;
-      if (Math.abs(c2 - c1) < minDist) {
-        minDist = Math.abs(c2 - c1);
-        mergeIdx = i;
-      }
-    }
-    clusters[mergeIdx] = [...clusters[mergeIdx], ...clusters[mergeIdx + 1]];
-    clusters.splice(mergeIdx + 1, 1);
-  }
+  const clusters = splitCluster(xs);
 
   if (clusters.length < 2) return null;
 
