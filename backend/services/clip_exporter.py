@@ -2210,10 +2210,7 @@ def _detect_position_clusters(
 ) -> list[dict] | None:
     """Detect N position clusters using recursive gap splitting.
 
-    No cap on cluster count — finds as many natural groups as exist.
-    Returns sorted list of {"center": int, "count": int} dicts,
-    or None if < 2 clusters found.
-
+    Strips center noise zone (47-53) when it prevents detection.
     Matches frontend detectPositionClusters() exactly for preview-export parity.
     """
     if len(keyframes) < 4:
@@ -2240,19 +2237,49 @@ def _detect_position_clusters(
             return [values]
         return _split(left) + _split(right)
 
-    clusters = _split(xs)
-
-    if len(clusters) < 2:
-        return None
-
     def _median(arr):
         s = sorted(arr)
         mid = len(s) // 2
         return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
 
-    result = [{"center": round(_median(v)), "count": len(v)} for v in clusters]
-    result.sort(key=lambda c: c["center"])
-    return result
+    def _build_result(clusters):
+        if len(clusters) < 2:
+            return None
+        return sorted(
+            [{"center": round(_median(v)), "count": len(v)} for v in clusters],
+            key=lambda c: c["center"],
+        )
+
+    # Pass 1: all values
+    result1 = _build_result(_split(xs))
+    if result1:
+        return result1
+
+    # Pass 2: strip center noise [47, 53]
+    CENTER_LO, CENTER_HI = 47, 53
+    non_center = [x for x in xs if x < CENTER_LO or x > CENTER_HI]
+    center_count = len(xs) - len(non_center)
+    if (center_count > len(xs) * 0.10
+            and len(non_center) >= min_cluster_size * 2
+            and any(x < CENTER_LO for x in non_center)
+            and any(x > CENTER_HI for x in non_center)):
+        result2 = _build_result(_split(non_center))
+        if result2:
+            return result2
+
+    # Pass 3: aggressive strip [44, 56]
+    WIDE_LO, WIDE_HI = 44, 56
+    far = [x for x in xs if x < WIDE_LO or x > WIDE_HI]
+    wide_count = len(xs) - len(far)
+    if (wide_count > len(xs) * 0.15
+            and len(far) >= min_cluster_size * 2
+            and any(x < WIDE_LO for x in far)
+            and any(x > WIDE_HI for x in far)):
+        result3 = _build_result(_split(far))
+        if result3:
+            return result3
+
+    return None
 
 
 def _snap_to_clusters(
@@ -2261,12 +2288,20 @@ def _snap_to_clusters(
 ) -> list[tuple[float, int]]:
     """Snap each keyframe to nearest cluster center.
 
+    When equidistant, prefers the cluster with more samples.
     Matches frontend snapToClusters() exactly for preview-export parity.
     """
-    return [
-        (t, min(clusters, key=lambda c: abs(sx - c["center"]))["center"])
-        for t, sx in keyframes
-    ]
+    result = []
+    for t, sx in keyframes:
+        best = clusters[0]
+        best_dist = abs(sx - best["center"])
+        for c in clusters[1:]:
+            d = abs(sx - c["center"])
+            if d < best_dist or (d == best_dist and c["count"] > best["count"]):
+                best = c
+                best_dist = d
+        result.append((t, best["center"]))
+    return result
 
 
 def _build_subject_keyframes(
@@ -5296,12 +5331,43 @@ async def export_clip(
                         elif i == len(snapped) - 1:
                             deduped.append((snapped[i][0], deduped[-1][1]))
 
+                    # ── Anti-jitter: minimum hold duration ──
+                    MIN_HOLD = 2.0
+                    if len(deduped) >= 3:
+                        # Pass 1: remove brief blips where surrounding positions match
+                        i = 1
+                        while i < len(deduped) - 1:
+                            hold = deduped[i + 1][0] - deduped[i][0]
+                            if hold < MIN_HOLD and deduped[i - 1][1] == deduped[i + 1][1]:
+                                deduped.pop(i)
+                            else:
+                                i += 1
+                    if len(deduped) >= 3:
+                        # Pass 2: extend dominant position over remaining short holds
+                        i = 1
+                        while i < len(deduped) - 1:
+                            hold = deduped[i + 1][0] - deduped[i][0]
+                            if hold < MIN_HOLD:
+                                deduped[i] = (deduped[i][0], deduped[i - 1][1])
+                                if deduped[i][1] == deduped[i - 1][1]:
+                                    deduped.pop(i)
+                                else:
+                                    i += 1
+                            else:
+                                i += 1
+
                     # Ensure start/end coverage
                     clip_dur = end - start
                     if deduped[0][0] > 0:
                         deduped.insert(0, (0.0, deduped[0][1]))
                     if deduped[-1][0] < clip_dur:
                         deduped.append((clip_dur, deduped[-1][1]))
+
+                    # Fix initial snap: use nearest cluster to first non-center value
+                    first_real = next((kf for kf in raw_kf if kf[1] < 47 or kf[1] > 53), None)
+                    if first_real and deduped:
+                        best_c = min(clusters, key=lambda c: abs(first_real[1] - c["center"]))
+                        deduped[0] = (deduped[0][0], best_c["center"])
 
                     # handleSceneCuts inserts 1ms instant-jump transitions
                     after_cuts = _handle_scene_cuts(deduped)

@@ -195,10 +195,6 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
     return [...splitCluster(left), ...splitCluster(right)];
   }
 
-  const clusters = splitCluster(xs);
-
-  if (clusters.length < 2) return null;
-
   // Compute center (median) and count for each cluster
   const median = (arr) => {
     const s = [...arr].sort((a, b) => a - b);
@@ -206,12 +202,48 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
     return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
   };
 
-  const result = clusters.map(values => ({
-    center: Math.round(median(values)),
-    count: values.length,
-  })).sort((a, b) => a.center - b.center);
+  function buildResult(clusters) {
+    if (clusters.length < 2) return null;
+    return clusters
+      .map(values => ({ center: Math.round(median(values)), count: values.length }))
+      .sort((a, b) => a.center - b.center);
+  }
 
-  return result;
+  // ── Pass 1: Try with all values ──
+  const result1 = buildResult(splitCluster(xs));
+  if (result1) return result1;
+
+  // ── Pass 2: Strip center noise zone [47, 53] and retry ──
+  // Many vision models default to subject_x ≈ 50. These values bridge the
+  // natural gap between left/right speaker clusters, preventing detection.
+  const CENTER_LO = 47, CENTER_HI = 53;
+  const nonCenter = xs.filter(x => x < CENTER_LO || x > CENTER_HI);
+  const centerCount = xs.length - nonCenter.length;
+
+  if (centerCount > xs.length * 0.10 && nonCenter.length >= minClusterSize * 2) {
+    const hasLeft = nonCenter.some(x => x < CENTER_LO);
+    const hasRight = nonCenter.some(x => x > CENTER_HI);
+    if (hasLeft && hasRight) {
+      const result2 = buildResult(splitCluster(nonCenter));
+      if (result2) return result2;
+    }
+  }
+
+  // ── Pass 3: Aggressive strip [44, 56] for soft-center values ──
+  const WIDE_LO = 44, WIDE_HI = 56;
+  const farFromCenter = xs.filter(x => x < WIDE_LO || x > WIDE_HI);
+  const wideCount = xs.length - farFromCenter.length;
+
+  if (wideCount > xs.length * 0.15 && farFromCenter.length >= minClusterSize * 2) {
+    const hasLeft = farFromCenter.some(x => x < WIDE_LO);
+    const hasRight = farFromCenter.some(x => x > WIDE_HI);
+    if (hasLeft && hasRight) {
+      const result3 = buildResult(splitCluster(farFromCenter));
+      if (result3) return result3;
+    }
+  }
+
+  return null;
 }
 
 // Backward compat — old name delegates to new function
@@ -236,12 +268,14 @@ export function detectBimodalClusters(keyframes, gapThreshold = 12, minClusterSi
 export function snapToClusters(keyframes, clusters) {
   return keyframes.map(kf => {
     let nearest = clusters[0].center;
+    let nearestCount = clusters[0].count;
     let minDist = Math.abs(kf.x - nearest);
     for (let i = 1; i < clusters.length; i++) {
       const dist = Math.abs(kf.x - clusters[i].center);
-      if (dist < minDist) {
+      if (dist < minDist || (dist === minDist && clusters[i].count > nearestCount)) {
         minDist = dist;
         nearest = clusters[i].center;
+        nearestCount = clusters[i].count;
       }
     }
     return { t: kf.t, x: nearest };
@@ -679,6 +713,43 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }
     }
 
+    // ── Anti-jitter: minimum hold duration ──
+    // After snapping to clusters, single-frame noise creates rapid oscillations
+    // like [40, 65, 40] where the 65 holds for only 1-2 seconds. Merge brief
+    // holds into the surrounding position.
+    const MIN_HOLD_SECONDS = 2.0;
+    if (deduped.length >= 3) {
+      // Pass 1: remove brief blips where surrounding positions are the same
+      let i = 1;
+      while (i < deduped.length - 1) {
+        const nextT = deduped[i + 1].t;
+        const holdDuration = nextT - deduped[i].t;
+        if (holdDuration < MIN_HOLD_SECONDS && deduped[i - 1].x === deduped[i + 1].x) {
+          deduped.splice(i, 1);
+        } else {
+          i++;
+        }
+      }
+    }
+    if (deduped.length >= 3) {
+      // Pass 2: extend dominant position over any remaining short holds
+      let i = 1;
+      while (i < deduped.length - 1) {
+        const nextT = deduped[i + 1].t;
+        const holdDuration = nextT - deduped[i].t;
+        if (holdDuration < MIN_HOLD_SECONDS) {
+          deduped[i].x = deduped[i - 1].x;
+          if (deduped[i].x === deduped[i - 1].x) {
+            deduped.splice(i, 1);
+          } else {
+            i++;
+          }
+        } else {
+          i++;
+        }
+      }
+    }
+
     // Ensure start and end keyframes
     if (deduped[0].t > 0) {
       deduped.unshift({ t: 0, x: deduped[0].x });
@@ -686,6 +757,20 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     const clipDur = clipEnd - clipStart;
     if (deduped[deduped.length - 1].t < clipDur) {
       deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x });
+    }
+
+    // ── Fix initial snap: use nearest cluster to first non-center value ──
+    // When the first raw value is a center default (50) but the actual speaker
+    // is at 35%, the crop starts centered and then jumps.
+    const firstReal = raw.find(kf => kf.x < 47 || kf.x > 53);
+    if (firstReal && deduped.length > 0) {
+      let nearestCenter = clusters[0].center;
+      let minDist = Math.abs(firstReal.x - nearestCenter);
+      for (let c = 1; c < clusters.length; c++) {
+        const dist = Math.abs(firstReal.x - clusters[c].center);
+        if (dist < minDist) { minDist = dist; nearestCenter = clusters[c].center; }
+      }
+      deduped[0].x = nearestCenter;
     }
 
     // handleSceneCuts inserts 1ms instant-jump transitions at speaker changes
