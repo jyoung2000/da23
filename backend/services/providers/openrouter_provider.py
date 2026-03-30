@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import logging
 from typing import Optional
@@ -16,6 +17,80 @@ from backend.services.prompts import DEFAULT_FRAME_ANALYSIS_PROMPT, DEFAULT_VIRA
 from backend.services.transcript_utils import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
 
 logger = logging.getLogger(__name__)
+
+
+# ── Dynamic model capabilities from OpenRouter API ────────────────────
+# The /api/v1/models endpoint returns context_length and
+# top_provider.max_completion_tokens for each model.  We load these from
+# the model cache (populated by the settings router on first fetch) so
+# the provider can respect each model's actual limits instead of relying
+# solely on hardcoded pattern matches.
+
+# Models with known per-request image limits (not available from the API).
+# key = model ID substring (lowercase), value = max images per request.
+_KNOWN_IMAGE_LIMITS: dict[str, int] = {
+    "reka": 2,             # Reka: "At most 3 images" — use 2 for safety margin
+    "llama-3.2": 4,        # Llama 3.2 vision: best with fewer images
+    "moondream": 1,        # Moondream: single-image model
+}
+
+
+def _resolve_cache_path() -> str:
+    """Return the model cache file path (same logic as settings router)."""
+    docker_path = "/data/logs"
+    if os.path.isdir(docker_path):
+        return os.path.join(docker_path, "model_cache.json")
+    local_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        ".clipai",
+    )
+    return os.path.join(local_path, "model_cache.json")
+
+
+def _load_model_capabilities() -> dict[str, dict]:
+    """Load model capabilities from the OpenRouter model cache.
+
+    Returns a dict keyed by model ID (lowercase) with values:
+        {
+            "context_length": int,          # max input tokens
+            "max_completion_tokens": int,    # max output tokens (0 = unknown)
+            "supports_vision": bool,         # True if model accepts images
+        }
+    """
+    cache_path = _resolve_cache_path()
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r") as f:
+            cache = json.load(f)
+        raw_models = cache.get("raw_models", [])
+    except Exception:
+        return {}
+
+    caps: dict[str, dict] = {}
+    for m in raw_models:
+        mid = m.get("id", "").lower()
+        if not mid:
+            continue
+        ctx = m.get("context_length", 0) or 0
+        top = m.get("top_provider", {}) or {}
+        max_comp = top.get("max_completion_tokens", 0) or 0
+        arch = m.get("architecture", {}) or {}
+        # Check both old-style string and new-style list modality fields
+        modality = arch.get("modality", "")
+        input_modalities = arch.get("input_modalities", [])
+        has_vision = (
+            "image" in str(modality).lower()
+            or "image" in [str(x).lower() for x in input_modalities]
+        )
+        caps[mid] = {
+            "context_length": ctx,
+            "max_completion_tokens": max_comp,
+            "supports_vision": has_vision,
+        }
+    if caps:
+        logger.info("Loaded capabilities for %d OpenRouter models from cache", len(caps))
+    return caps
 
 # ── Model presets ──────────────────────────────────────────────────────
 # Each preset targets a different cost / quality tradeoff on OpenRouter.
@@ -138,11 +213,10 @@ class _RateLimiter:
 class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     """Proxies to various models via OpenRouter's unified API."""
 
-    # Approximate context window budgets (in chars, ~4 chars/token) per model pattern.
-    # Used to scale prompt condensation to fit the model's input limits.
-    # Conservative estimates — leaves room for the system prompt + output tokens.
-    _MODEL_CONTEXT_BUDGET = {
-        "openrouter/free": 6000,       # free auto-route → unpredictable, be very conservative
+    # Fallback context budgets (in chars, ~4 chars/token) when the model
+    # is not found in the OpenRouter cache.  Pattern-matched against model ID.
+    _FALLBACK_CONTEXT_BUDGET = {
+        "openrouter/free": 6000,       # free auto-route → unpredictable
         "gemma": 6000,                 # Gemma models: 8K context
         "llama": 12000,                # Llama models: 8-128K context
         "qwen": 30000,                 # Qwen models: 32K+ context
@@ -150,53 +224,112 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         "gemini-2.5-pro": 120000,      # Gemini Pro: 1M context
         "claude": 80000,               # Claude: 200K context
         "gpt-4": 50000,                # GPT-4: 128K context
-        "reka": 6000,                  # Reka models: 16K context, small budget
+        "reka": 6000,                  # Reka models: 16K context
     }
     _DEFAULT_CONTEXT_BUDGET = 12000    # safe default for unknown models
-
-    # Maximum images per vision API call, keyed by model pattern.
-    # Models with strict image limits (e.g. reka-edge allows max 3)
-    # will have their batch size reduced to avoid 400 errors.
-    _MODEL_MAX_IMAGES = {
-        "reka": 2,                     # Reka: "At most 3 images" — use 2 to leave room for prompt
-        "openrouter/free": 4,          # Free routing: unpredictable, be conservative
-        "llama": 4,                    # Llama vision: works best with fewer images
-    }
-    _DEFAULT_MAX_IMAGES = 8            # Most models handle 8 images fine
-
-    # Vision-specific max_tokens override — models with small context windows
-    # need fewer output tokens to leave room for the image input tokens.
-    _MODEL_VISION_MAX_TOKENS = {
-        "reka": 1024,                  # 16K context, images eat ~11K tokens
-        "openrouter/free": 2048,       # Conservative for free routing
-    }
+    _DEFAULT_MAX_IMAGES = 8            # most models handle 8 images fine
     _DEFAULT_VISION_MAX_TOKENS = 4096
 
+    # How many tokens an image takes (approximate; varies by resolution).
+    # Used to compute safe max_tokens from the remaining context budget.
+    _TOKENS_PER_IMAGE_ESTIMATE = 1500
+
     def _get_context_budget(self, model: str) -> int:
-        """Return the approximate char budget for prompt content based on model."""
+        """Return the approximate char budget for prompt content.
+
+        First checks the live model capabilities loaded from the OpenRouter
+        cache, then falls back to the hardcoded pattern table.
+        """
         model_lower = model.lower()
-        for pattern, budget in self._MODEL_CONTEXT_BUDGET.items():
+        caps = self._model_caps.get(model_lower)
+        if caps and caps["context_length"] > 0:
+            ctx = caps["context_length"]
+            # Reserve tokens for output and overhead, convert to chars
+            max_out = caps.get("max_completion_tokens", 0) or 4096
+            usable_tokens = ctx - min(max_out, 4096) - 500  # 500 for system overhead
+            return max(2000, int(usable_tokens * 3.5))  # ~3.5 chars per token
+
+        for pattern, budget in self._FALLBACK_CONTEXT_BUDGET.items():
             if pattern in model_lower:
                 return budget
         return self._DEFAULT_CONTEXT_BUDGET
 
     def _get_max_images(self, model: str) -> int:
-        """Return the max images per vision call for the given model."""
+        """Return the max images per vision call for the given model.
+
+        Uses known image limits first, then estimates from the model's
+        context window: images ≈ 1500 tokens each, and we need room for
+        the text prompt (~800 tokens) and output (~1024-4096 tokens).
+        """
         model_lower = model.lower()
-        for pattern, limit in self._MODEL_MAX_IMAGES.items():
+
+        # Check known hard limits (not available from API)
+        for pattern, limit in _KNOWN_IMAGE_LIMITS.items():
             if pattern in model_lower:
                 return limit
+
+        # Estimate from context window
+        caps = self._model_caps.get(model_lower)
+        if caps and caps["context_length"] > 0:
+            ctx = caps["context_length"]
+            max_out = caps.get("max_completion_tokens", 0) or 4096
+            output_reserve = min(max_out, 4096)
+            prompt_overhead = 800  # instruction text
+            available_for_images = ctx - output_reserve - prompt_overhead
+            estimated_max = max(1, available_for_images // self._TOKENS_PER_IMAGE_ESTIMATE)
+            # Cap at 8 (diminishing returns beyond that) and leave 1 image of headroom
+            return min(8, max(1, estimated_max - 1))
+
+        # Special cases for free routing
+        if "openrouter/free" in model_lower:
+            return 4
+
         return self._DEFAULT_MAX_IMAGES
 
     def _get_vision_max_tokens(self, model: str) -> int:
-        """Return the max_tokens for vision API calls based on model constraints."""
+        """Return the max_tokens for vision API calls.
+
+        Uses the model's actual max_completion_tokens if available,
+        capped to leave room for images within the context window.
+        """
         model_lower = model.lower()
-        for pattern, tokens in self._MODEL_VISION_MAX_TOKENS.items():
-            if pattern in model_lower:
-                return tokens
+        caps = self._model_caps.get(model_lower)
+        if caps and caps["context_length"] > 0:
+            ctx = caps["context_length"]
+            max_comp = caps.get("max_completion_tokens", 0) or 4096
+            # For vision: assume batch_size images + prompt text
+            batch_size = self._get_max_images(model)
+            image_tokens = batch_size * self._TOKENS_PER_IMAGE_ESTIMATE
+            prompt_tokens = 800
+            available_for_output = ctx - image_tokens - prompt_tokens
+            # Clamp between 512 and model's max, don't exceed available budget
+            safe_max = max(512, min(max_comp, available_for_output))
+            return min(safe_max, 8192)  # never request more than 8K for vision
+
+        # Fallback for models not in cache
+        if "openrouter/free" in model_lower:
+            return 2048
+
         return self._DEFAULT_VISION_MAX_TOKENS
 
+    def _get_max_tokens(self, model: str) -> int:
+        """Return the safe max_tokens for text (non-vision) API calls."""
+        model_lower = model.lower()
+        caps = self._model_caps.get(model_lower)
+        if caps:
+            max_comp = caps.get("max_completion_tokens", 0) or 0
+            if max_comp > 0:
+                # For text calls, use the model's actual limit but cap at 8192
+                # (clip detection / summary don't need more)
+                return min(max_comp, 8192)
+        return 4096
+
     def __init__(self):
+        # Load model capabilities from OpenRouter cache (context_length,
+        # max_completion_tokens) so we can respect each model's actual limits
+        # instead of relying solely on hardcoded pattern matches.
+        self._model_caps = _load_model_capabilities()
+
         self._client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=settings.OPENROUTER_API_KEY,
@@ -248,11 +381,27 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         )
         self._total_tokens = 0
         self._total_cost = 0.0
+        # Log resolved capabilities for each active model
+        def _caps_str(model_id):
+            c = self._model_caps.get(model_id.lower())
+            if c and c["context_length"] > 0:
+                ctx_k = c["context_length"] // 1000
+                max_out = (c.get("max_completion_tokens", 0) or 0) // 1000
+                return f"ctx={ctx_k}K,max_out={max_out}K"
+            return "no-cache"
+
         logger.info(
             f"OpenRouter init: preset={self._preset_name}, "
-            f"vision={self._vision_model} (+{len(self._vision_fallbacks)} fallbacks), "
-            f"summary={self._summary_model} (+{len(self._summary_fallbacks)} fallbacks), "
-            f"clip={self._text_model} (+{len(self._text_fallbacks)} fallbacks)"
+            f"vision={self._vision_model} [{_caps_str(self._vision_model)}, "
+            f"batch={self._get_max_images(self._vision_model)}, "
+            f"vis_tok={self._get_vision_max_tokens(self._vision_model)}] "
+            f"(+{len(self._vision_fallbacks)} fallbacks), "
+            f"summary={self._summary_model} [{_caps_str(self._summary_model)}] "
+            f"(+{len(self._summary_fallbacks)} fallbacks), "
+            f"clip={self._text_model} [{_caps_str(self._text_model)}, "
+            f"budget={self._get_context_budget(self._text_model)} chars] "
+            f"(+{len(self._text_fallbacks)} fallbacks), "
+            f"model_caps={len(self._model_caps)} models loaded"
         )
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None) -> str:
@@ -383,9 +532,22 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         errors: list[tuple[str, ProviderError]] = []
         for i, model in enumerate(chain):
             model_timeout = primary_timeout if i == 0 else fb_timeout
+            # Adjust max_tokens per model: when falling back from a small-context
+            # model (e.g. reka@1024) to a large one (e.g. gemini), use the
+            # fallback model's own safe limit instead of the primary's.
+            if i == 0:
+                model_max_tokens = max_tokens
+            elif is_vision:
+                model_max_tokens = self._get_vision_max_tokens(model)
+            else:
+                fb_caps = self._model_caps.get(model.lower())
+                if fb_caps and fb_caps.get("max_completion_tokens", 0) > 0:
+                    model_max_tokens = min(fb_caps["max_completion_tokens"], max(max_tokens, 4096))
+                else:
+                    model_max_tokens = max(max_tokens, 4096)
             try:
                 return await self._call_cancellable(
-                    model, messages, max_tokens, cancel_check, timeout=model_timeout,
+                    model, messages, model_max_tokens, cancel_check, timeout=model_timeout,
                 )
             except ProviderError as e:
                 errors.append((model, e))

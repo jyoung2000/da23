@@ -1135,15 +1135,21 @@ def _save_model_cache(models: list):
     text_models = []
     for m in models:
         model_id = m.get("id", "")
+        top_provider = m.get("top_provider", {}) or {}
         model_info = {
             "id": model_id,
             "name": m.get("name", model_id),
             "pricing": m.get("pricing", {}),
             "context_length": m.get("context_length", 0),
+            "max_completion_tokens": top_provider.get("max_completion_tokens", 0),
         }
         architecture = m.get("architecture", {})
         modality = architecture.get("modality", "")
-        if "image" in modality:
+        input_modalities = architecture.get("input_modalities", [])
+        has_vision = "image" in str(modality).lower() or "image" in [
+            str(x).lower() for x in input_modalities
+        ]
+        if has_vision:
             vision_models.append(model_info)
         text_models.append(model_info)
 
