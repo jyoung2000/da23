@@ -247,10 +247,46 @@ def _restore_user_settings():
 # Restore saved settings on module load
 _restore_user_settings()
 
-# ── One-time migration: fix stale settings from before WHISPER_MODEL_USER_SET was persisted ──
-# If the file has a large Whisper model but no WHISPER_MODEL_USER_SET flag, the model was
-# set by auto-upgrade (not the user). Reset to the config default so the auto-upgrade
-# can re-evaluate on this hardware, or the user can set it fresh.
+
+def _backfill_api_keys():
+    """Ensure API keys loaded from .env are also persisted to user_settings.json.
+
+    When a user upgrades from an older version that only saved keys to .env,
+    the key is loaded by pydantic into memory but may not be in user_settings.json.
+    On container recreate, .env is lost. This backfill captures any in-memory keys
+    that are missing from the persisted file, preventing key loss on updates.
+    """
+    if not os.path.exists(USER_SETTINGS_PATH):
+        return
+    try:
+        with open(USER_SETTINGS_PATH, "r") as f:
+            data = json.load(f)
+        updated = False
+        for key in _API_KEY_FIELDS:
+            in_memory = getattr(settings, key, "")
+            in_file = data.get(key, "")
+            if _is_real_value(key, in_memory) and not _is_real_value(key, in_file):
+                data[key] = in_memory
+                updated = True
+                logger.info(
+                    "Backfilling %s from memory to user_settings.json (%d chars)",
+                    key, len(in_memory),
+                )
+        if updated:
+            with open(USER_SETTINGS_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.warning("API key backfill failed (non-fatal): %s", e)
+
+
+_backfill_api_keys()
+
+
+# ── One-time migration: add WHISPER_MODEL_USER_SET flag if missing ──
+# Older versions didn't persist this flag. If the file has a non-default
+# Whisper model but no flag, preserve the model and mark it as user-set
+# (the user kept it, whether originally from auto-upgrade or manual choice).
+# Previously this reset to "small", which wiped users' model selections.
 def _migrate_stale_whisper():
     if not os.path.exists(USER_SETTINGS_PATH):
         return
@@ -259,21 +295,19 @@ def _migrate_stale_whisper():
             data = json.load(f)
         whisper = data.get("WHISPER_MODEL")
         user_set = data.get("WHISPER_MODEL_USER_SET")
-        if whisper in ("large-v3", "large-v3-turbo") and user_set is None:
-            # This model was set by auto-upgrade before USER_SET was persisted.
-            # Reset to default so the user gets a clean slate.
-            logger.warning(
+        if whisper and whisper != "small" and user_set is None:
+            # Flag was missing — preserve the model and mark as user-set.
+            # The user had this model saved, so it represents their preference
+            # regardless of how it was originally selected.
+            logger.info(
                 "Migration: WHISPER_MODEL='%s' with no WHISPER_MODEL_USER_SET flag — "
-                "this was set by auto-upgrade, not the user. Resetting to default 'small' "
-                "so auto-upgrade can re-evaluate on this hardware.",
+                "preserving model and marking as user-set.",
                 whisper,
             )
-            data["WHISPER_MODEL"] = "small"
-            data["WHISPER_MODEL_USER_SET"] = False
+            data["WHISPER_MODEL_USER_SET"] = True
             with open(USER_SETTINGS_PATH, "w") as f:
                 json.dump(data, f, indent=2)
-            settings.WHISPER_MODEL = "small"
-            settings.WHISPER_MODEL_USER_SET = False
+            settings.WHISPER_MODEL_USER_SET = True
     except Exception as e:
         logger.warning("Migration check failed (non-fatal): %s", e)
 
