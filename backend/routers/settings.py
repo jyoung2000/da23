@@ -156,7 +156,16 @@ def _persist_user_settings() -> bool:
         os.makedirs(os.path.dirname(USER_SETTINGS_PATH), exist_ok=True)
         with open(USER_SETTINGS_PATH, "w") as f:
             json.dump(data, f, indent=2)
-        logger.info(f"Persisted {len(data)} settings to {USER_SETTINGS_PATH}")
+        # Verify critical values were written
+        has_key = "OPENROUTER_API_KEY" in data
+        whisper = data.get("WHISPER_MODEL", "?")
+        chain = data.get("AI_FALLBACK_CHAIN", "?")
+        logger.info(
+            "Persisted %d settings to %s (WHISPER_MODEL=%s, API_KEY=%s, CHAIN=%s)",
+            len(data), USER_SETTINGS_PATH, whisper,
+            f"YES({len(data['OPENROUTER_API_KEY'])}ch)" if has_key else "NO",
+            chain,
+        )
         return True
     except Exception as e:
         logger.warning(f"Failed to persist user settings to {USER_SETTINGS_PATH}: {e}")
@@ -216,12 +225,59 @@ def _restore_user_settings():
                 setattr(settings, key, val)
                 restored += 1
         logger.info(f"Restored {restored} persisted settings from {USER_SETTINGS_PATH}")
+
+        # Warn about common misconfigurations after restore
+        if "openrouter" in (getattr(settings, "AI_FALLBACK_CHAIN", "") or "").lower():
+            key = getattr(settings, "OPENROUTER_API_KEY", "")
+            if not key or key in _PLACEHOLDER_KEYS:
+                logger.warning(
+                    "⚠ OpenRouter is in the fallback chain but OPENROUTER_API_KEY is empty! "
+                    "Cloud AI models will fail. Enter your API key in Settings > AI Provider."
+                )
+        whisper = getattr(settings, "WHISPER_MODEL", "small")
+        user_set = getattr(settings, "WHISPER_MODEL_USER_SET", False)
+        logger.info(
+            "Whisper config after restore: model=%s, user_set=%s",
+            whisper, user_set,
+        )
     except Exception as e:
         logger.warning(f"Failed to restore user settings from {USER_SETTINGS_PATH}: {e}")
 
 
 # Restore saved settings on module load
 _restore_user_settings()
+
+# ── One-time migration: fix stale settings from before WHISPER_MODEL_USER_SET was persisted ──
+# If the file has a large Whisper model but no WHISPER_MODEL_USER_SET flag, the model was
+# set by auto-upgrade (not the user). Reset to the config default so the auto-upgrade
+# can re-evaluate on this hardware, or the user can set it fresh.
+def _migrate_stale_whisper():
+    if not os.path.exists(USER_SETTINGS_PATH):
+        return
+    try:
+        with open(USER_SETTINGS_PATH, "r") as f:
+            data = json.load(f)
+        whisper = data.get("WHISPER_MODEL")
+        user_set = data.get("WHISPER_MODEL_USER_SET")
+        if whisper in ("large-v3", "large-v3-turbo") and user_set is None:
+            # This model was set by auto-upgrade before USER_SET was persisted.
+            # Reset to default so the user gets a clean slate.
+            logger.warning(
+                "Migration: WHISPER_MODEL='%s' with no WHISPER_MODEL_USER_SET flag — "
+                "this was set by auto-upgrade, not the user. Resetting to default 'small' "
+                "so auto-upgrade can re-evaluate on this hardware.",
+                whisper,
+            )
+            data["WHISPER_MODEL"] = "small"
+            data["WHISPER_MODEL_USER_SET"] = False
+            with open(USER_SETTINGS_PATH, "w") as f:
+                json.dump(data, f, indent=2)
+            settings.WHISPER_MODEL = "small"
+            settings.WHISPER_MODEL_USER_SET = False
+    except Exception as e:
+        logger.warning("Migration check failed (non-fatal): %s", e)
+
+_migrate_stale_whisper()
 
 # Short-lived cache for /api/providers/status (avoid hammering Ollama on rapid re-renders)
 _status_cache: dict = {}
