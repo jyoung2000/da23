@@ -29,10 +29,36 @@ logger = logging.getLogger(__name__)
 # Models with known per-request image limits (not available from the API).
 # key = model ID substring (lowercase), value = max images per request.
 _KNOWN_IMAGE_LIMITS: dict[str, int] = {
-    "reka": 2,             # Reka: "At most 3 images" — use 2 for safety margin
+    "reka": 1,             # Reka: 16K context, ~5800 tok/img → only 1 image fits safely
     "llama-3.2": 4,        # Llama 3.2 vision: best with fewer images
     "moondream": 1,        # Moondream: single-image model
 }
+
+
+def _extract_position_from_text(text: str) -> int | None:
+    """Extract subject_x from positional language in description text.
+
+    Returns a position estimate (0-100) or None if no position cues found.
+    Matches Ollama's extraction logic for consistency across providers.
+    """
+    if not text:
+        return None
+    lower = text.lower()
+
+    if any(kw in lower for kw in ("far left", "left edge", "leftmost")):
+        return 20
+    if any(kw in lower for kw in ("left side", "to the left", "on the left", "left of center", "left half")):
+        return 35
+    if any(kw in lower for kw in ("slightly left", "just left", "left-center")):
+        return 42
+    if any(kw in lower for kw in ("far right", "right edge", "rightmost")):
+        return 80
+    if any(kw in lower for kw in ("right side", "to the right", "on the right", "right of center", "right half")):
+        return 65
+    if any(kw in lower for kw in ("slightly right", "just right", "right-center")):
+        return 58
+    # Don't return 50 for "center" — same as the default
+    return None
 
 
 def _resolve_cache_path() -> str:
@@ -738,13 +764,12 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 {"type": "text", "text": (
                     instruction + "\n\n"
                     "Return ONLY valid JSON array:\n"
-                    '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>, "active_speaker_x": <0-100 or null>}]\n'
-                    "IMPORTANT: subject_x = horizontal position of the ACTIVE SPEAKER (the person "
-                    "whose lips are moving or who is currently talking). If you can tell who is "
-                    "speaking, use THEIR face position. If no one is clearly speaking, use the most "
-                    "prominent person. active_speaker_x = same value if confident someone is speaking, "
-                    "null otherwise. 0=left edge, 50=center, 100=right edge. "
-                    "Do NOT default to 50 — carefully estimate the actual horizontal position."
+                    '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>}]\n'
+                    "IMPORTANT: subject_x = horizontal position of the person who is TALKING "
+                    "(lips moving, actively speaking). If multiple people visible, focus on the "
+                    "ACTIVE SPEAKER. If no one is clearly speaking, use the most prominent person. "
+                    "0=left edge, 50=center, 100=right edge. "
+                    "Do NOT default to 50 — look at where the face actually is in the frame."
                 )},
             ]
             for frame in batch:
@@ -811,6 +836,17 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         sx = 50
                     else:
                         sx = max(0, min(100, int(sx)))
+                    # If model returned center (50) or omitted subject_x,
+                    # try extracting position from description text.
+                    desc_text = item.get("description", "")
+                    if sx == 50 and desc_text:
+                        text_sx = _extract_position_from_text(desc_text)
+                        if text_sx is not None:
+                            logger.debug(
+                                "Batch %d frame %d: extracted subject_x=%d from description (was 50)",
+                                batch_idx, idx, text_sx,
+                            )
+                            sx = text_sx
                     active_sx = item.get("active_speaker_x")
                     if active_sx is not None:
                         try:
@@ -819,12 +855,28 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             active_sx = None
                     batch_results[batch_idx].append(SceneDescription(
                         timestamp=item.get("timestamp", frame_ref.timestamp),
-                        description=item.get("description", ""),
+                        description=desc_text,
                         importance_score=max(1, min(10, int(item.get("importance_score", 5)))),
                         thumbnail_path=frame_ref.path,
                         subject_x=sx,
                         active_speaker_x=active_sx,
                     ))
+                # Ensure every frame in batch has a scene entry — some models
+                # return fewer JSON items than images sent.
+                existing_ts = {s.timestamp for s in batch_results[batch_idx]}
+                for frame in batch:
+                    if frame.timestamp not in existing_ts:
+                        logger.debug(
+                            "Batch %d: no result for frame %.1fs — adding fallback",
+                            batch_idx, frame.timestamp,
+                        )
+                        batch_results[batch_idx].append(SceneDescription(
+                            timestamp=frame.timestamp,
+                            description="Frame not analyzed by model",
+                            importance_score=5,
+                            thumbnail_path=frame.path,
+                            subject_x=50,
+                        ))
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 logger.warning(f"Failed to parse frame analysis: {e}")
                 fallback_desc = extract_description_fallback(raw) if raw else "Analysis failed"
@@ -854,6 +906,86 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         scenes = []
         for batch_scene_list in batch_results:
             scenes.extend(batch_scene_list)
+
+        # ── Quality check: if most frames defaulted to center, re-analyze ──
+        center_count = sum(1 for s in scenes if s.subject_x == 50)
+        center_pct = center_count / len(scenes) * 100 if scenes else 0
+
+        if center_pct > 70 and len(scenes) > 5:
+            logger.warning(
+                "Subject tracking quality poor: %d/%d (%.0f%%) at center — "
+                "running targeted position re-analysis",
+                center_count, len(scenes), center_pct,
+            )
+
+            # Re-analyze ONLY center-defaulted frames with a simpler position prompt
+            center_frames = [
+                frames[i] for i, s in enumerate(scenes)
+                if s.subject_x == 50 and i < len(frames)
+            ]
+
+            if center_frames:
+                position_prompt = (
+                    "Look at this image. Where is the main person's face horizontally?\n"
+                    "Answer with ONLY a JSON object: {\"subject_x\": <number>}\n"
+                    "subject_x is a number from 0 to 100:\n"
+                    "  0-15 = far left\n"
+                    "  25-35 = left side\n"
+                    "  40-60 = center area\n"
+                    "  65-75 = right side\n"
+                    "  80-100 = far right\n"
+                    "If multiple people, pick who is talking."
+                )
+
+                reanalyzed = 0
+                for frame in center_frames:
+                    if not frame.base64:
+                        continue
+                    content = [
+                        {"type": "text", "text": position_prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{frame.base64}",
+                        }},
+                    ]
+                    try:
+                        reraw = await self._call_with_fallback(
+                            self._vision_model, self._vision_fallbacks,
+                            [{"role": "user", "content": content}],
+                            max_tokens=256, is_vision=True, cancel_check=cancel_check,
+                        )
+                        reraw = reraw.strip()
+                        if reraw.startswith("```"):
+                            reraw = reraw.split("\n", 1)[1].rsplit("```", 1)[0]
+                        # Try parsing as JSON; handle partial JSON gracefully
+                        if not reraw.startswith("{"):
+                            brace = reraw.find("{")
+                            if brace >= 0:
+                                reraw = reraw[brace:]
+                        parsed_pos = json.loads(reraw)
+                        new_sx = parsed_pos.get("subject_x")
+                        if new_sx is not None:
+                            new_sx = max(0, min(100, int(new_sx)))
+                            if new_sx != 50:
+                                for s in scenes:
+                                    if abs(s.timestamp - frame.timestamp) < 0.5 and s.subject_x == 50:
+                                        logger.info(
+                                            "Re-analysis: frame %.1fs subject_x 50 → %d",
+                                            frame.timestamp, new_sx,
+                                        )
+                                        s.subject_x = new_sx
+                                        reanalyzed += 1
+                                        break
+                    except Exception as e:
+                        logger.debug("Position re-analysis failed for frame %.1fs: %s", frame.timestamp, e)
+
+                if reanalyzed > 0:
+                    new_center = sum(1 for s in scenes if s.subject_x == 50)
+                    logger.info(
+                        "Re-analysis improved %d frames — center count: %d → %d (%.0f%% → %.0f%%)",
+                        reanalyzed, center_count, new_center,
+                        center_pct, new_center / len(scenes) * 100,
+                    )
+
         return scenes
 
     # ── Summary Generation ─────────────────────────────────────────────
