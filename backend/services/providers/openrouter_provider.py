@@ -150,8 +150,27 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         "gemini-2.5-pro": 120000,      # Gemini Pro: 1M context
         "claude": 80000,               # Claude: 200K context
         "gpt-4": 50000,                # GPT-4: 128K context
+        "reka": 6000,                  # Reka models: 16K context, small budget
     }
     _DEFAULT_CONTEXT_BUDGET = 12000    # safe default for unknown models
+
+    # Maximum images per vision API call, keyed by model pattern.
+    # Models with strict image limits (e.g. reka-edge allows max 3)
+    # will have their batch size reduced to avoid 400 errors.
+    _MODEL_MAX_IMAGES = {
+        "reka": 2,                     # Reka: "At most 3 images" — use 2 to leave room for prompt
+        "openrouter/free": 4,          # Free routing: unpredictable, be conservative
+        "llama": 4,                    # Llama vision: works best with fewer images
+    }
+    _DEFAULT_MAX_IMAGES = 8            # Most models handle 8 images fine
+
+    # Vision-specific max_tokens override — models with small context windows
+    # need fewer output tokens to leave room for the image input tokens.
+    _MODEL_VISION_MAX_TOKENS = {
+        "reka": 1024,                  # 16K context, images eat ~11K tokens
+        "openrouter/free": 2048,       # Conservative for free routing
+    }
+    _DEFAULT_VISION_MAX_TOKENS = 4096
 
     def _get_context_budget(self, model: str) -> int:
         """Return the approximate char budget for prompt content based on model."""
@@ -160,6 +179,22 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             if pattern in model_lower:
                 return budget
         return self._DEFAULT_CONTEXT_BUDGET
+
+    def _get_max_images(self, model: str) -> int:
+        """Return the max images per vision call for the given model."""
+        model_lower = model.lower()
+        for pattern, limit in self._MODEL_MAX_IMAGES.items():
+            if pattern in model_lower:
+                return limit
+        return self._DEFAULT_MAX_IMAGES
+
+    def _get_vision_max_tokens(self, model: str) -> int:
+        """Return the max_tokens for vision API calls based on model constraints."""
+        model_lower = model.lower()
+        for pattern, tokens in self._MODEL_VISION_MAX_TOKENS.items():
+            if pattern in model_lower:
+                return tokens
+        return self._DEFAULT_VISION_MAX_TOKENS
 
     def __init__(self):
         self._client = AsyncOpenAI(
@@ -393,7 +428,13 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         cancel_check=None, progress_callback=None,
     ) -> list[SceneDescription]:
         instruction = custom_prompt if custom_prompt else DEFAULT_FRAME_ANALYSIS_PROMPT
-        batch_size = 8
+        # Model-aware batch size: some models (reka-edge) only support 2-3 images
+        batch_size = self._get_max_images(self._vision_model)
+        vision_max_tokens = self._get_vision_max_tokens(self._vision_model)
+        logger.info(
+            "Vision batch config for '%s': batch_size=%d, max_tokens=%d",
+            self._vision_model, batch_size, vision_max_tokens,
+        )
         total = len(frames)
         num_batches = (total + batch_size - 1) // batch_size
         # Store results per batch index to maintain ordering
@@ -436,6 +477,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 try:
                     raw = await self._call_with_fallback(
                         self._vision_model, self._vision_fallbacks, messages,
+                        max_tokens=vision_max_tokens,
                         is_vision=True, cancel_check=cancel_check,
                     )
                 except (ProviderError, ProviderRateLimitError) as api_err:
