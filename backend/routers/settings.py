@@ -364,10 +364,32 @@ _MODEL_SPEED_PROFILES = {
     "gpt-4-turbo": {"speed": "slow", "est_minutes_vision": 5.0, "est_minutes_text": 2.0, "quality": "excellent", "quality_score": 4},
     "o1": {"speed": "slow", "est_minutes_vision": 6.0, "est_minutes_text": 3.0, "quality": "excellent", "quality_score": 4},
     "o3": {"speed": "slow", "est_minutes_vision": 7.0, "est_minutes_text": 3.5, "quality": "best", "quality_score": 5},
+    # --- Vision model families ---
+    "qwen2.5-vl": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "good", "quality_score": 3},
+    "qwen3-vl": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "excellent", "quality_score": 4},
+    "kimi-vl": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
+    "kimi-k2": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "excellent", "quality_score": 4},
+    "internvl": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
+    "minicpm-v": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 1.0, "quality": "good", "quality_score": 3},
+    "glm-4": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
+    "yi-vision": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
+    "step-3.5": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "good", "quality_score": 3},
+    "mimo": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
+    "deepseek-vl": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
+    "nemotron": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "good", "quality_score": 3},
+    "phi-4": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "good", "quality_score": 3},
+    "phi-3": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "basic", "quality_score": 2},
+    "gemma-3": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "good", "quality_score": 3},
+    "llama-3.2-90b": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "excellent", "quality_score": 4},
+    "llama-3.2-11b": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.8, "quality": "good", "quality_score": 3},
+    "llama-4": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "excellent", "quality_score": 4},
+    "grok-3": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "excellent", "quality_score": 4},
+    "grok-4": {"speed": "medium", "est_minutes_vision": 3.5, "est_minutes_text": 2.0, "quality": "excellent", "quality_score": 4},
+    "grok-2": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.5, "quality": "good", "quality_score": 3},
     # --- Models with limited/no vision tracking ---
     "reka-edge": {"speed": "fast", "est_minutes_vision": 2.0, "est_minutes_text": 0.5, "quality": "poor", "quality_score": 1},
     "reka-core": {"speed": "medium", "est_minutes_vision": 3.0, "est_minutes_text": 1.0, "quality": "basic", "quality_score": 2},
-    "gemini-2.5-flash-lite": {"speed": "fast", "est_minutes_vision": 1.0, "est_minutes_text": 0.3, "quality": "basic", "quality_score": 2},
+    "gemini-2.5-flash-lite": {"speed": "fast", "est_minutes_vision": 1.0, "est_minutes_text": 0.3, "quality": "good", "quality_score": 3},
 }
 
 # Free tier models are rate-limited (~20 RPM), multiply time by 3x
@@ -1448,23 +1470,62 @@ _VISION_BLOCKLIST_PATTERNS = [
     "nanollava",           # Too small for structured output
 ]
 
-# Models known to work well for subject tracking — used for quality scoring
-_VISION_TRACKING_SCORES = {
-    "gemini-2.5-flash": 5,
-    "gemini-2.5-pro": 5,
-    "gemini-2.0-flash": 4,
-    "gpt-4o": 4,
-    "gpt-4o-mini": 3,
-    "claude-sonnet": 4,
-    "claude-haiku": 3,
-    "qwen2.5-vl-72b": 4,
-    "qwen2.5-vl-32b": 3,
-    "pixtral": 3,
-    "llama-3.2-90b": 3,
-    "llama-3.2-11b": 2,
-    "gemma-3-27b": 3,
-    "mistral-small-3.1": 2,
+# ── Subject tracking quality scores ──
+# Scoring criteria: can the model output structured JSON with a reliable
+# subject_x (0-100) horizontal position? Most 7B+ vision models can.
+#   5 = best:  Excellent spatial reasoning + JSON + large context + fast
+#   4 = excellent: Strong spatial + reliable JSON + good context
+#   3 = good:  Solid spatial awareness + JSON works + adequate context
+#   2 = basic: Can estimate positions + JSON mostly works
+#   1 = minimal: Marginal capability
+_VISION_TRACKING_SCORES: dict[str, int] = {
+    # ── Google ──
+    "gemini-2.5-pro": 5, "gemini-2.5-flash": 5, "gemini-2.0-flash": 4,
+    "gemini-2.5-flash-lite": 3, "gemini-flash": 4, "gemini-3": 5,
+    # ── Anthropic ──
+    "claude-sonnet-4": 5, "claude-opus": 5, "claude-sonnet": 4, "claude-haiku": 3,
+    # ── OpenAI ──
+    "gpt-4o": 4, "gpt-4o-mini": 3, "gpt-4-turbo": 4, "o1": 4, "o3": 5, "o4-mini": 4,
+    # ── Qwen VL ──
+    "qwen2.5-vl-72b": 4, "qwen2.5-vl-32b": 4, "qwen2.5-vl-7b": 3, "qwen2.5-vl-3b": 2,
+    "qwen3-vl-32b": 4, "qwen3-vl-8b": 3, "qwen-vl-max": 4, "qwen-vl-plus": 3,
+    "qwen-vl": 3, "qwq": 3,
+    # ── Mistral / Pixtral ──
+    "pixtral-large": 4, "pixtral-12b": 3, "pixtral": 3,
+    "mistral-large-3": 4, "mistral-small-3.1": 3, "mistral-small-3": 3, "mistral-medium": 3,
+    # ── Meta Llama ──
+    "llama-4-maverick": 4, "llama-4-scout": 4,
+    "llama-3.2-90b": 4, "llama-3.2-11b": 3, "llama-3.2-3b": 2,
+    # ── Google Gemma ──
+    "gemma-3-27b": 3, "gemma-3-12b": 3, "gemma-3-4b": 2, "gemma-2": 2,
+    # ── DeepSeek ──
+    "deepseek-r1": 3, "deepseek-v3": 3, "deepseek-vl2": 3, "deepseek": 3,
+    # ── Moonshot / Kimi ──
+    "kimi-vl": 3, "kimi-k2.5": 4, "kimi-k2": 3, "moonshot": 3,
+    # ── NVIDIA ──
+    "nemotron": 3, "nemotron-nano-2-vl": 3, "llama-3.1-nemotron": 3,
+    # ── xAI Grok ──
+    "grok-3": 4, "grok-2": 3, "grok-4": 4, "grok": 3,
+    # ── Zhipu / GLM ──
+    "glm-4v": 3, "glm-4.5": 3, "chatglm": 2,
+    # ── InternLM / InternVL ──
+    "internvl": 3, "internlm": 3,
+    # ── Yi (01.AI) ──
+    "yi-vision": 3, "yi-vl": 3,
+    # ── MiniCPM ──
+    "minicpm-v": 3, "minicpm": 2,
+    # ── StepFun ──
+    "step-3.5": 3,
+    # ── Reka (only Core; Edge is blocklisted) ──
+    "reka-core": 2,
+    # ── Moondream ──
     "moondream": 2,
+    # ── Cohere ──
+    "command-r-plus": 3, "command-r": 2,
+    # ── MiMo ──
+    "mimo": 3,
+    # ── Microsoft Phi ──
+    "phi-4": 3, "phi-3.5-vision": 2, "phi-3-vision": 2,
 }
 
 
@@ -1472,6 +1533,7 @@ def _vision_tracking_compat(model_id: str, context_length: int) -> tuple[bool, i
     """Check if a vision model is compatible with subject tracking.
 
     Returns (is_compatible, tracking_quality_score 0-5).
+    Uses longest pattern match for specificity (e.g. "qwen2.5-vl-72b" wins over "qwen-vl").
     """
     mid_lower = model_id.lower()
 
@@ -1483,18 +1545,27 @@ def _vision_tracking_compat(model_id: str, context_length: int) -> tuple[bool, i
     if context_length > 0 and context_length < _MIN_VISION_CONTEXT:
         return False, 0
 
+    # Longest match wins for specificity
+    best_score = None
+    best_len = 0
     for pattern, score in _VISION_TRACKING_SCORES.items():
-        if pattern in mid_lower:
-            return True, score
+        if pattern in mid_lower and len(pattern) > best_len:
+            best_score = score
+            best_len = len(pattern)
+    if best_score is not None:
+        return True, best_score
 
-    # Unknown model — score by context size
+    # Context-based fallback for unknown models — most modern vision models
+    # with decent context can do basic spatial estimation.
     if context_length == 0:
-        return True, 2  # Ollama local, allow with basic score
-    if context_length >= 128000:
-        return True, 3
+        return True, 2  # Ollama local, give benefit of doubt
+    if context_length >= 200000:
+        return True, 4  # 200K+ → likely capable frontier model
     if context_length >= 32000:
-        return True, 2
-    return True, 1  # 16K-32K range — marginal
+        return True, 3  # 32K+ → modern model, should work well
+    if context_length >= 16000:
+        return True, 2  # 16K → tight but workable
+    return True, 1  # Below 16K but passed blocklist — marginal
 
 
 @router.get("/providers/models/available")
@@ -1629,6 +1700,9 @@ async def available_models():
                             compatible, tracking_score = _vision_tracking_compat(f"ollama/{model_name}", 0)
                             if compatible:
                                 entry["tracking_score"] = tracking_score
+                                if tracking_score > entry.get("quality_score", 0):
+                                    entry["quality_score"] = tracking_score
+                                    entry["quality"] = {1: "minimal", 2: "basic", 3: "good", 4: "excellent", 5: "best"}.get(tracking_score, "good")
                                 vision.append(entry)
                         # All models can do text
                         text.append(entry)
