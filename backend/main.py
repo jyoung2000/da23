@@ -379,6 +379,48 @@ async def warmup_ollama():
             logger.warning("Ollama capability detection at startup failed (non-fatal): %s", e)
 
 @app.on_event("startup")
+async def fetch_openrouter_model_caps():
+    """Fetch OpenRouter model capabilities at startup so the pipeline knows
+    each model's context_length, max_completion_tokens, and vision support
+    BEFORE the first analysis runs.  Without this, the provider falls back
+    to hardcoded pattern-based estimates which can be wrong (e.g. reka-edge
+    getting 8K output tokens when it only supports 4K context total).
+
+    The cache is stored on the Docker volume (/data/logs/model_cache.json)
+    and refreshed if older than 24h.
+    """
+    from backend.config import settings as cfg
+    if not cfg.OPENROUTER_API_KEY or cfg.OPENROUTER_API_KEY in {"", "sk-or-..."}:
+        logger.info("OpenRouter API key not set — skipping model capability fetch")
+        return
+    try:
+        from backend.routers.settings import _fetch_openrouter_models, MODEL_CACHE_PATH, MODEL_CACHE_TTL
+        import os, time as _time
+        # Check if cache is fresh enough (avoid hitting API on every restart)
+        if os.path.exists(MODEL_CACHE_PATH):
+            try:
+                import json as _json
+                with open(MODEL_CACHE_PATH, "r") as f:
+                    cache = _json.load(f)
+                age = _time.time() - cache.get("timestamp", 0)
+                n_models = len(cache.get("raw_models", []))
+                if age < MODEL_CACHE_TTL and n_models > 0:
+                    logger.info(
+                        "OpenRouter model cache is fresh (%d models, %.0fh old) — skipping fetch",
+                        n_models, age / 3600,
+                    )
+                    return
+            except Exception:
+                pass
+        models = await _fetch_openrouter_models()
+        if models:
+            logger.info("Fetched %d OpenRouter models at startup — capabilities cached", len(models))
+        else:
+            logger.warning("OpenRouter model fetch returned no models (API may be unreachable)")
+    except Exception as e:
+        logger.warning("OpenRouter model capability fetch failed at startup (non-fatal): %s", e)
+
+@app.on_event("startup")
 async def recover_uploads():
     """Recover in-progress chunked upload sessions from disk after restart."""
     from backend.routers.chunked_upload import restore_sessions

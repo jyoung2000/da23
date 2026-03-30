@@ -47,8 +47,8 @@ def _resolve_cache_path() -> str:
     return os.path.join(local_path, "model_cache.json")
 
 
-def _load_model_capabilities() -> dict[str, dict]:
-    """Load model capabilities from the OpenRouter model cache.
+def _parse_model_caps(raw_models: list) -> dict[str, dict]:
+    """Parse raw OpenRouter model list into a capabilities lookup dict.
 
     Returns a dict keyed by model ID (lowercase) with values:
         {
@@ -57,16 +57,6 @@ def _load_model_capabilities() -> dict[str, dict]:
             "supports_vision": bool,         # True if model accepts images
         }
     """
-    cache_path = _resolve_cache_path()
-    if not os.path.exists(cache_path):
-        return {}
-    try:
-        with open(cache_path, "r") as f:
-            cache = json.load(f)
-        raw_models = cache.get("raw_models", [])
-    except Exception:
-        return {}
-
     caps: dict[str, dict] = {}
     for m in raw_models:
         mid = m.get("id", "").lower()
@@ -76,7 +66,6 @@ def _load_model_capabilities() -> dict[str, dict]:
         top = m.get("top_provider", {}) or {}
         max_comp = top.get("max_completion_tokens", 0) or 0
         arch = m.get("architecture", {}) or {}
-        # Check both old-style string and new-style list modality fields
         modality = arch.get("modality", "")
         input_modalities = arch.get("input_modalities", [])
         has_vision = (
@@ -88,9 +77,62 @@ def _load_model_capabilities() -> dict[str, dict]:
             "max_completion_tokens": max_comp,
             "supports_vision": has_vision,
         }
-    if caps:
-        logger.info("Loaded capabilities for %d OpenRouter models from cache", len(caps))
     return caps
+
+
+def _load_model_capabilities() -> dict[str, dict]:
+    """Load model capabilities from the OpenRouter model cache.
+
+    If the cache file exists, parses it.  If the cache is missing or empty,
+    attempts a synchronous HTTP fetch from OpenRouter's /api/v1/models endpoint
+    so that model limits are available on the very first pipeline run (even if
+    the user never visited the Settings page).
+    """
+    cache_path = _resolve_cache_path()
+
+    # Try loading from existing cache
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+            raw_models = cache.get("raw_models", [])
+            if raw_models:
+                caps = _parse_model_caps(raw_models)
+                if caps:
+                    logger.info("Loaded capabilities for %d OpenRouter models from cache", len(caps))
+                    return caps
+        except Exception:
+            pass
+
+    # Cache is missing or empty — try a synchronous fetch
+    api_key = settings.OPENROUTER_API_KEY
+    if not api_key or api_key in {"", "sk-or-..."}:
+        logger.info("No OpenRouter API key — cannot fetch model capabilities")
+        return {}
+
+    logger.info("Model cache empty — fetching OpenRouter model list synchronously...")
+    try:
+        import httpx
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp.raise_for_status()
+            raw_models = resp.json().get("data", [])
+        if raw_models:
+            # Save to cache for future use
+            from backend.routers.settings import _save_model_cache
+            _save_model_cache(raw_models)
+            caps = _parse_model_caps(raw_models)
+            logger.info(
+                "Fetched and cached %d OpenRouter model capabilities on first use",
+                len(caps),
+            )
+            return caps
+    except Exception as e:
+        logger.warning("Synchronous OpenRouter model fetch failed: %s", e)
+    return {}
 
 # ── Model presets ──────────────────────────────────────────────────────
 # Each preset targets a different cost / quality tradeoff on OpenRouter.
@@ -257,7 +299,16 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
 
         for pattern, budget in self._FALLBACK_CONTEXT_BUDGET.items():
             if pattern in model_lower:
+                logger.warning(
+                    "Model '%s' not in API cache — using hardcoded context budget %d (pattern: %s). "
+                    "Run /api/providers/models/refresh to fetch actual limits.",
+                    model, budget, pattern,
+                )
                 return budget
+        logger.warning(
+            "Model '%s' not in API cache and no pattern match — using default context budget %d",
+            model, self._DEFAULT_CONTEXT_BUDGET,
+        )
         return self._DEFAULT_CONTEXT_BUDGET
 
     def _get_tokens_per_image(self, model: str) -> int:
@@ -396,28 +447,52 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         )
         self._total_tokens = 0
         self._total_cost = 0.0
-        # Log resolved capabilities for each active model
-        def _caps_str(model_id):
+
+        # Log resolved constraints for each active model so we can verify
+        # in container logs that real API data is being used, not hardcoded fallbacks.
+        def _model_constraints(model_id: str, role: str) -> str:
             c = self._model_caps.get(model_id.lower())
+            src = "API" if (c and c["context_length"] > 0) else "fallback"
+            parts = [f"src={src}"]
             if c and c["context_length"] > 0:
-                ctx_k = c["context_length"] // 1000
-                max_out = (c.get("max_completion_tokens", 0) or 0) // 1000
-                return f"ctx={ctx_k}K,max_out={max_out}K"
-            return "no-cache"
+                parts.append(f"ctx={c['context_length'] // 1000}K")
+                max_out = (c.get("max_completion_tokens", 0) or 0)
+                if max_out:
+                    parts.append(f"max_out={max_out // 1000}K")
+            if role == "vision":
+                parts.append(f"batch={self._get_max_images(model_id)}")
+                parts.append(f"vis_tok={self._get_vision_max_tokens(model_id)}")
+                parts.append(f"img_tok={self._get_tokens_per_image(model_id)}/img")
+            elif role == "text":
+                parts.append(f"budget={self._get_context_budget(model_id)} chars")
+                parts.append(f"max_tok={self._get_max_tokens(model_id)}")
+            return ", ".join(parts)
 
         logger.info(
-            f"OpenRouter init: preset={self._preset_name}, "
-            f"vision={self._vision_model} [{_caps_str(self._vision_model)}, "
-            f"batch={self._get_max_images(self._vision_model)}, "
-            f"vis_tok={self._get_vision_max_tokens(self._vision_model)}] "
-            f"(+{len(self._vision_fallbacks)} fallbacks), "
-            f"summary={self._summary_model} [{_caps_str(self._summary_model)}] "
-            f"(+{len(self._summary_fallbacks)} fallbacks), "
-            f"clip={self._text_model} [{_caps_str(self._text_model)}, "
-            f"budget={self._get_context_budget(self._text_model)} chars] "
-            f"(+{len(self._text_fallbacks)} fallbacks), "
-            f"model_caps={len(self._model_caps)} models loaded"
+            "OpenRouter init: %d model caps from API cache | preset=%s",
+            len(self._model_caps), self._preset_name,
         )
+        logger.info(
+            "  vision: %s [%s] (+%d fallbacks)",
+            self._vision_model, _model_constraints(self._vision_model, "vision"),
+            len(self._vision_fallbacks),
+        )
+        logger.info(
+            "  text:   %s [%s] (+%d fallbacks)",
+            self._text_model, _model_constraints(self._text_model, "text"),
+            len(self._text_fallbacks),
+        )
+        logger.info(
+            "  summary: %s [%s] (+%d fallbacks)",
+            self._summary_model, _model_constraints(self._summary_model, "text"),
+            len(self._summary_fallbacks),
+        )
+        if not self._model_caps:
+            logger.warning(
+                "OpenRouter model cache is EMPTY — all constraints are hardcoded estimates. "
+                "Model limits may be wrong. Fetch real data via Settings > Models > Refresh, "
+                "or ensure the API key is set so startup fetch can populate the cache."
+            )
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None) -> str:
         """Generic text completion using the text model with fallback chain."""
