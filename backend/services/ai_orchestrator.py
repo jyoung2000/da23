@@ -131,6 +131,31 @@ class AIOrchestrator:
             return f"{pname} ({', '.join(parts)})"
         return pname
 
+    def _get_task_model(self, provider, task: str) -> str:
+        """Get the specific model name used for a task (vision/text/summary/clips).
+
+        Returns a string like 'reka/reka-edge via openrouter' for storage
+        in provider_used so the frontend can show exactly which model ran.
+        """
+        pname = provider.provider_name
+        if pname == "openrouter":
+            if task in ("scenes", "vision", "scene_analysis"):
+                model = getattr(provider, '_vision_model', None)
+            elif task in ("summary",):
+                model = getattr(provider, '_summary_model', None) or getattr(provider, '_text_model', None)
+            else:  # clips, seo, text
+                model = getattr(provider, '_text_model', None)
+            if model:
+                return f"{model} via openrouter"
+        elif pname == "ollama":
+            if task in ("scenes", "vision", "scene_analysis"):
+                model = getattr(provider, '_vision_model', None)
+            else:
+                model = getattr(provider, '_text_model', None)
+            if model:
+                return f"{model} via ollama"
+        return pname
+
     # Rough cost per 1K tokens by provider (input+output blended average)
     _COST_PER_1K_TOKENS = {
         "openrouter": 0.0002,   # varies by model; free tier = 0
@@ -350,7 +375,7 @@ class AIOrchestrator:
                         " ⚠ ALL VALUES ARE 50 — model may not have detected subject positions" if all_default else "",
                     )
                 self._circuit_breaker.record_success(provider.provider_name)
-                return result, provider.provider_name
+                return result, self._get_task_model(provider, "scenes")
             except (ProviderRateLimitError, ProviderError) as e:
                 self._circuit_breaker.record_failure(provider.provider_name)
                 await self._notify_fallback(job_id, provider.provider_name, str(e))
@@ -381,7 +406,7 @@ class AIOrchestrator:
                 elapsed = time.monotonic() - t0
                 logger.info("Summary generation via %s completed in %.1fs", provider.provider_name, elapsed)
                 self._circuit_breaker.record_success(provider.provider_name)
-                return result, provider.provider_name
+                return result, self._get_task_model(provider, "summary")
             except (ProviderRateLimitError, ProviderError) as e:
                 self._circuit_breaker.record_failure(provider.provider_name)
                 await self._notify_fallback(job_id, provider.provider_name, str(e))
@@ -504,7 +529,7 @@ class AIOrchestrator:
                 )
                 data = extract_json(raw)
                 if has_real_summary_content(data):
-                    return VideoSummary(**data), provider.provider_name
+                    return VideoSummary(**data), self._get_task_model(provider, "summary")
             except Exception as e:
                 logger.warning("[%s] Reduce summary via %s failed: %s", job_id, provider.provider_name, e)
                 continue
@@ -628,7 +653,7 @@ class AIOrchestrator:
                 elapsed = time.monotonic() - t0
                 logger.info("Clip detection via %s completed in %.1fs (%d clips)", pname, elapsed, len(result))
                 self._circuit_breaker.record_success(pname)
-                return result, pname
+                return result, self._get_task_model(provider, "clips")
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - t0
                 # Check if partial results were collected before timeout
@@ -641,7 +666,7 @@ class AIOrchestrator:
                         "Clip detection via %s timed out after %ds but recovered %d partial clips",
                         pname, timeout, len(deduped),
                     )
-                    return deduped, f"{pname} (partial)"
+                    return deduped, f"{self._get_task_model(provider, 'clips')} (partial)"
                 logger.warning("Clip detection via %s timed out after %ds", pname, timeout)
                 self._circuit_breaker.record_failure(pname)
                 await self._notify_fallback(job_id, pname, f"Timed out after {timeout}s")
@@ -777,7 +802,7 @@ class AIOrchestrator:
                 elapsed = time.monotonic() - t0
                 logger.info("SEO generation via %s completed in %.1fs", provider.provider_name, elapsed)
                 self._circuit_breaker.record_success(provider.provider_name)
-                return result, provider.provider_name
+                return result, self._get_task_model(provider, "seo")
             except (ProviderRateLimitError, ProviderError) as e:
                 self._circuit_breaker.record_failure(provider.provider_name)
                 await self._notify_fallback(job_id, provider.provider_name, str(e))

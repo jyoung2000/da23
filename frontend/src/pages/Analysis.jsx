@@ -2392,7 +2392,25 @@ export default function Analysis() {
         {job.fps > 0 && <span style={{ fontFamily: 'var(--font-mono)' }}>{job.fps} FPS</span>}
         {job.file_size_mb > 0 && <span style={{ fontFamily: 'var(--font-mono)' }}>{job.file_size_mb.toFixed(1)} MB</span>}
         {Object.keys(job.provider_used || {}).length > 0 && (
-          <span>Providers: {Object.entries(job.provider_used).map(([k, v]) => `${String(k)}=${typeof v === 'object' ? JSON.stringify(v) : String(v)}`).join(', ')}</span>
+          <span style={{ lineHeight: 1.5 }}>
+            {Object.entries(job.provider_used).map(([task, model]) => {
+              const modelStr = typeof model === 'object' ? JSON.stringify(model) : String(model || '');
+              const isFallback = modelStr.includes('(partial)') || modelStr === 'fallback' || modelStr === 'none';
+              return (
+                <span key={task} style={{
+                  display: 'inline-block',
+                  marginRight: 8,
+                  padding: '1px 6px',
+                  borderRadius: 4,
+                  background: isFallback ? 'rgba(245,158,11,0.15)' : 'rgba(16,185,129,0.1)',
+                  color: isFallback ? 'var(--accent-amber)' : 'var(--text-secondary)',
+                  fontSize: 11,
+                }}>
+                  <strong>{String(task)}</strong>: {modelStr}
+                </span>
+              );
+            })}
+          </span>
         )}
         {job.analysis_duration_seconds > 0 && (
           <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--success)' }}>
