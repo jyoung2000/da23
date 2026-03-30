@@ -152,6 +152,77 @@ export function buildSpeakerKeyframes(transcript, speakerMap, clipStart, clipEnd
 }
 
 /**
+ * Detect if subject_x values form two distinct clusters (two speakers).
+ * Uses a simple gap-based approach: sort values, find the largest gap.
+ * If the gap is > gapThreshold and both sides have enough samples,
+ * returns the two cluster centers. Otherwise returns null.
+ *
+ * This is a visual-only approach that works WITHOUT audio diarization —
+ * it catches two-speaker scenarios even when Whisper only detects 1 speaker.
+ *
+ * Matches backend _detect_bimodal_clusters() exactly for preview-export parity.
+ *
+ * @param {Array<{t: number, x: number}>} keyframes
+ * @param {number} gapThreshold - Minimum gap between clusters (default 12)
+ * @param {number} minClusterSize - Minimum samples per cluster (default 3)
+ * @returns {{left: number, right: number, split: number}|null}
+ */
+export function detectBimodalClusters(keyframes, gapThreshold = 12, minClusterSize = 3) {
+  if (!keyframes || keyframes.length < 6) return null;
+
+  const xs = keyframes.map(k => k.x).sort((a, b) => a - b);
+
+  // Find the largest gap between consecutive sorted values
+  let maxGap = 0;
+  let splitIdx = -1;
+  for (let i = 1; i < xs.length; i++) {
+    const gap = xs[i] - xs[i - 1];
+    if (gap > maxGap) {
+      maxGap = gap;
+      splitIdx = i;
+    }
+  }
+
+  if (maxGap < gapThreshold || splitIdx < 0) return null;
+
+  const leftValues = xs.slice(0, splitIdx);
+  const rightValues = xs.slice(splitIdx);
+
+  if (leftValues.length < minClusterSize || rightValues.length < minClusterSize) return null;
+
+  // Compute cluster centers (median for robustness)
+  const median = (arr) => {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  };
+
+  const leftCenter = Math.round(median(leftValues));
+  const rightCenter = Math.round(median(rightValues));
+  const splitValue = (leftValues[leftValues.length - 1] + rightValues[0]) / 2;
+
+  return { left: leftCenter, right: rightCenter, split: splitValue };
+}
+
+/**
+ * For bimodal data (two speakers), snap each keyframe to its nearest
+ * cluster center. This replaces the noisy per-frame values with clean
+ * alternating positions that handleSceneCuts can process into instant jumps.
+ *
+ * Matches backend _snap_to_clusters() exactly for preview-export parity.
+ *
+ * @param {Array<{t: number, x: number}>} keyframes
+ * @param {{left: number, right: number, split: number}} clusters
+ * @returns {Array<{t: number, x: number}>}
+ */
+export function snapToClusters(keyframes, clusters) {
+  return keyframes.map(kf => ({
+    t: kf.t,
+    x: kf.x < clusters.split ? clusters.left : clusters.right,
+  }));
+}
+
+/**
  * Build sorted keyframes from scenes for a clip range.
  *
  * Uses scenes both within and outside the clip range.  Scenes outside the
@@ -553,7 +624,64 @@ export function mergeHolds(keyframes, tolerance = 3) {
  * @returns {Array<{t: number, x: number}>} Fully processed keyframes
  */
 export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null, transcript = null) {
-  // ── PHASE 1: Try speaker-aware tracking ──
+  // ── PHASE 0: Build raw keyframes ──
+  const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
+  if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];
+  if (raw.length === 1) return raw;
+
+  // ── PHASE 1: Detect bimodal clusters (two speakers from visual data) ──
+  // This works WITHOUT audio diarization — catches two-speaker scenarios
+  // even when Whisper only detects 1 speaker, by finding two position clusters
+  // in the scene analysis subject_x values.
+  const clusters = detectBimodalClusters(raw);
+
+  if (clusters) {
+    // Two-speaker mode: snap to cluster centers, then use scene cuts for instant jumps.
+    // NO smoothing — speaker changes must be instant snaps, not pans.
+    const snapped = snapToClusters(raw, clusters);
+
+    // Remove consecutive duplicates (same speaker holding) to clean up
+    const deduped = [snapped[0]];
+    for (let i = 1; i < snapped.length; i++) {
+      if (snapped[i].x !== deduped[deduped.length - 1].x) {
+        deduped.push(snapped[i]);
+      } else if (i === snapped.length - 1) {
+        deduped.push({ t: snapped[i].t, x: deduped[deduped.length - 1].x });
+      }
+    }
+
+    // Ensure start and end keyframes
+    if (deduped[0].t > 0) {
+      deduped.unshift({ t: 0, x: deduped[0].x });
+    }
+    const clipDur = clipEnd - clipStart;
+    if (deduped[deduped.length - 1].t < clipDur) {
+      deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x });
+    }
+
+    // handleSceneCuts inserts 1ms instant-jump transitions at speaker changes
+    // (delta between clusters is always > 15, so every change triggers an instant cut)
+    const afterCuts = handleSceneCuts(deduped);
+
+    // Final bounds enforcement
+    let result;
+    if (srcRatio && targetRatio) {
+      const range = computeSafeRange(srcRatio, targetRatio);
+      result = afterCuts.map(kf => ({
+        t: kf.t,
+        x: Math.max(range.min, Math.min(range.max, Math.round(kf.x))),
+      }));
+    } else {
+      result = afterCuts.map(kf => ({
+        t: kf.t,
+        x: Math.max(0, Math.min(100, Math.round(kf.x))),
+      }));
+    }
+
+    return result;
+  }
+
+  // ── PHASE 2: Try speaker-aware tracking (requires 2+ speakers in transcript) ──
   if (transcript?.length && scenes?.length) {
     const speakerMap = buildSpeakerPositionMap(scenes, transcript);
     if (Object.keys(speakerMap).length >= 2) {
@@ -575,12 +703,7 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     }
   }
 
-  // ── PHASE 2: Fall back to scene-based tracking ──
-  const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
-  if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];
-  // Single keyframe is still useful — return it as static position
-  if (raw.length === 1) return raw;
-
+  // ── PHASE 3: Single-subject tracking (original pipeline) ──
   // Sparse data detection: when we have very few keyframes (≤ 4),
   // relax pipeline thresholds so the little tracking data we have
   // doesn't get killed by dead zones and convergence checks.
@@ -624,11 +747,6 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     // With sparse data, even small differences are meaningful — lower threshold
     if (isSparse) convergenceThreshold = Math.max(1, Math.round(convergenceThreshold * 0.6));
     if (maxX - minX < convergenceThreshold) {
-      // Use the keyframe value closest to the clip midpoint — this gives
-      // the best static position for the most common playback moment.
-      // For two-speaker scenarios (e.g. sx=30 and sx=70), this picks
-      // whichever speaker the AI detected at the midpoint rather than
-      // averaging to 50 (the empty gap between them).
       let staticX;
       if (result.length <= 1) {
         staticX = result[0].x;

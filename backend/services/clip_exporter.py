@@ -2203,6 +2203,70 @@ def _build_speaker_keyframes(
     return keyframes if len(keyframes) >= 2 else None
 
 
+def _detect_bimodal_clusters(
+    keyframes: list[tuple[float, int]],
+    gap_threshold: int = 12,
+    min_cluster_size: int = 3,
+) -> dict | None:
+    """Detect if keyframe positions form two distinct clusters (two speakers).
+
+    Uses a gap-based approach: sort values, find the largest gap.
+    If the gap is > gap_threshold and both sides have enough samples,
+    returns the two cluster centers. Otherwise returns None.
+
+    This is a visual-only approach that works WITHOUT audio diarization —
+    it catches two-speaker scenarios even when Whisper only detects 1 speaker.
+
+    Matches frontend detectBimodalClusters() exactly for preview-export parity.
+    """
+    if len(keyframes) < 6:
+        return None
+
+    xs = sorted(kf[1] for kf in keyframes)
+
+    max_gap = 0
+    split_idx = -1
+    for i in range(1, len(xs)):
+        gap = xs[i] - xs[i - 1]
+        if gap > max_gap:
+            max_gap = gap
+            split_idx = i
+
+    if max_gap < gap_threshold or split_idx < 0:
+        return None
+
+    left_values = xs[:split_idx]
+    right_values = xs[split_idx:]
+
+    if len(left_values) < min_cluster_size or len(right_values) < min_cluster_size:
+        return None
+
+    def _median(arr):
+        s = sorted(arr)
+        mid = len(s) // 2
+        return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+    left_center = round(_median(left_values))
+    right_center = round(_median(right_values))
+    split_value = (left_values[-1] + right_values[0]) / 2
+
+    return {"left": left_center, "right": right_center, "split": split_value}
+
+
+def _snap_to_clusters(
+    keyframes: list[tuple[float, int]],
+    clusters: dict,
+) -> list[tuple[float, int]]:
+    """Snap each keyframe to its nearest cluster center.
+
+    Matches frontend snapToClusters() exactly for preview-export parity.
+    """
+    return [
+        (t, clusters["left"] if sx < clusters["split"] else clusters["right"])
+        for t, sx in keyframes
+    ]
+
+
 def _build_subject_keyframes(
     scenes: list,
     clip_start: float,
@@ -5200,9 +5264,62 @@ async def export_clip(
                 )
 
             if subject_scenes and aspect_ratio and not all_tracking_off:
-                # ── PHASE 1: Try speaker-aware tracking ──
+                # ── PHASE 0: Build raw keyframes ──
+                raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                logger.info(
+                    "[SubjectTracking] clip %s: %d raw keyframes from %d scenes",
+                    clip_id, len(raw_kf), len(subject_scenes),
+                )
+
+                # ── PHASE 1: Detect bimodal clusters (two speakers from visual data) ──
+                # Works WITHOUT audio diarization — catches two-speaker scenarios
+                # even when Whisper only detects 1 speaker.
+                _bimodal_used = False
+                clusters = _detect_bimodal_clusters(raw_kf)
+                if clusters:
+                    logger.info(
+                        "[SubjectTracking] clip %s: BIMODAL detected — left=%d, right=%d, split=%.1f, gap=%d",
+                        clip_id, clusters["left"], clusters["right"], clusters["split"],
+                        clusters["right"] - clusters["left"],
+                    )
+                    snapped = _snap_to_clusters(raw_kf, clusters)
+
+                    # Remove consecutive duplicates (same speaker holding)
+                    deduped = [snapped[0]]
+                    for i in range(1, len(snapped)):
+                        if snapped[i][1] != deduped[-1][1]:
+                            deduped.append(snapped[i])
+                        elif i == len(snapped) - 1:
+                            deduped.append((snapped[i][0], deduped[-1][1]))
+
+                    # Ensure start/end coverage
+                    clip_dur = end - start
+                    if deduped[0][0] > 0:
+                        deduped.insert(0, (0.0, deduped[0][1]))
+                    if deduped[-1][0] < clip_dur:
+                        deduped.append((clip_dur, deduped[-1][1]))
+
+                    # handleSceneCuts inserts 1ms instant-jump transitions
+                    after_cuts = _handle_scene_cuts(deduped)
+
+                    # Final bounds enforcement
+                    safe_lo, safe_hi = _compute_safe_range(_src_ratio, _target_ratio)
+                    keyframes = [
+                        (t, max(safe_lo, min(safe_hi, round(sx))))
+                        for t, sx in after_cuts
+                    ]
+                    _bimodal_used = True
+
+                    logger.info(
+                        "[SubjectTracking] clip %s: BIMODAL tracking — %d keyframes, "
+                        "alternating between L=%d and R=%d, keyframes=%s",
+                        clip_id, len(keyframes), clusters["left"], clusters["right"],
+                        [(f"t={t:.2f}s,sx={sx}") for t, sx in keyframes[:20]],
+                    )
+
+                # ── PHASE 2: Try speaker-aware tracking (requires 2+ speakers) ──
                 _speaker_kf_used = False
-                if transcript:
+                if not _bimodal_used and transcript:
                     _spk_map = _build_speaker_position_map(subject_scenes, transcript)
                     if len(_spk_map) >= 2:
                         _spk_kf = _build_speaker_keyframes(transcript, _spk_map, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
@@ -5220,18 +5337,8 @@ async def export_clip(
                             else:
                                 keyframes = None
 
-                # ── PHASE 2: Fall back to scene-based tracking ──
-                if not _speaker_kf_used:
-                    keyframes = None
-                    raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
-                    logger.info(
-                        "[SubjectTracking] clip %s: %d raw keyframes from %d scenes",
-                        clip_id, len(raw_kf), len(subject_scenes),
-                    )
-                else:
-                    raw_kf = []  # Speaker tracking already set keyframes
-
-                if not _speaker_kf_used and len(raw_kf) > 1:
+                # ── PHASE 3: Single-subject tracking (original pipeline) ──
+                if not _bimodal_used and not _speaker_kf_used and len(raw_kf) > 1:
                     # Sparse data detection: relax thresholds when we have ≤4 keyframes
                     is_sparse = len(raw_kf) <= 4
                     dz_threshold = 3 if is_sparse else 5
@@ -5307,7 +5414,7 @@ async def export_clip(
                                 kf_min, kf_max,
                                 [(f"t={t:.2f}s,sx={sx}") for t, sx in keyframes],
                             )
-                elif len(raw_kf) == 1:
+                elif not _bimodal_used and not _speaker_kf_used and len(raw_kf) == 1:
                     # Single keyframe — use its tracked value directly as the
                     # static subject_x so the crop centers on the actual subject
                     subject_x = raw_kf[0][1]

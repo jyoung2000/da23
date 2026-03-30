@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectBimodalClusters, buildSubjectKeyframes } from '../utils/subjectTracking';
 import useResponsive from '../hooks/useResponsive';
 import useTimelineStore from '../stores/timelineStore';
 import useTimelinePersistence from '../hooks/useTimelinePersistence';
@@ -889,6 +889,17 @@ export default function VideoEditor({
     if (!scenes?.length) return { mode: 'no-data', label: 'No AI data', color: '#f59e0b' };
     if (!subjectKeyframes?.length) return { mode: 'error', label: 'Tracking failed', color: '#ef4444' };
     if (hasDynamicSubject) {
+      // Check for bimodal (two-speaker) mode
+      const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd,
+        isCrop ? srcRatio : null, isCrop ? targetRatio : null);
+      const clusters = detectBimodalClusters(raw);
+      if (clusters) {
+        return {
+          mode: 'bimodal',
+          label: `2-position tracking (L:${clusters.left}% R:${clusters.right}%)`,
+          color: '#10b981',
+        };
+      }
       return { mode: 'dynamic', label: `Tracking (${subjectKeyframes.length} pts)`, color: '#10b981' };
     }
     const sx = subjectKeyframes[0].x;
@@ -896,7 +907,7 @@ export default function VideoEditor({
       return { mode: 'center', label: 'Centered', color: '#6b7280' };
     }
     return { mode: 'static', label: `Subject at ${sx}%`, color: '#3b82f6' };
-  }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject]);
+  }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject, clipStart, clipEnd, srcRatio, targetRatio]);
 
   // ── Segment helpers ────────────────────────────────
   const getActiveSegment = useCallback((t) => {
@@ -2457,7 +2468,7 @@ export default function VideoEditor({
             <span style={{
               width: 6, height: 6, borderRadius: '50%',
               background: trackingStatus.color,
-              boxShadow: trackingStatus.mode === 'dynamic' ? `0 0 4px ${trackingStatus.color}` : 'none',
+              boxShadow: (trackingStatus.mode === 'dynamic' || trackingStatus.mode === 'bimodal') ? `0 0 4px ${trackingStatus.color}` : 'none',
             }} />
             {trackingStatus.label}
           </div>
