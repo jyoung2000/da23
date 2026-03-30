@@ -800,6 +800,37 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }));
     }
 
+    // ── Fix leading center keyframes after bounds enforcement ──
+    if (result.length > 0) {
+      const firstRealKf = raw.find(kf => kf.x < 44 || kf.x > 56);
+      if (firstRealKf) {
+        let bestCenter = clusters[0].center;
+        let bestDist = Math.abs(firstRealKf.x - bestCenter);
+        for (const c of clusters) {
+          const d = Math.abs(firstRealKf.x - c.center);
+          if (d < bestDist) { bestDist = d; bestCenter = c.center; }
+        }
+        const safeCenter = srcRatio && targetRatio
+          ? Math.max(computeSafeRange(srcRatio, targetRatio).min,
+                     Math.min(computeSafeRange(srcRatio, targetRatio).max, bestCenter))
+          : bestCenter;
+        for (let j = 0; j < result.length; j++) {
+          if (result[j].x >= 44 && result[j].x <= 56) {
+            result[j].x = safeCenter;
+          } else {
+            break;
+          }
+        }
+      }
+    }
+
+    // ── QA validation: fix extended center holds and missing instant cuts ──
+    const qa = validateTracking(result, clusters, clipEnd - clipStart);
+    if (!qa.passed) {
+      qa.warnings.forEach(w => console.log(`[SubjectTracking] ${w}`));
+      return qa.fixedKeyframes;
+    }
+
     return result;
   }
 
@@ -1011,4 +1042,55 @@ export function isDynamic(keyframes) {
   if (!keyframes || keyframes.length <= 1) return false;
   const first = keyframes[0].x;
   return keyframes.some((kf) => kf.x !== first);
+}
+
+
+/**
+ * QA validation for subject tracking output.
+ * Checks that:
+ *  - No extended sequences stuck at center (50 ± 3) when clusters exist
+ *  - All large position changes have instant-cut markers (no pans through dead space)
+ *
+ * @param {Array<{t: number, x: number}>} keyframes
+ * @param {Array<{center: number, count: number}>|null} clusters
+ * @param {number} clipDuration
+ * @returns {{ passed: boolean, warnings: string[], fixedKeyframes: Array }}
+ */
+export function validateTracking(keyframes, clusters, clipDuration) {
+  const warnings = [];
+  const fixed = keyframes.map(kf => ({ ...kf }));
+
+  if (!keyframes || keyframes.length === 0) {
+    return { passed: false, warnings: ['No keyframes'], fixedKeyframes: [{ t: 0, x: 50 }] };
+  }
+
+  // Check 1: No extended center holds when multi-position data exists
+  if (clusters && clusters.length >= 2) {
+    for (let i = 0; i < fixed.length - 1; i++) {
+      const hold = fixed[i + 1].t - fixed[i].t;
+      if (fixed[i].x >= 47 && fixed[i].x <= 53 && hold > 3.0) {
+        const prev = i > 0 ? fixed[i - 1].x : null;
+        if (prev !== null && clusters.some(c => c.center === prev)) {
+          warnings.push(`QA: center hold at t=${fixed[i].t.toFixed(1)}s (${hold.toFixed(1)}s) → holding previous at ${prev}%`);
+          fixed[i].x = prev;
+        }
+      }
+    }
+  }
+
+  // Check 2: Large position changes must have instant-cut markers
+  for (let i = 0; i < fixed.length - 1; i++) {
+    const delta = Math.abs(fixed[i + 1].x - fixed[i].x);
+    const dt = fixed[i + 1].t - fixed[i].t;
+    if (delta > 15 && dt > 0.01) {
+      const cutTime = Math.round((fixed[i + 1].t - 0.001) * 1000) / 1000;
+      if (cutTime > fixed[i].t) {
+        fixed.splice(i + 1, 0, { t: cutTime, x: fixed[i].x });
+        warnings.push(`QA: inserted instant cut at t=${cutTime.toFixed(3)}s (delta=${delta})`);
+        i++;
+      }
+    }
+  }
+
+  return { passed: warnings.length === 0, warnings, fixedKeyframes: fixed };
 }

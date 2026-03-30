@@ -2309,6 +2309,43 @@ def _snap_to_clusters(
     return result
 
 
+def _validate_tracking(
+    keyframes: list[tuple[float, int]],
+    clusters: list[dict] | None,
+    clip_duration: float,
+) -> list[tuple[float, int]]:
+    """QA validation: fix extended center holds and missing instant-cut markers.
+
+    Matches frontend validateTracking() exactly for preview-export parity.
+    """
+    if not keyframes:
+        return [(0.0, 50)]
+    fixed = list(keyframes)
+
+    # Check 1: no extended center holds when multi-position data exists
+    if clusters and len(clusters) >= 2:
+        for i in range(len(fixed) - 1):
+            hold = fixed[i + 1][0] - fixed[i][0]
+            if 47 <= fixed[i][1] <= 53 and hold > 3.0:
+                prev = fixed[i - 1][1] if i > 0 else None
+                if prev is not None and any(c["center"] == prev for c in clusters):
+                    fixed[i] = (fixed[i][0], prev)
+
+    # Check 2: large position changes must have instant-cut markers
+    i = 0
+    while i < len(fixed) - 1:
+        delta = abs(fixed[i + 1][1] - fixed[i][1])
+        dt = fixed[i + 1][0] - fixed[i][0]
+        if delta > 15 and dt > 0.01:
+            cut_time = round(fixed[i + 1][0] - 0.001, 3)
+            if cut_time > fixed[i][0]:
+                fixed.insert(i + 1, (cut_time, fixed[i][1]))
+                i += 1
+        i += 1
+
+    return fixed
+
+
 def _build_subject_keyframes(
     scenes: list,
     clip_start: float,
@@ -5384,6 +5421,20 @@ async def export_clip(
                         (t, max(safe_lo, min(safe_hi, round(sx))))
                         for t, sx in after_cuts
                     ]
+
+                    # Fix leading center keyframes after bounds enforcement
+                    first_real_kf = next((kf for kf in raw_kf if kf[1] < 44 or kf[1] > 56), None)
+                    if first_real_kf and keyframes:
+                        best_c = min(clusters, key=lambda c: abs(first_real_kf[1] - c["center"]))
+                        safe_center = max(safe_lo, min(safe_hi, best_c["center"]))
+                        for j in range(len(keyframes)):
+                            if 44 <= keyframes[j][1] <= 56:
+                                keyframes[j] = (keyframes[j][0], safe_center)
+                            else:
+                                break
+
+                    # QA validation
+                    keyframes = _validate_tracking(keyframes, clusters, end - start)
                     _cluster_used = True
 
                     logger.info(
