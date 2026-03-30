@@ -152,74 +152,116 @@ export function buildSpeakerKeyframes(transcript, speakerMap, clipStart, clipEnd
 }
 
 /**
- * Detect if subject_x values form two distinct clusters (two speakers).
- * Uses a simple gap-based approach: sort values, find the largest gap.
- * If the gap is > gapThreshold and both sides have enough samples,
- * returns the two cluster centers. Otherwise returns null.
+ * Detect N distinct position clusters in subject_x values.
+ * Uses recursive largest-gap splitting to find 2-6 natural groupings.
  *
- * This is a visual-only approach that works WITHOUT audio diarization —
- * it catches two-speaker scenarios even when Whisper only detects 1 speaker.
+ * Works WITHOUT audio diarization — catches multi-speaker scenarios
+ * even when Whisper only detects 1 speaker, by finding position clusters
+ * in the scene analysis subject_x values.
  *
- * Matches backend _detect_bimodal_clusters() exactly for preview-export parity.
+ * For 2 speakers: [{center:35, count:12}, {center:65, count:15}]
+ * For 4 speakers: [{center:15, count:5}, {center:35, count:12}, {center:65, count:15}, {center:85, count:8}]
+ *
+ * Matches backend _detect_position_clusters() exactly for preview-export parity.
  *
  * @param {Array<{t: number, x: number}>} keyframes
- * @param {number} gapThreshold - Minimum gap between clusters (default 12)
- * @param {number} minClusterSize - Minimum samples per cluster (default 3)
- * @returns {{left: number, right: number, split: number}|null}
+ * @param {number} gapThreshold - Minimum gap to split a cluster (default 10)
+ * @param {number} minClusterSize - Min samples per cluster (default 2)
+ * @param {number} maxClusters - Maximum clusters to detect (default 6)
+ * @returns {Array<{center: number, count: number}>|null} Sorted clusters or null
  */
-export function detectBimodalClusters(keyframes, gapThreshold = 12, minClusterSize = 3) {
-  if (!keyframes || keyframes.length < 6) return null;
+export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterSize = 2, maxClusters = 6) {
+  if (!keyframes || keyframes.length < 4) return null;
 
-  const xs = keyframes.map(k => k.x).sort((a, b) => a - b);
+  const xs = keyframes.map(k => k.x);
 
-  // Find the largest gap between consecutive sorted values
-  let maxGap = 0;
-  let splitIdx = -1;
-  for (let i = 1; i < xs.length; i++) {
-    const gap = xs[i] - xs[i - 1];
-    if (gap > maxGap) {
-      maxGap = gap;
-      splitIdx = i;
+  // Recursive gap-based splitting
+  function splitCluster(values) {
+    if (values.length < minClusterSize * 2) return [values];
+    const sorted = [...values].sort((a, b) => a - b);
+    let maxGap = 0;
+    let splitIdx = -1;
+    for (let i = 1; i < sorted.length; i++) {
+      const gap = sorted[i] - sorted[i - 1];
+      if (gap > maxGap) {
+        maxGap = gap;
+        splitIdx = i;
+      }
     }
+    if (maxGap < gapThreshold || splitIdx < 0) return [values];
+    const left = sorted.slice(0, splitIdx);
+    const right = sorted.slice(splitIdx);
+    if (left.length < minClusterSize || right.length < minClusterSize) return [values];
+    return [...splitCluster(left), ...splitCluster(right)];
   }
 
-  if (maxGap < gapThreshold || splitIdx < 0) return null;
+  let clusters = splitCluster(xs);
 
-  const leftValues = xs.slice(0, splitIdx);
-  const rightValues = xs.slice(splitIdx);
+  // Cap at maxClusters by merging the two closest clusters
+  while (clusters.length > maxClusters) {
+    let minDist = Infinity;
+    let mergeIdx = 0;
+    for (let i = 0; i < clusters.length - 1; i++) {
+      const c1 = clusters[i].reduce((a, b) => a + b, 0) / clusters[i].length;
+      const c2 = clusters[i + 1].reduce((a, b) => a + b, 0) / clusters[i + 1].length;
+      if (Math.abs(c2 - c1) < minDist) {
+        minDist = Math.abs(c2 - c1);
+        mergeIdx = i;
+      }
+    }
+    clusters[mergeIdx] = [...clusters[mergeIdx], ...clusters[mergeIdx + 1]];
+    clusters.splice(mergeIdx + 1, 1);
+  }
 
-  if (leftValues.length < minClusterSize || rightValues.length < minClusterSize) return null;
+  if (clusters.length < 2) return null;
 
-  // Compute cluster centers (median for robustness)
+  // Compute center (median) and count for each cluster
   const median = (arr) => {
-    const sorted = [...arr].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    const s = [...arr].sort((a, b) => a - b);
+    const mid = Math.floor(s.length / 2);
+    return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
   };
 
-  const leftCenter = Math.round(median(leftValues));
-  const rightCenter = Math.round(median(rightValues));
-  const splitValue = (leftValues[leftValues.length - 1] + rightValues[0]) / 2;
+  const result = clusters.map(values => ({
+    center: Math.round(median(values)),
+    count: values.length,
+  })).sort((a, b) => a.center - b.center);
 
-  return { left: leftCenter, right: rightCenter, split: splitValue };
+  return result;
+}
+
+// Backward compat — old name delegates to new function
+export function detectBimodalClusters(keyframes, gapThreshold = 12, minClusterSize = 3) {
+  const clusters = detectPositionClusters(keyframes, gapThreshold, minClusterSize, 6);
+  if (!clusters || clusters.length < 2) return null;
+  // Return old format for any callers still using the bimodal shape
+  return { left: clusters[0].center, right: clusters[clusters.length - 1].center,
+           split: (clusters[0].center + clusters[clusters.length - 1].center) / 2 };
 }
 
 /**
- * For bimodal data (two speakers), snap each keyframe to its nearest
- * cluster center. This replaces the noisy per-frame values with clean
- * alternating positions that handleSceneCuts can process into instant jumps.
+ * Snap each keyframe to its nearest cluster center.
+ * Works with any number of clusters (2, 3, 4, ...).
  *
  * Matches backend _snap_to_clusters() exactly for preview-export parity.
  *
  * @param {Array<{t: number, x: number}>} keyframes
- * @param {{left: number, right: number, split: number}} clusters
+ * @param {Array<{center: number}>} clusters - Cluster objects with center field
  * @returns {Array<{t: number, x: number}>}
  */
 export function snapToClusters(keyframes, clusters) {
-  return keyframes.map(kf => ({
-    t: kf.t,
-    x: kf.x < clusters.split ? clusters.left : clusters.right,
-  }));
+  return keyframes.map(kf => {
+    let nearest = clusters[0].center;
+    let minDist = Math.abs(kf.x - nearest);
+    for (let i = 1; i < clusters.length; i++) {
+      const dist = Math.abs(kf.x - clusters[i].center);
+      if (dist < minDist) {
+        minDist = dist;
+        nearest = clusters[i].center;
+      }
+    }
+    return { t: kf.t, x: nearest };
+  });
 }
 
 /**
@@ -245,17 +287,20 @@ export function buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio = nul
   const within = sorted.filter((s) => clipStart <= s.timestamp && s.timestamp <= clipEnd);
   const after = sorted.filter((s) => s.timestamp > clipEnd);
 
+  // Prefer active_speaker_x (when AI detected who is talking) over generic subject_x
+  const _sx = (s) => s.active_speaker_x ?? s.subject_x ?? 50;
+
   const raw = within.map((s) => ({
     t: s.timestamp - clipStart,
-    x: safeSubjectX(s.subject_x ?? 50, srcRatio, targetRatio),
+    x: safeSubjectX(_sx(s), srcRatio, targetRatio),
   }));
 
   const interp = (tAbs, s1, s2) => {
     const dt = s2.timestamp - s1.timestamp;
-    if (dt <= 0) return safeSubjectX(s1.subject_x ?? 50, srcRatio, targetRatio);
+    if (dt <= 0) return safeSubjectX(_sx(s1), srcRatio, targetRatio);
     const frac = Math.min(1, Math.max(0, (tAbs - s1.timestamp) / dt));
     return safeSubjectX(Math.round(
-      (s1.subject_x ?? 50) + ((s2.subject_x ?? 50) - (s1.subject_x ?? 50)) * frac
+      _sx(s1) + (_sx(s2) - _sx(s1)) * frac
     ), srcRatio, targetRatio);
   };
 
@@ -269,11 +314,11 @@ export function buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio = nul
     } else if (before.length && after.length && !within.length) {
       sx0 = interp(clipStart, before[before.length - 1], after[0]);
     } else if (before.length) {
-      sx0 = safeSubjectX(before[before.length - 1].subject_x ?? 50, srcRatio, targetRatio);
+      sx0 = safeSubjectX(_sx(before[before.length - 1]), srcRatio, targetRatio);
     } else if (within.length) {
-      sx0 = safeSubjectX(within[0].subject_x ?? 50, srcRatio, targetRatio);
+      sx0 = safeSubjectX(_sx(within[0]), srcRatio, targetRatio);
     } else if (after.length) {
-      sx0 = safeSubjectX(after[0].subject_x ?? 50, srcRatio, targetRatio);
+      sx0 = safeSubjectX(_sx(after[0]), srcRatio, targetRatio);
     } else {
       sx0 = 50;
     }
@@ -288,11 +333,11 @@ export function buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio = nul
     } else if (before.length && after.length && !within.length) {
       sxEnd = interp(clipEnd, before[before.length - 1], after[0]);
     } else if (after.length) {
-      sxEnd = safeSubjectX(after[0].subject_x ?? 50, srcRatio, targetRatio);
+      sxEnd = safeSubjectX(_sx(after[0]), srcRatio, targetRatio);
     } else if (within.length) {
-      sxEnd = safeSubjectX(within[within.length - 1].subject_x ?? 50, srcRatio, targetRatio);
+      sxEnd = safeSubjectX(_sx(within[within.length - 1]), srcRatio, targetRatio);
     } else if (before.length) {
-      sxEnd = safeSubjectX(before[before.length - 1].subject_x ?? 50, srcRatio, targetRatio);
+      sxEnd = safeSubjectX(_sx(before[before.length - 1]), srcRatio, targetRatio);
     } else {
       sxEnd = 50;
     }
@@ -629,15 +674,15 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];
   if (raw.length === 1) return raw;
 
-  // ── PHASE 1: Detect bimodal clusters (two speakers from visual data) ──
-  // This works WITHOUT audio diarization — catches two-speaker scenarios
-  // even when Whisper only detects 1 speaker, by finding two position clusters
+  // ── PHASE 1: Detect position clusters (N speakers from visual data) ──
+  // This works WITHOUT audio diarization — catches multi-speaker scenarios
+  // even when Whisper only detects 1 speaker, by finding position clusters
   // in the scene analysis subject_x values.
-  const clusters = detectBimodalClusters(raw);
+  const clusters = detectPositionClusters(raw);
 
-  if (clusters) {
-    // Two-speaker mode: snap to cluster centers, then use scene cuts for instant jumps.
-    // NO smoothing — speaker changes must be instant snaps, not pans.
+  if (clusters && clusters.length >= 2) {
+    // Multi-position mode: snap to cluster centers, then use scene cuts for instant jumps.
+    // NO smoothing — speaker/position changes must be instant snaps, not pans.
     const snapped = snapToClusters(raw, clusters);
 
     // Remove consecutive duplicates (same speaker holding) to clean up

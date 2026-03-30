@@ -94,10 +94,13 @@ class AnthropicProvider(ChunkedClipDetectionMixin, AIProvider):
                     {"type": "text", "text": (
                         instruction + "\n\n"
                         "Return ONLY valid JSON array:\n"
-                        '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>}]\n'
-                        "IMPORTANT: subject_x is REQUIRED for every frame. Carefully estimate the actual "
-                        "horizontal position of the subject's face (0=left edge, 50=center, 100=right edge). "
-                        "Do NOT use 50 for every frame — look at where the face actually is."
+                        '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>, "active_speaker_x": <0-100 or null>}]\n'
+                        "IMPORTANT: subject_x = horizontal position of the ACTIVE SPEAKER (the person "
+                        "whose lips are moving or who is currently talking). If you can tell who is "
+                        "speaking, use THEIR face position. If no one is clearly speaking, use the most "
+                        "prominent person. active_speaker_x = same value if confident someone is speaking, "
+                        "null otherwise. 0=left edge, 50=center, 100=right edge. "
+                        "Do NOT default to 50 — carefully estimate the actual horizontal position."
                     )},
                 ]
                 for frame in batch:

@@ -743,10 +743,13 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     {"type": "text", "text": (
                         instruction + "\n\n"
                         "Return ONLY valid JSON array:\n"
-                        '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>}]\n'
-                        "IMPORTANT: subject_x is REQUIRED for every frame. Carefully estimate the actual "
-                        "horizontal position of the subject's face (0=left edge, 50=center, 100=right edge). "
-                        "Do NOT use 50 for every frame — look at where the face actually is."
+                        '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>, "active_speaker_x": <0-100 or null>}]\n'
+                        "IMPORTANT: subject_x = horizontal position of the ACTIVE SPEAKER (the person "
+                        "whose lips are moving or who is currently talking). If you can tell who is "
+                        "speaking, use THEIR face position. If no one is clearly speaking, use the most "
+                        "prominent person. active_speaker_x = same value if confident someone is speaking, "
+                        "null otherwise. 0=left edge, 50=center, 100=right edge. "
+                        "Do NOT default to 50 — carefully estimate the actual horizontal position."
                     )},
                 ]
                 for frame in batch:
@@ -804,12 +807,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             sx = 50
                         else:
                             sx = max(0, min(100, int(sx)))
+                        active_sx = item.get("active_speaker_x")
+                        if active_sx is not None:
+                            try:
+                                active_sx = max(0, min(100, int(active_sx)))
+                            except (ValueError, TypeError):
+                                active_sx = None
                         batch_results[batch_idx].append(SceneDescription(
                             timestamp=item.get("timestamp", frame_ref.timestamp),
                             description=item.get("description", ""),
                             importance_score=max(1, min(10, int(item.get("importance_score", 5)))),
                             thumbnail_path=frame_ref.path,
                             subject_x=sx,
+                            active_speaker_x=active_sx,
                         ))
                 except (json.JSONDecodeError, KeyError, IndexError) as e:
                     logger.warning(f"Failed to parse frame analysis: {e}")

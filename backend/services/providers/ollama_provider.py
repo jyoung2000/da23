@@ -22,9 +22,11 @@ _VISION_JSON_SUFFIX = (
     '\n\nReturn ONLY valid JSON:\n'
     '{"timestamp": <float>, "description": "<text>", '
     '"importance_score": <1-10>, "subject_x": <0-100>}\n'
-    'subject_x = horizontal center of the main subject\'s FACE as % of frame width '
+    'subject_x = horizontal position of the person who is TALKING (lips moving). '
+    'If multiple people are visible, pick the one who is SPEAKING. '
+    'If no one is clearly speaking, pick the most prominent person. '
     '(0=far left, 50=exact center, 100=far right). '
-    'IMPORTANT: Carefully estimate the actual position — do NOT default to 50 for every frame.'
+    'IMPORTANT: Carefully estimate the actual position — do NOT default to 50.'
 )
 
 # Simplified JSON schema for small models (moondream) that can't handle complex prompts.
@@ -32,8 +34,9 @@ _VISION_JSON_SUFFIX = (
 _VISION_JSON_SUFFIX_SIMPLE = (
     '\n\nRespond with ONLY this JSON, nothing else:\n'
     '{"description": "<what you see>", "subject_x": <number 0 to 100>}\n'
-    'subject_x = horizontal position of the main person\'s face.\n'
-    'Examples: person on far left = 15, slightly left = 35, '
+    'subject_x = horizontal position of the person who is TALKING or speaking.\n'
+    'If multiple people visible, focus on who is SPEAKING (lips moving).\n'
+    'Examples: speaker on far left = 15, slightly left = 35, '
     'dead center = 50, slightly right = 65, far right = 85.\n'
     'IMPORTANT: Estimate the ACTUAL position. Vary your answer per frame.'
 )

@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectBimodalClusters, buildSubjectKeyframes } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes } from '../utils/subjectTracking';
 import useResponsive from '../hooks/useResponsive';
 import useTimelineStore from '../stores/timelineStore';
 import useTimelinePersistence from '../hooks/useTimelinePersistence';
@@ -889,14 +889,15 @@ export default function VideoEditor({
     if (!scenes?.length) return { mode: 'no-data', label: 'No AI data', color: '#f59e0b' };
     if (!subjectKeyframes?.length) return { mode: 'error', label: 'Tracking failed', color: '#ef4444' };
     if (hasDynamicSubject) {
-      // Check for bimodal (two-speaker) mode
+      // Check for multi-position (N-speaker) mode
       const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd,
         isCrop ? srcRatio : null, isCrop ? targetRatio : null);
-      const clusters = detectBimodalClusters(raw);
-      if (clusters) {
+      const clusters = detectPositionClusters(raw);
+      if (clusters && clusters.length >= 2) {
+        const positions = clusters.map(c => `${c.center}%`).join(' ');
         return {
-          mode: 'bimodal',
-          label: `2-position tracking (L:${clusters.left}% R:${clusters.right}%)`,
+          mode: 'multi',
+          label: `${clusters.length}-position tracking (${positions})`,
           color: '#10b981',
         };
       }
@@ -2468,7 +2469,7 @@ export default function VideoEditor({
             <span style={{
               width: 6, height: 6, borderRadius: '50%',
               background: trackingStatus.color,
-              boxShadow: (trackingStatus.mode === 'dynamic' || trackingStatus.mode === 'bimodal') ? `0 0 4px ${trackingStatus.color}` : 'none',
+              boxShadow: (trackingStatus.mode === 'dynamic' || trackingStatus.mode === 'multi') ? `0 0 4px ${trackingStatus.color}` : 'none',
             }} />
             {trackingStatus.label}
           </div>

@@ -2203,42 +2203,61 @@ def _build_speaker_keyframes(
     return keyframes if len(keyframes) >= 2 else None
 
 
-def _detect_bimodal_clusters(
+def _detect_position_clusters(
     keyframes: list[tuple[float, int]],
-    gap_threshold: int = 12,
-    min_cluster_size: int = 3,
-) -> dict | None:
-    """Detect if keyframe positions form two distinct clusters (two speakers).
+    gap_threshold: int = 10,
+    min_cluster_size: int = 2,
+    max_clusters: int = 6,
+) -> list[dict] | None:
+    """Detect N distinct position clusters in keyframe values.
 
-    Uses a gap-based approach: sort values, find the largest gap.
-    If the gap is > gap_threshold and both sides have enough samples,
-    returns the two cluster centers. Otherwise returns None.
+    Uses recursive gap splitting to find 2-6 natural groupings.
+    Returns sorted list of {"center": int, "count": int} dicts,
+    or None if < 2 clusters found.
 
-    This is a visual-only approach that works WITHOUT audio diarization —
-    it catches two-speaker scenarios even when Whisper only detects 1 speaker.
+    Matches frontend detectPositionClusters() exactly for preview-export parity.
 
-    Matches frontend detectBimodalClusters() exactly for preview-export parity.
+    Matches frontend detectPositionClusters() exactly for preview-export parity.
     """
-    if len(keyframes) < 6:
+    if len(keyframes) < 4:
         return None
 
-    xs = sorted(kf[1] for kf in keyframes)
+    xs = [kf[1] for kf in keyframes]
 
-    max_gap = 0
-    split_idx = -1
-    for i in range(1, len(xs)):
-        gap = xs[i] - xs[i - 1]
-        if gap > max_gap:
-            max_gap = gap
-            split_idx = i
+    def _split(values):
+        if len(values) < min_cluster_size * 2:
+            return [values]
+        sv = sorted(values)
+        mg = 0
+        si = -1
+        for i in range(1, len(sv)):
+            g = sv[i] - sv[i - 1]
+            if g > mg:
+                mg = g
+                si = i
+        if mg < gap_threshold or si < 0:
+            return [values]
+        left = sv[:si]
+        right = sv[si:]
+        if len(left) < min_cluster_size or len(right) < min_cluster_size:
+            return [values]
+        return _split(left) + _split(right)
 
-    if max_gap < gap_threshold or split_idx < 0:
-        return None
+    clusters = _split(xs)
 
-    left_values = xs[:split_idx]
-    right_values = xs[split_idx:]
+    while len(clusters) > max_clusters:
+        min_dist = float('inf')
+        merge_idx = 0
+        for i in range(len(clusters) - 1):
+            c1 = sum(clusters[i]) / len(clusters[i])
+            c2 = sum(clusters[i + 1]) / len(clusters[i + 1])
+            if abs(c2 - c1) < min_dist:
+                min_dist = abs(c2 - c1)
+                merge_idx = i
+        clusters[merge_idx] = clusters[merge_idx] + clusters[merge_idx + 1]
+        del clusters[merge_idx + 1]
 
-    if len(left_values) < min_cluster_size or len(right_values) < min_cluster_size:
+    if len(clusters) < 2:
         return None
 
     def _median(arr):
@@ -2246,23 +2265,21 @@ def _detect_bimodal_clusters(
         mid = len(s) // 2
         return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
 
-    left_center = round(_median(left_values))
-    right_center = round(_median(right_values))
-    split_value = (left_values[-1] + right_values[0]) / 2
-
-    return {"left": left_center, "right": right_center, "split": split_value}
+    result = [{"center": round(_median(v)), "count": len(v)} for v in clusters]
+    result.sort(key=lambda c: c["center"])
+    return result
 
 
 def _snap_to_clusters(
     keyframes: list[tuple[float, int]],
-    clusters: dict,
+    clusters: list[dict],
 ) -> list[tuple[float, int]]:
-    """Snap each keyframe to its nearest cluster center.
+    """Snap each keyframe to nearest cluster center.
 
     Matches frontend snapToClusters() exactly for preview-export parity.
     """
     return [
-        (t, clusters["left"] if sx < clusters["split"] else clusters["right"])
+        (t, min(clusters, key=lambda c: abs(sx - c["center"]))["center"])
         for t, sx in keyframes
     ]
 
@@ -2292,8 +2309,10 @@ def _build_subject_keyframes(
     all_data = []
     for s in scenes:
         ts = float(s.timestamp if hasattr(s, "timestamp") else s.get("timestamp", 0))
+        # Prefer active_speaker_x (when AI detected who is talking) over generic subject_x
+        asx = s.active_speaker_x if hasattr(s, "active_speaker_x") else s.get("active_speaker_x")
         sx = s.subject_x if hasattr(s, "subject_x") else s.get("subject_x", 50)
-        raw_sx = int(sx)
+        raw_sx = int(asx if asx is not None else sx)
         safe_sx = _safe_subject_x(raw_sx, src_ratio=src_ratio, target_ratio=target_ratio)
         all_data.append((ts, safe_sx))
 
@@ -5271,16 +5290,16 @@ async def export_clip(
                     clip_id, len(raw_kf), len(subject_scenes),
                 )
 
-                # ── PHASE 1: Detect bimodal clusters (two speakers from visual data) ──
-                # Works WITHOUT audio diarization — catches two-speaker scenarios
+                # ── PHASE 1: Detect position clusters (N speakers from visual data) ──
+                # Works WITHOUT audio diarization — catches multi-speaker scenarios
                 # even when Whisper only detects 1 speaker.
-                _bimodal_used = False
-                clusters = _detect_bimodal_clusters(raw_kf)
-                if clusters:
+                _cluster_used = False
+                clusters = _detect_position_clusters(raw_kf)
+                if clusters and len(clusters) >= 2:
+                    centers = [c["center"] for c in clusters]
                     logger.info(
-                        "[SubjectTracking] clip %s: BIMODAL detected — left=%d, right=%d, split=%.1f, gap=%d",
-                        clip_id, clusters["left"], clusters["right"], clusters["split"],
-                        clusters["right"] - clusters["left"],
+                        "[SubjectTracking] clip %s: %d CLUSTERS detected — centers=%s",
+                        clip_id, len(clusters), centers,
                     )
                     snapped = _snap_to_clusters(raw_kf, clusters)
 
@@ -5308,18 +5327,18 @@ async def export_clip(
                         (t, max(safe_lo, min(safe_hi, round(sx))))
                         for t, sx in after_cuts
                     ]
-                    _bimodal_used = True
+                    _cluster_used = True
 
                     logger.info(
-                        "[SubjectTracking] clip %s: BIMODAL tracking — %d keyframes, "
-                        "alternating between L=%d and R=%d, keyframes=%s",
-                        clip_id, len(keyframes), clusters["left"], clusters["right"],
+                        "[SubjectTracking] clip %s: %d-POSITION tracking — %d keyframes, "
+                        "centers=%s, keyframes=%s",
+                        clip_id, len(clusters), len(keyframes), centers,
                         [(f"t={t:.2f}s,sx={sx}") for t, sx in keyframes[:20]],
                     )
 
                 # ── PHASE 2: Try speaker-aware tracking (requires 2+ speakers) ──
                 _speaker_kf_used = False
-                if not _bimodal_used and transcript:
+                if not _cluster_used and transcript:
                     _spk_map = _build_speaker_position_map(subject_scenes, transcript)
                     if len(_spk_map) >= 2:
                         _spk_kf = _build_speaker_keyframes(transcript, _spk_map, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
@@ -5338,7 +5357,7 @@ async def export_clip(
                                 keyframes = None
 
                 # ── PHASE 3: Single-subject tracking (original pipeline) ──
-                if not _bimodal_used and not _speaker_kf_used and len(raw_kf) > 1:
+                if not _cluster_used and not _speaker_kf_used and len(raw_kf) > 1:
                     # Sparse data detection: relax thresholds when we have ≤4 keyframes
                     is_sparse = len(raw_kf) <= 4
                     dz_threshold = 3 if is_sparse else 5
@@ -5414,7 +5433,7 @@ async def export_clip(
                                 kf_min, kf_max,
                                 [(f"t={t:.2f}s,sx={sx}") for t, sx in keyframes],
                             )
-                elif not _bimodal_used and not _speaker_kf_used and len(raw_kf) == 1:
+                elif not _cluster_used and not _speaker_kf_used and len(raw_kf) == 1:
                     # Single keyframe — use its tracked value directly as the
                     # static subject_x so the crop centers on the actual subject
                     subject_x = raw_kf[0][1]

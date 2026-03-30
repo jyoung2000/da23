@@ -27,6 +27,7 @@ class SceneDescription(BaseModel):
     importance_score: int  # 1-10
     thumbnail_path: str
     subject_x: int = 50  # 0-100, horizontal subject position (0=left, 50=center, 100=right)
+    active_speaker_x: Optional[int] = None  # 0-100, position of the person who is talking (if detectable)
 
 
 class WordTimestamp(BaseModel):
