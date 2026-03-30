@@ -111,6 +111,26 @@ class AIOrchestrator:
             if p:
                 self._providers[name] = p
 
+    def _wire_ws_to_providers(self, job_id: str):
+        """Pass WebSocket broadcast to providers that support model-level notifications."""
+        if not self._ws_broadcast:
+            return
+        for provider in self._providers.values():
+            if hasattr(provider, 'set_ws_broadcast'):
+                provider.set_ws_broadcast(self._ws_broadcast, job_id)
+
+    def _get_model_info(self, provider) -> str:
+        """Get human-readable model info string for a provider."""
+        pname = provider.provider_name
+        parts = []
+        if hasattr(provider, '_vision_model'):
+            parts.append(f"vision={provider._vision_model}")
+        if hasattr(provider, '_text_model'):
+            parts.append(f"text={provider._text_model}")
+        if parts:
+            return f"{pname} ({', '.join(parts)})"
+        return pname
+
     # Rough cost per 1K tokens by provider (input+output blended average)
     _COST_PER_1K_TOKENS = {
         "openrouter": 0.0002,   # varies by model; free tier = 0
@@ -119,6 +139,79 @@ class AIOrchestrator:
         "groq": 0.0001,         # Groq is very cheap
         "ollama": 0.0,          # local, no cost
     }
+
+    async def validate_models(self, job_id: str) -> list[str]:
+        """Pre-flight check: verify that the selected AI models are reachable.
+
+        Sends a tiny test prompt to each provider's text endpoint.
+        Returns a list of warning messages for the frontend log.
+        Does NOT fail the pipeline — warnings are informational.
+        """
+        self._wire_ws_to_providers(job_id)
+        warnings = []
+        primary = next(iter(self._providers.values()), None)
+        if not primary:
+            warnings.append("No AI providers configured — check Settings")
+            return warnings
+
+        pname = primary.provider_name
+        model_info = self._get_model_info(primary)
+
+        # Notify frontend which models will be used
+        await self._notify_attempt(job_id, primary, "model validation")
+
+        if pname == "openrouter":
+            # Check if OpenRouter API key is set
+            if not settings.OPENROUTER_API_KEY or settings.OPENROUTER_API_KEY in {"", "sk-or-..."}:
+                warnings.append("⚠ OpenRouter API key is not set — cloud models will fail")
+                return warnings
+            # Quick ping: send a tiny prompt to the text model
+            try:
+                await asyncio.wait_for(
+                    primary.text_complete("Reply with OK", max_tokens=5, timeout=15),
+                    timeout=20,
+                )
+                if self._ws_broadcast:
+                    await self._ws_broadcast(job_id, {
+                        "type": "status",
+                        "message": f"✓ {model_info} — models verified",
+                    })
+            except asyncio.TimeoutError:
+                msg = f"⚠ OpenRouter text model timed out — may be overloaded. Will retry with fallbacks."
+                warnings.append(msg)
+                if self._ws_broadcast:
+                    await self._ws_broadcast(job_id, {"type": "status", "message": msg})
+            except Exception as e:
+                err = str(e)[:150]
+                msg = f"⚠ OpenRouter text model check failed: {err}"
+                warnings.append(msg)
+                if self._ws_broadcast:
+                    await self._ws_broadcast(job_id, {"type": "status", "message": msg})
+
+        elif pname == "ollama":
+            # Ollama is local — just check if it's responding
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.head(f"{settings.OLLAMA_HOST}")
+                    if resp.status_code == 200:
+                        if self._ws_broadcast:
+                            await self._ws_broadcast(job_id, {
+                                "type": "status",
+                                "message": f"✓ {model_info} — Ollama connected",
+                            })
+                    else:
+                        warnings.append(f"⚠ Ollama returned HTTP {resp.status_code}")
+            except Exception as e:
+                warnings.append(f"⚠ Ollama unreachable: {str(e)[:100]}")
+        else:
+            if self._ws_broadcast:
+                await self._ws_broadcast(job_id, {
+                    "type": "status",
+                    "message": f"Using {model_info}",
+                })
+
+        return warnings
 
     def get_total_tokens(self) -> int:
         """Return total tokens used across all provider instances."""
@@ -181,26 +274,33 @@ class AIOrchestrator:
             logger.debug("Active provider chain: %s", chain_names)
         return chain
 
-    async def _notify_attempt(self, job_id: str, provider_name: str, task: str):
-        logger.info(f"Attempting {task} via {provider_name}")
+    async def _notify_attempt(self, job_id: str, provider, task: str):
+        """Notify the frontend that a provider is being tried for a task.
+        `provider` can be a string or an AIProvider instance."""
+        if isinstance(provider, str):
+            label = provider
+        else:
+            label = self._get_model_info(provider)
+        logger.info("Attempting %s via %s", task, label)
         if self._ws_broadcast:
             try:
                 await self._ws_broadcast(job_id, {
                     "type": "status",
-                    "message": f"Attempting {task} via {provider_name}...",
+                    "message": f"Attempting {task} via {label}...",
                 })
             except Exception:
                 pass
 
     async def _notify_fallback(self, job_id: str, from_provider: str, reason: str):
-        logger.info(f"Falling back from {from_provider}: {reason}")
+        reason_short = reason[:200] if len(reason) > 200 else reason
+        logger.info("Falling back from %s: %s", from_provider, reason_short)
         if self._ws_broadcast:
             try:
                 await self._ws_broadcast(job_id, {
                     "type": "fallback",
                     "from_provider": from_provider,
-                    "to_provider": "next",
-                    "reason": reason,
+                    "to_provider": "next in chain",
+                    "reason": reason_short,
                 })
             except Exception:
                 pass
@@ -211,6 +311,7 @@ class AIOrchestrator:
     ) -> tuple[list[SceneDescription], str]:
         """Returns (results, provider_name_used).
         progress_callback(frames_done, total_frames, provider_name) is called per batch."""
+        self._wire_ws_to_providers(job_id)
         frame_prompt = self._custom_prompts.frame_analysis if self._custom_prompts else None
         # Append subject tracking instructions when enabled
         if settings.SUBJECT_TRACKING_ENABLED:
@@ -222,7 +323,7 @@ class AIOrchestrator:
             if not provider.supports_vision:
                 continue
             try:
-                await self._notify_attempt(job_id, provider.provider_name, f"scene analysis ({len(frames)} frames)")
+                await self._notify_attempt(job_id, provider, f"scene analysis ({len(frames)} frames)")
 
                 async def _provider_progress(done, total):
                     if progress_callback:
@@ -274,7 +375,7 @@ class AIOrchestrator:
         summary_prompt = self._custom_prompts.summary if self._custom_prompts else None
         for provider in self._get_active_chain():
             try:
-                await self._notify_attempt(job_id, provider.provider_name, "summary generation")
+                await self._notify_attempt(job_id, provider, "summary generation")
                 t0 = time.monotonic()
                 result = await provider.generate_summary(transcript, scenes, cancel_check=self._cancel_check, custom_prompt=summary_prompt)
                 elapsed = time.monotonic() - t0
@@ -507,7 +608,7 @@ class AIOrchestrator:
             else:
                 timeout = default_timeout
             try:
-                await self._notify_attempt(job_id, pname, "viral clip detection")
+                await self._notify_attempt(job_id, provider, "viral clip detection")
                 t0 = time.monotonic()
                 result = await asyncio.wait_for(
                     provider.detect_viral_clips(
@@ -666,7 +767,7 @@ class AIOrchestrator:
         seo_prompt = self._custom_prompts.seo if self._custom_prompts else None
         for provider in self._get_active_chain():
             try:
-                await self._notify_attempt(job_id, provider.provider_name, "SEO generation")
+                await self._notify_attempt(job_id, provider, "SEO generation")
                 t0 = time.monotonic()
                 result = await provider.generate_seo(
                     clip_title, clip_transcript, video_summary,

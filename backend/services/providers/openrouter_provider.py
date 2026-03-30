@@ -395,6 +395,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # max_completion_tokens) so we can respect each model's actual limits
         # instead of relying solely on hardcoded pattern matches.
         self._model_caps = _load_model_capabilities()
+        self._ws_broadcast = None  # Set by orchestrator via set_ws_broadcast()
+        self._job_id = None        # Set per-job for WS messages
 
         self._client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -493,6 +495,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 "Model limits may be wrong. Fetch real data via Settings > Models > Refresh, "
                 "or ensure the API key is set so startup fetch can populate the cache."
             )
+
+    def set_ws_broadcast(self, ws_broadcast, job_id: str):
+        """Set the WebSocket broadcast function and job ID for frontend notifications."""
+        self._ws_broadcast = ws_broadcast
+        self._job_id = job_id
+
+    async def _ws_notify(self, msg_type: str, **kwargs):
+        """Send a WebSocket message to the frontend if broadcast is available."""
+        if self._ws_broadcast and self._job_id:
+            try:
+                await self._ws_broadcast(self._job_id, {"type": msg_type, **kwargs})
+            except Exception:
+                pass
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None) -> str:
         """Generic text completion using the text model with fallback chain."""
@@ -636,15 +651,35 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 else:
                     model_max_tokens = max(max_tokens, 4096)
             try:
-                return await self._call_cancellable(
+                result = await self._call_cancellable(
                     model, messages, model_max_tokens, cancel_check, timeout=model_timeout,
                 )
+                # Notify frontend which model actually served the request
+                if i > 0:
+                    failed_models = ", ".join(m for m, _ in errors)
+                    await self._ws_notify(
+                        "fallback",
+                        from_provider=f"openrouter/{errors[-1][0]}",
+                        to_provider=f"openrouter/{model}",
+                        reason=f"Primary model failed, using fallback ({failed_models} → {model})",
+                    )
+                return result
             except ProviderError as e:
                 errors.append((model, e))
+                err_short = str(e)[:120]
                 logger.warning(
                     "OpenRouter model %s failed (%d/%d): %s",
                     model, i + 1, len(chain), e,
                 )
+                # Notify frontend about the model failure
+                if i < len(chain) - 1:
+                    next_model = chain[i + 1]
+                    await self._ws_notify(
+                        "fallback",
+                        from_provider=f"openrouter/{model}",
+                        to_provider=f"openrouter/{next_model}",
+                        reason=err_short,
+                    )
                 continue
         # Report ALL errors (not just the last one) so the user can see
         # which primary model failed and why, rather than only seeing the

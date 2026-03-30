@@ -579,6 +579,14 @@ async def _run_analysis_inner(job_id: str):
         cancel_check=cancel_check,
     )
 
+    # ── Pre-flight: validate AI models are reachable ──
+    try:
+        model_warnings = await orchestrator.validate_models(job_id)
+        for w in model_warnings:
+            logger.warning("[%s] Model validation: %s", job_id, w)
+    except Exception as e:
+        logger.warning("[%s] Model validation failed (non-fatal): %s", job_id, e)
+
     def _pipeline_elapsed():
         return _time.monotonic() - _pipeline_start
 
