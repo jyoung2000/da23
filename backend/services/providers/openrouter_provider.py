@@ -790,17 +790,21 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     "Return ONLY a valid JSON array. No markdown, no explanation.\n"
                     '[{"timestamp": <float>, "description": "<text>", '
                     '"importance_score": <1-10>, "subject_x": <0-100>}]\n\n'
-                    "subject_x = horizontal position of the MAIN PERSON on screen.\n"
-                    "Pick the person who is TALKING (lips moving, gesturing).\n"
-                    "If nobody is talking, pick the most prominent face.\n\n"
-                    "SCALE: 0=left edge, 25=left quarter, 50=center, 75=right quarter, 100=right edge\n"
-                    "EXAMPLES: person on far left=15, slightly left=35, center=50, slightly right=65, far right=85\n\n"
+                    "subject_x = horizontal position of the FACE CENTER of the main person.\n"
+                    "Imagine the frame divided into a 10-column grid:\n"
+                    "  columns 1-2 = far left (subject_x 10-20)\n"
+                    "  columns 3-4 = left side (subject_x 30-40)\n"
+                    "  column 5 = center-left (subject_x 45)\n"
+                    "  column 6 = center-right (subject_x 55)\n"
+                    "  columns 7-8 = right side (subject_x 60-70)\n"
+                    "  columns 9-10 = far right (subject_x 80-90)\n\n"
                     "RULES:\n"
-                    "- Look at where the person's FACE is, not the overall scene\n"
-                    "- Interview/podcast subjects are usually at 30-45 or 55-70, rarely at exactly 50\n"
-                    "- If you see a title card or graphic with NO people, estimate where the nearest "
-                    "person WOULD be based on the scene layout (30 for left-weighted, 70 for right-weighted)\n"
-                    "- VARY your subject_x — do not return 50 for every frame"
+                    "- Track the face of whoever is TALKING (lips moving, gesturing)\n"
+                    "- If nobody talking, track the most prominent face\n"
+                    "- Estimate which COLUMN their face center falls in\n"
+                    "- Interview subjects are almost always in columns 3-4 or 7-8\n"
+                    "- If no people visible (title card/graphic), use 30 or 70 based on layout\n"
+                    "- VARY your subject_x per frame — do not repeat the same value"
                 )},
             ]
             for frame in batch:

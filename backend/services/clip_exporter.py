@@ -2245,11 +2245,16 @@ def _detect_position_clusters(
     def _build_result(clusters):
         if len(clusters) < 2:
             return None
-        result = sorted(
-            [{"center": round(_median(v)), "count": len(v)} for v in clusters],
-            key=lambda c: c["center"],
-        )
-        # Reject if adjacent clusters are too close (< 8 apart) — not distinct speakers
+        # Trimmed mean: remove top/bottom 10% for more accurate centering.
+        # Matches frontend buildResult() exactly.
+        result = []
+        for v in clusters:
+            sv = sorted(v)
+            trim = max(1, len(sv) // 10)
+            trimmed = sv[trim:len(sv) - trim] if len(sv) > 2 else sv
+            center = round(sum(trimmed) / len(trimmed)) if trimmed else sv[len(sv) // 2]
+            result.append({"center": center, "count": len(v)})
+        result.sort(key=lambda c: c["center"])
         for i in range(1, len(result)):
             if result[i]["center"] - result[i - 1]["center"] < 8:
                 return None

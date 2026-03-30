@@ -205,10 +205,18 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
   function buildResult(clusters) {
     if (clusters.length < 2) return null;
     const result = clusters
-      .map(values => ({ center: Math.round(median(values)), count: values.length }))
+      .map(values => {
+        // Trimmed mean: remove top/bottom 10% before averaging.
+        // More accurate than median for centering while still robust to outliers.
+        const sorted = [...values].sort((a, b) => a - b);
+        const trim = Math.max(1, Math.floor(sorted.length * 0.1));
+        const trimmed = sorted.length > 2 ? sorted.slice(trim, sorted.length - trim) : sorted;
+        const center = trimmed.length > 0
+          ? Math.round(trimmed.reduce((s, v) => s + v, 0) / trimmed.length)
+          : Math.round(median(sorted));
+        return { center, count: values.length };
+      })
       .sort((a, b) => a.center - b.center);
-    // Reject if any two adjacent clusters are too close (< 8 apart) —
-    // they're not distinct speakers, just noise around the same position
     for (let i = 1; i < result.length; i++) {
       if (result[i].center - result[i - 1].center < 8) return null;
     }
@@ -1093,4 +1101,39 @@ export function validateTracking(keyframes, clusters, clipDuration) {
   }
 
   return { passed: warnings.length === 0, warnings, fixedKeyframes: fixed };
+}
+
+
+/**
+ * Diagnostic: validate that each keyframe position would center the subject
+ * within the crop window for a given aspect ratio conversion.
+ *
+ * @param {Array<{t:number, x:number}>} keyframes
+ * @param {number} srcRatio - Source aspect ratio (e.g. 16/9)
+ * @param {number} targetRatio - Target aspect ratio (e.g. 9/16)
+ * @returns {{ keyframes: Array, corrections: number }}
+ */
+export function validateCentering(keyframes, srcRatio, targetRatio) {
+  if (!srcRatio || !targetRatio) return { keyframes, corrections: 0 };
+  const R = srcRatio / targetRatio;
+  if (R <= 1.01) return { keyframes, corrections: 0 };
+
+  const cropWidth = 1 / R;
+  let corrections = 0;
+
+  const fixed = keyframes.map(kf => {
+    const objPos = (R * kf.x - 50) / (R - 1);
+    const cropStart = (objPos / 100) * (1 - cropWidth);
+    const faceInCrop = (kf.x / 100 - cropStart) / cropWidth;
+
+    if (faceInCrop < 0.2 || faceInCrop > 0.8) {
+      corrections++;
+      console.log(
+        `[CenteringQA] t=${kf.t.toFixed(1)}s: face at ${Math.round(faceInCrop * 100)}% of crop (should be ~50%)`
+      );
+    }
+    return { ...kf };
+  });
+
+  return { keyframes: fixed, corrections };
 }
