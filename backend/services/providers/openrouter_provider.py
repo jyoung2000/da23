@@ -789,11 +789,15 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     instruction + "\n\n"
                     "Return ONLY valid JSON array:\n"
                     '[{"timestamp": <float>, "description": "<text>", "importance_score": <1-10>, "subject_x": <0-100>}]\n'
-                    "IMPORTANT: subject_x = horizontal position of the person who is TALKING "
-                    "(lips moving, actively speaking). If multiple people visible, focus on the "
-                    "ACTIVE SPEAKER. If no one is clearly speaking, use the most prominent person. "
-                    "0=left edge, 50=center, 100=right edge. "
-                    "Do NOT default to 50 — look at where the face actually is in the frame."
+                    "CRITICAL RULE FOR subject_x:\n"
+                    "- subject_x = horizontal position of the person who is TALKING (lips moving)\n"
+                    "- If multiple people visible, pick the ACTIVE SPEAKER\n"
+                    "- If no one is speaking, pick the most prominent person\n"
+                    "- 0=left edge, 25=left quarter, 50=center, 75=right quarter, 100=right edge\n"
+                    "- NEVER return 50 unless the person's face is TRULY at exact center\n"
+                    "- If you see a title card, logo, or no people: still estimate where "
+                    "the most important visual element is — do NOT default to 50\n"
+                    "- Most interview subjects are OFF-CENTER (30-45 or 55-70), not at 50"
                 )},
             ]
             for frame in batch:

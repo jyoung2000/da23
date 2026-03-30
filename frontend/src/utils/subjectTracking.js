@@ -204,9 +204,15 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
 
   function buildResult(clusters) {
     if (clusters.length < 2) return null;
-    return clusters
+    const result = clusters
       .map(values => ({ center: Math.round(median(values)), count: values.length }))
       .sort((a, b) => a.center - b.center);
+    // Reject if any two adjacent clusters are too close (< 8 apart) —
+    // they're not distinct speakers, just noise around the same position
+    for (let i = 1; i < result.length; i++) {
+      if (result[i].center - result[i - 1].center < 8) return null;
+    }
+    return result;
   }
 
   // ── Pass 1: Try with all values ──
@@ -759,18 +765,20 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x });
     }
 
-    // ── Fix initial snap: use nearest cluster to first non-center value ──
-    // When the first raw value is a center default (50) but the actual speaker
-    // is at 35%, the crop starts centered and then jumps.
-    const firstReal = raw.find(kf => kf.x < 47 || kf.x > 53);
-    if (firstReal && deduped.length > 0) {
-      let nearestCenter = clusters[0].center;
-      let minDist = Math.abs(firstReal.x - nearestCenter);
-      for (let c = 1; c < clusters.length; c++) {
-        const dist = Math.abs(firstReal.x - clusters[c].center);
-        if (dist < minDist) { minDist = dist; nearestCenter = clusters[c].center; }
+    // ── Fix initial snap: don't start at center default ──
+    // If the first keyframe is in the center noise zone (44-56), it's likely
+    // a title card or default. Snap to the first non-center value's cluster.
+    if (deduped.length > 0 && deduped[0].x >= 44 && deduped[0].x <= 56) {
+      const firstReal = raw.find(kf => kf.x < 44 || kf.x > 56);
+      if (firstReal) {
+        let nearestCenter = clusters[0].center;
+        let minDist = Math.abs(firstReal.x - nearestCenter);
+        for (let c = 1; c < clusters.length; c++) {
+          const dist = Math.abs(firstReal.x - clusters[c].center);
+          if (dist < minDist) { minDist = dist; nearestCenter = clusters[c].center; }
+        }
+        deduped[0].x = nearestCenter;
       }
-      deduped[0].x = nearestCenter;
     }
 
     // handleSceneCuts inserts 1ms instant-jump transitions at speaker changes

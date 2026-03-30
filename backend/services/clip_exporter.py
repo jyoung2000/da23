@@ -2245,10 +2245,15 @@ def _detect_position_clusters(
     def _build_result(clusters):
         if len(clusters) < 2:
             return None
-        return sorted(
+        result = sorted(
             [{"center": round(_median(v)), "count": len(v)} for v in clusters],
             key=lambda c: c["center"],
         )
+        # Reject if adjacent clusters are too close (< 8 apart) — not distinct speakers
+        for i in range(1, len(result)):
+            if result[i]["center"] - result[i - 1]["center"] < 8:
+                return None
+        return result
 
     # Pass 1: all values
     result1 = _build_result(_split(xs))
@@ -5363,11 +5368,12 @@ async def export_clip(
                     if deduped[-1][0] < clip_dur:
                         deduped.append((clip_dur, deduped[-1][1]))
 
-                    # Fix initial snap: use nearest cluster to first non-center value
-                    first_real = next((kf for kf in raw_kf if kf[1] < 47 or kf[1] > 53), None)
-                    if first_real and deduped:
-                        best_c = min(clusters, key=lambda c: abs(first_real[1] - c["center"]))
-                        deduped[0] = (deduped[0][0], best_c["center"])
+                    # Fix initial snap: don't start at center default
+                    if deduped and 44 <= deduped[0][1] <= 56:
+                        first_real = next((kf for kf in raw_kf if kf[1] < 44 or kf[1] > 56), None)
+                        if first_real:
+                            best_c = min(clusters, key=lambda c: abs(first_real[1] - c["center"]))
+                            deduped[0] = (deduped[0][0], best_c["center"])
 
                     # handleSceneCuts inserts 1ms instant-jump transitions
                     after_cuts = _handle_scene_cuts(deduped)
