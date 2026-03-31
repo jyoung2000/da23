@@ -978,6 +978,9 @@ async def _run_analysis_inner(job_id: str):
                 frame.face_data = face_data
             faces_found = sum(1 for fd in face_results if fd.faces)
             logger.info("[%s] Face detection complete: %d/%d frames have faces", job_id, faces_found, len(frames))
+            # Face detection is complete — all OpenCV resources released.
+            import gc
+            gc.collect()
         except ImportError:
             logger.info("[%s] Face detection unavailable (mediapipe not installed) — using AI estimates only", job_id)
         except Exception as e:

@@ -144,6 +144,14 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
             faces=faces, primary_face_idx=primary,
         ))
 
+    # Explicitly release OpenCV resources
+    if use_haar:
+        del cascade
+    elif detector is not None:
+        del detector
+    import gc
+    gc.collect()
+
     return results
 
 
@@ -242,11 +250,15 @@ def detect_faces_batch(
     Tries MediaPipe first (more accurate), falls back to OpenCV Haar cascade.
     Returns list of FrameFaces, one per input frame.
     """
+    import time as _t
+    t0 = _t.monotonic()
+
     # Try MediaPipe first
     try:
         results = _detect_with_mediapipe(frame_paths, min_confidence)
         if results is not None:
-            logger.info("Face detection using MediaPipe")
+            elapsed = _t.monotonic() - t0
+            logger.info("Face detection using MediaPipe (%.1fs for %d frames)", elapsed, len(frame_paths))
             _log_summary(results)
             return results
     except Exception as e:
@@ -256,14 +268,16 @@ def detect_faces_batch(
     try:
         results = _detect_with_opencv_dnn(frame_paths, min_confidence)
         if results is not None:
-            logger.info("Face detection using OpenCV Haar cascade")
+            elapsed = _t.monotonic() - t0
+            logger.info("Face detection using OpenCV Haar cascade (%.1fs for %d frames)", elapsed, len(frame_paths))
             _log_summary(results)
             return results
     except Exception as e:
         logger.warning("OpenCV face detection failed: %s", e)
 
     # Both failed — return empty results (graceful degradation)
-    logger.warning("All face detection methods failed — using AI estimates only")
+    elapsed = _t.monotonic() - t0
+    logger.warning("All face detection methods failed (%.1fs) — using AI estimates only", elapsed)
     return [
         FrameFaces(timestamp=ts, frame_path=str(p))
         for ts, p in frame_paths

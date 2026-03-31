@@ -1186,12 +1186,20 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         secs = int(frame.timestamp % 60)
                         # Apply minimal spread so hasAiData=true on frontend
                         offset = (i % 5) - 2
+                        # Use face detection position if available
+                        _fd = getattr(frame, 'face_data', None)
+                        _fallback_sx = 50 + offset
+                        if _fd and hasattr(_fd, 'faces') and _fd.faces:
+                            if len(_fd.faces) == 1:
+                                _fallback_sx = round(_fd.faces[0].nose_x)
+                            elif _fd.primary_face_idx >= 0:
+                                _fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
                         scenes.append(SceneDescription(
                             timestamp=frame.timestamp,
                             description=f"Frame at {mins}:{secs:02d} (vision unavailable — CLIP on CPU, model needs GPU)",
                             importance_score=5,
                             thumbnail_path=frame.path,
-                            subject_x=50 + offset,
+                            subject_x=_fallback_sx,
                         ))
                         if progress_callback:
                             await progress_callback(i + 1, total)
@@ -1210,12 +1218,20 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         mins = int(frame.timestamp // 60)
                         secs = int(frame.timestamp % 60)
                         offset = (i % 5) - 2
+                        # Use face detection position if available
+                        _fd = getattr(frame, 'face_data', None)
+                        _fallback_sx = 50 + offset
+                        if _fd and hasattr(_fd, 'faces') and _fd.faces:
+                            if len(_fd.faces) == 1:
+                                _fallback_sx = round(_fd.faces[0].nose_x)
+                            elif _fd.primary_face_idx >= 0:
+                                _fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
                         scenes.append(SceneDescription(
                             timestamp=frame.timestamp,
                             description=f"Frame at {mins}:{secs:02d} (vision model crashed — check Ollama logs)",
                             importance_score=5,
                             thumbnail_path=frame.path,
-                            subject_x=50 + offset,
+                            subject_x=_fallback_sx,
                         ))
                         if progress_callback:
                             await progress_callback(i + 1, total)
@@ -1380,8 +1396,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         _prev_descriptions: list[str] = []  # last N descriptions for context
         _CONTEXT_WINDOW = 3  # number of previous descriptions to include
 
+        # Temporal continuity tracker for multi-face fusion
+        _prev_sx = 50
+
         async def _analyze_one(fi: int, frame: FrameData):
-            nonlocal completed, stage2_consecutive_failures, stage2_aborted
+            nonlocal completed, stage2_consecutive_failures, stage2_aborted, _prev_sx
             async with sem:
                 if cancel_check:
                     cancel_check()
@@ -1424,7 +1443,30 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     )
                     json_suffix = _VISION_JSON_SUFFIX
 
-                prompt = ollama_vision_prompt + json_suffix
+                # ── Face detection context ──
+                face_hint = ""
+                fd = getattr(frame, 'face_data', None)
+                if fd and hasattr(fd, 'faces') and fd.faces:
+                    vision_lower_fh = self._vision_model.lower()
+                    if "moondream" in vision_lower_fh:
+                        # Ultra-compact for small models
+                        if len(fd.faces) == 1:
+                            face_hint = f"\nFace at x={fd.faces[0].nose_x:.0f}%."
+                        else:
+                            face_hint = f"\n{len(fd.faces)} faces: " + ", ".join(
+                                f"x={f.nose_x:.0f}%" for f in fd.faces
+                            ) + "."
+                    else:
+                        if len(fd.faces) == 1:
+                            face_hint = f"\nFace detected at x={fd.faces[0].nose_x:.0f}%. Use this as subject_x."
+                        elif len(fd.faces) >= 2:
+                            descs = [f"face{i+1} at x={f.nose_x:.0f}%" for i, f in enumerate(fd.faces)]
+                            face_hint = (
+                                f"\n{len(fd.faces)} faces detected: {', '.join(descs)}. "
+                                "Set subject_x to the face that is SPEAKING."
+                            )
+
+                prompt = ollama_vision_prompt + face_hint + json_suffix
                 try:
                     _frame_t0 = _time.monotonic()
                     _cur_timeout = _adaptive_timeout()
@@ -1498,6 +1540,29 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                                 "Ollama frame %d: extracted subject_x=%d from free text (no JSON)",
                                 fi, subject_x,
                             )
+                    # ── Face data fusion: prefer detection over AI estimate ──
+                    fd = getattr(frame, 'face_data', None)
+                    if fd and hasattr(fd, 'faces') and fd.faces:
+                        if len(fd.faces) == 1:
+                            subject_x = round(fd.faces[0].nose_x)
+                        elif len(fd.faces) >= 2:
+                            face_xs = [round(f.nose_x) for f in fd.faces]
+                            nearest = min(face_xs, key=lambda fx: abs(fx - subject_x))
+                            if abs(nearest - subject_x) <= 15:
+                                subject_x = nearest
+                            else:
+                                subject_x = min(face_xs, key=lambda fx: abs(fx - _prev_sx))
+
+                            # Midpoint snap: if subject_x is between faces and far from all
+                            min_dist = min(abs(subject_x - fx) for fx in face_xs)
+                            if min_dist > 10:
+                                subject_x = min(face_xs, key=lambda fx: abs(fx - subject_x))
+                    elif subject_x == 50 and _prev_sx != 50:
+                        # No face data AND center default → hold previous position
+                        subject_x = _prev_sx
+
+                    _prev_sx = subject_x
+
                     # ── Quality validation ──
                     if description:
                         # Strip JSON fragments from non-JSON-parsed descriptions
