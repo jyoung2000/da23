@@ -835,6 +835,41 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }
     }
 
+    // ── Camera mode selection (Google AutoFlip architecture) ──
+    // For static multi-speaker content (podcasts, interviews), use STATIONARY mode
+    // with extended hold times. Only use TRACKING if faces actually move.
+    const clusterVariances = clusters.map(c => {
+      const memberKfs = raw.filter(kf => {
+        const nearest = clusters.reduce((best, cl) =>
+          Math.abs(kf.x - cl.center) < Math.abs(kf.x - best.center) ? cl : best
+        );
+        return nearest === c;
+      });
+      if (memberKfs.length < 2) return 0;
+      return Math.sqrt(
+        memberKfs.reduce((sum, kf) => sum + (kf.x - c.center) ** 2, 0) / memberKfs.length
+      );
+    });
+    const isStaticContent = Math.max(...clusterVariances) < 5;
+    if (isStaticContent && deduped.length >= 3) {
+      // STATIONARY MODE: extend minimum hold to 3s for rock-solid stability
+      const STATIC_MIN_HOLD = 3.0;
+      let si = 1;
+      while (si < deduped.length - 1) {
+        const holdDuration = deduped[si + 1].t - deduped[si].t;
+        if (holdDuration < STATIC_MIN_HOLD) {
+          deduped[si] = { t: deduped[si].t, x: deduped[si - 1].x };
+          if (deduped[si].x === deduped[si - 1].x) {
+            deduped.splice(si, 1);
+          } else {
+            si++;
+          }
+        } else {
+          si++;
+        }
+      }
+    }
+
     // Ensure start and end keyframes
     if (deduped[0].t > 0) {
       deduped.unshift({ t: 0, x: deduped[0].x });

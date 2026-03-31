@@ -974,6 +974,7 @@ async def _run_analysis_inner(job_id: str):
     # Runs pixel-accurate face detection on extracted frames to augment
     # the AI vision model's subject_x estimates. No GPU needed.
     face_registry = None
+    face_results = []  # Will hold FrameFaces for active speaker detection
     if settings.SUBJECT_TRACKING_ENABLED:
         try:
             from backend.services.face_detector import detect_faces_batch
@@ -1739,6 +1740,41 @@ async def _run_analysis_inner(job_id: str):
         "[%s] Branches complete: %d transcript segments (%d speakers), %d scenes via %s",
         job_id, len(transcript), speaker_count, len(scenes), scenes_provider,
     )
+
+    # ── Active Speaker Detection (lip-audio cross-correlation) ──
+    active_speaker_events = []
+    if face_registry and face_registry.multi_speaker and transcript and face_results:
+        try:
+            from backend.services.active_speaker import (
+                build_active_speaker_timeline, get_active_slot_at_time,
+            )
+            active_speaker_events = build_active_speaker_timeline(
+                face_results, transcript, face_registry,
+            )
+            if active_speaker_events:
+                logger.info(
+                    "[%s] Active speaker timeline: %d events covering %.1fs",
+                    job_id, len(active_speaker_events),
+                    sum(e.end - e.start for e in active_speaker_events),
+                )
+                # Correct scenes where lip tracking disagrees with subject_x
+                lip_corrected = 0
+                for scene in scenes:
+                    active_slot_id = get_active_slot_at_time(
+                        active_speaker_events, scene.timestamp,
+                    )
+                    if active_slot_id >= 0:
+                        slot = face_registry.slot_by_id(active_slot_id)
+                        if slot and abs(scene.subject_x - slot.x_center) > 15:
+                            scene.subject_x = round(slot.x_center)
+                            lip_corrected += 1
+                if lip_corrected > 0:
+                    logger.info(
+                        "[%s] Lip-audio correction: updated %d/%d scenes to match active speaker",
+                        job_id, lip_corrected, len(scenes),
+                    )
+        except Exception as e:
+            logger.warning("[%s] Active speaker detection failed (non-fatal): %s", job_id, e)
 
     # ── Pipeline health check: detect total failure ──
     real_scenes = [s for s in scenes

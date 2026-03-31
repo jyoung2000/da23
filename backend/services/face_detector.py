@@ -22,6 +22,7 @@ class FaceInfo:
     nose_x: float         # Best estimate of face center x, 0-100
     nose_y: float         # Best estimate of face center y, 0-100
     confidence: float     # Detection confidence, 0-1
+    lip_aperture: float = 0.0  # Mouth openness ratio (0=closed, 1=wide open)
 
 
 @dataclass
@@ -153,6 +154,108 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
     return results
 
 
+def _detect_with_facemesh(frame_paths, min_confidence):
+    """Detect faces using MediaPipe FaceMesh — provides lip landmarks for active speaker detection.
+
+    FaceMesh gives 468 landmarks per face including lip points.
+    Lip Aperture Ratio = inner_lip_distance / face_height.
+    When LAR > ~0.03, the person's mouth is open (likely speaking).
+    Runs on CPU, ~3-5s for 60 frames.
+    """
+    import mediapipe as mp
+    import cv2
+
+    face_mesh_module = None
+    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
+        face_mesh_module = mp.solutions.face_mesh
+    if face_mesh_module is None:
+        try:
+            from mediapipe.python.solutions import face_mesh as fm_mod
+            face_mesh_module = fm_mod
+        except (ImportError, AttributeError):
+            pass
+    if face_mesh_module is None:
+        logger.info("MediaPipe FaceMesh not available — falling back to FaceDetection")
+        return None
+
+    UPPER_LIP_INNER = 82
+    LOWER_LIP_INNER = 87
+    NOSE_TIP = 1
+
+    results = []
+
+    with face_mesh_module.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=4,
+        refine_landmarks=True,
+        min_detection_confidence=min_confidence,
+    ) as mesh:
+        for timestamp, path in frame_paths:
+            img = cv2.imread(str(path))
+            if img is None:
+                results.append(FrameFaces(timestamp=timestamp, frame_path=str(path)))
+                continue
+
+            h, w = img.shape[:2]
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            det_result = mesh.process(rgb)
+
+            faces: list[FaceInfo] = []
+            if det_result.multi_face_landmarks:
+                for face_landmarks in det_result.multi_face_landmarks:
+                    lm = face_landmarks.landmark
+
+                    xs_px = [l.x * w for l in lm]
+                    ys_px = [l.y * h for l in lm]
+                    x_min, x_max = min(xs_px), max(xs_px)
+                    y_min, y_max = min(ys_px), max(ys_px)
+                    face_w = x_max - x_min
+                    face_h = y_max - y_min
+
+                    cx = ((x_min + x_max) / 2) / w * 100
+                    cy = ((y_min + y_max) / 2) / h * 100
+                    fw_pct = face_w / w * 100
+                    fh_pct = face_h / h * 100
+
+                    nose_x = lm[NOSE_TIP].x * 100
+                    nose_y = lm[NOSE_TIP].y * 100
+
+                    # Lip Aperture Ratio (LAR)
+                    upper_lip_y = lm[UPPER_LIP_INNER].y * h
+                    lower_lip_y = lm[LOWER_LIP_INNER].y * h
+                    lip_distance = abs(lower_lip_y - upper_lip_y)
+                    lip_aperture = lip_distance / max(face_h, 1)
+
+                    faces.append(FaceInfo(
+                        x_center=round(cx, 1),
+                        y_center=round(cy, 1),
+                        width=round(fw_pct, 1),
+                        height=round(fh_pct, 1),
+                        nose_x=round(nose_x, 1),
+                        nose_y=round(nose_y, 1),
+                        confidence=0.9,
+                        lip_aperture=round(lip_aperture, 3),
+                    ))
+
+            # Reject merged detections
+            if len(faces) == 1 and faces[0].width > 18.0:
+                if 30 < faces[0].x_center < 70:
+                    logger.debug("FaceMesh: rejecting merged detection w=%.1f%% c=%.1f%%",
+                                 faces[0].width, faces[0].x_center)
+                    faces = []
+
+            primary = -1
+            if faces:
+                primary = max(range(len(faces)), key=lambda i: faces[i].width * faces[i].height)
+
+            results.append(FrameFaces(
+                timestamp=timestamp, frame_path=str(path),
+                faces=faces, primary_face_idx=primary,
+            ))
+
+    return results
+
+
 def _detect_with_mediapipe(frame_paths, min_confidence):
     """Detect faces using MediaPipe — more accurate than Haar cascade.
 
@@ -251,16 +354,27 @@ def detect_faces_batch(
     import time as _t
     t0 = _t.monotonic()
 
-    # Try MediaPipe first
+    # Try FaceMesh first (gives lip landmarks for active speaker detection)
+    try:
+        results = _detect_with_facemesh(frame_paths, min_confidence)
+        if results is not None:
+            elapsed = _t.monotonic() - t0
+            logger.info("Face detection using MediaPipe FaceMesh (%.1fs for %d frames)", elapsed, len(frame_paths))
+            _log_summary(results)
+            return results
+    except Exception as e:
+        logger.info("FaceMesh unavailable (%s), trying FaceDetection", e)
+
+    # Try MediaPipe FaceDetection (no lip landmarks but more robust)
     try:
         results = _detect_with_mediapipe(frame_paths, min_confidence)
         if results is not None:
             elapsed = _t.monotonic() - t0
-            logger.info("Face detection using MediaPipe (%.1fs for %d frames)", elapsed, len(frame_paths))
+            logger.info("Face detection using MediaPipe FaceDetection (%.1fs for %d frames)", elapsed, len(frame_paths))
             _log_summary(results)
             return results
     except Exception as e:
-        logger.info("MediaPipe face detection unavailable (%s), trying OpenCV", e)
+        logger.info("MediaPipe FaceDetection unavailable (%s), trying OpenCV", e)
 
     # Fall back to OpenCV
     try:
@@ -302,4 +416,14 @@ def _log_summary(results: list[FrameFaces]):
             min(nose_xs), max(nose_xs),
             sum(nose_xs) / len(nose_xs),
             len(set(round(x) for x in nose_xs)),
+        )
+
+    # Lip aperture stats (for active speaker detection)
+    all_lars = [f.lip_aperture for r in results for f in r.faces if f.lip_aperture > 0]
+    if all_lars:
+        logger.info(
+            "Lip aperture: min=%.3f, max=%.3f, mean=%.3f, speaking_frames=%d (LAR>0.03)",
+            min(all_lars), max(all_lars),
+            sum(all_lars) / len(all_lars),
+            sum(1 for l in all_lars if l > 0.03),
         )

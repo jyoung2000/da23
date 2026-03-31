@@ -914,6 +914,27 @@ export default function VideoEditor({
     return { mode: 'static', label: `Face tracked at ${sx}%`, color: '#10b981' };
   }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject, clipStart, clipEnd, srcRatio, targetRatio]);
 
+  // Live face position — updates during playback via requestAnimationFrame
+  const [livePosition, setLivePosition] = useState(null);
+  useEffect(() => {
+    if (!hasDynamicSubject || !isCrop) { setLivePosition(null); return; }
+    const video = videoRef.current;
+    if (!video) return;
+    let animId;
+    let lastPos = null;
+    const tick = () => {
+      if (!video.paused) {
+        const relTime = video.currentTime - (clipStart || 0);
+        const sx = interpolateSubjectX(subjectKeyframes, relTime);
+        const rounded = Math.round(sx);
+        if (rounded !== lastPos) { lastPos = rounded; setLivePosition(rounded); }
+      }
+      animId = requestAnimationFrame(tick);
+    };
+    animId = requestAnimationFrame(tick);
+    return () => { cancelAnimationFrame(animId); setLivePosition(null); };
+  }, [hasDynamicSubject, isCrop, subjectKeyframes, clipStart]);
+
   // ── Segment helpers ────────────────────────────────
   const getActiveSegment = useCallback((t) => {
     return segments.find(s => t >= s.start && t < s.end) || null;
@@ -2475,7 +2496,7 @@ export default function VideoEditor({
               background: trackingStatus.color,
               boxShadow: (trackingStatus.mode === 'dynamic' || trackingStatus.mode === 'multi') ? `0 0 4px ${trackingStatus.color}` : 'none',
             }} />
-            {trackingStatus.label}
+            {livePosition !== null ? `Face tracked at ${livePosition}%` : trackingStatus.label}
           </div>
         )}
         <video
