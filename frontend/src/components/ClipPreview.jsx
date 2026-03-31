@@ -317,7 +317,7 @@ export default function ClipPreview({
     if (Math.abs(sx - 50) < 3) {
       return { mode: 'center', label: 'Centered', color: '#6b7280' };
     }
-    return { mode: 'static', label: `Subject at ${sx}%`, color: '#3b82f6' };
+    return { mode: 'static', label: 'Face tracked', color: '#10b981' };
   }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject]);
 
   const SPEED_OPTIONS = [0.5, 1.0, 1.5, 2.0];
