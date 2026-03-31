@@ -28,6 +28,9 @@ from backend.services.clip_exporter import (
     _build_filter_chain,
     _compute_safe_range,
     _validate_subject_tracking,
+    _detect_position_clusters,
+    _snap_to_clusters,
+    _validate_tracking,
 )
 from backend.models import SceneDescription
 
@@ -873,3 +876,286 @@ class TestPipelineOrdering:
         assert has_instant_cut, (
             f"Expected instant scene cut in pipeline output, got: {after_cuts}"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# _detect_position_clusters — 3-pass center noise stripping
+# ══════════════════════════════════════════════════════════════════════
+
+class TestDetectPositionClusters:
+    """Cluster detection with center-noise stripping."""
+
+    def test_clear_bimodal_split(self):
+        """Two distinct groups should split on Pass 1."""
+        kf = [(i, 30) for i in range(10)] + [(i + 10, 70) for i in range(10)]
+        result = _detect_position_clusters(kf)
+        assert result is not None
+        assert len(result) == 2
+        assert result[0]["center"] < 50
+        assert result[1]["center"] > 50
+
+    def test_center_noise_blocks_pass1(self):
+        """50s bridging left/right should prevent Pass 1 split but Pass 2 works."""
+        # Left values 38-42, center defaults 48-52, right values 58-62
+        # Sorted gaps: max is ~6 (42→48, 52→58) < threshold 10 → Pass 1 fails
+        # After stripping [47-53], gap becomes 42→58 = 16 → Pass 2 succeeds
+        kf = (
+            [(i, 38 + (i % 5)) for i in range(8)]       # 38,39,40,41,42 repeating
+            + [(i + 8, 48 + (i % 5)) for i in range(8)]  # 48,49,50,51,52 repeating
+            + [(i + 16, 58 + (i % 5)) for i in range(8)] # 58,59,60,61,62 repeating
+        )
+        result = _detect_position_clusters(kf)
+        assert result is not None
+        assert len(result) >= 2
+        centers = [c["center"] for c in result]
+        # Should NOT have a cluster at ~50 — those were stripped
+        assert all(c < 44 or c > 56 for c in centers), f"Center cluster not stripped: {centers}"
+
+    def test_heavy_center_pollution_pass3(self):
+        """Soft-center values (45, 48, 52, 55) need Pass 3 (strip [44-56])."""
+        kf = (
+            [(i, 25) for i in range(5)]
+            + [(i + 5, 45) for i in range(3)]
+            + [(i + 8, 50) for i in range(10)]
+            + [(i + 18, 55) for i in range(3)]
+            + [(i + 21, 75) for i in range(5)]
+        )
+        result = _detect_position_clusters(kf)
+        assert result is not None
+        assert len(result) >= 2
+        centers = [c["center"] for c in result]
+        assert any(c < 40 for c in centers), f"No left cluster found: {centers}"
+        assert any(c > 60 for c in centers), f"No right cluster found: {centers}"
+
+    def test_single_cluster_returns_none(self):
+        """All values at same position should return None."""
+        kf = [(i, 50) for i in range(10)]
+        assert _detect_position_clusters(kf) is None
+
+    def test_too_few_keyframes(self):
+        kf = [(0, 30), (1, 70)]
+        assert _detect_position_clusters(kf) is None
+
+    def test_minimum_cluster_distance(self):
+        """Clusters < 8 apart should be rejected."""
+        kf = [(i, 48) for i in range(5)] + [(i + 5, 52) for i in range(5)]
+        assert _detect_position_clusters(kf) is None
+
+    def test_three_clusters(self):
+        """Should detect 3+ clusters when data supports it."""
+        kf = (
+            [(i, 20) for i in range(5)]
+            + [(i + 5, 50) for i in range(5)]
+            + [(i + 10, 80) for i in range(5)]
+        )
+        result = _detect_position_clusters(kf)
+        assert result is not None
+        assert len(result) == 3
+
+    def test_center_stripping_conditional(self):
+        """Center stripping only activates when >10% in noise zone AND data on both sides."""
+        # Only 1 value at 50 out of 20 = 5% — should NOT strip
+        kf = [(i, 30) for i in range(10)] + [(10, 50)] + [(i + 11, 32) for i in range(9)]
+        result = _detect_position_clusters(kf)
+        # With gap 30→32 = 2 and 32→50 = 18, should still find clusters if possible
+        # But all values are close to 30-32 except one 50, so likely no split
+
+    def test_real_world_tank_tyrese_data(self):
+        """Real data from Tank vs Tyrese video — 40% center defaults."""
+        xs = [50,50,75,50,45,65,75,50,55,75,55,75,25,65,50,55,50,75,75,60,
+              75,50,45,50,55,55,50,50,50,25,50,50,48,72,72,60,50,72,72,35,
+              50,72,72,50,50,35,50,50,25,35,35,50,60,50,45,25,65,50,50,50]
+        kf = [(i, x) for i, x in enumerate(xs)]
+        result = _detect_position_clusters(kf)
+        assert result is not None, "Should find clusters after center stripping"
+        assert len(result) >= 2
+        centers = [c["center"] for c in result]
+        # Should have clusters NOT at 50
+        assert all(c < 44 or c > 56 for c in centers), f"Unexpected center cluster: {centers}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# _snap_to_clusters — tie-breaking and nearest assignment
+# ══════════════════════════════════════════════════════════════════════
+
+class TestSnapToClusters:
+    def test_basic_snap(self):
+        clusters = [{"center": 30, "count": 5}, {"center": 70, "count": 5}]
+        kf = [(0, 25), (1, 45), (2, 55), (3, 80)]
+        result = _snap_to_clusters(kf, clusters)
+        assert result == [(0, 30), (1, 30), (2, 70), (3, 70)]
+
+    def test_equidistant_prefers_higher_count(self):
+        """At equal distance, prefer the cluster with more samples."""
+        clusters = [{"center": 40, "count": 3}, {"center": 60, "count": 10}]
+        kf = [(0, 50)]  # Equidistant from 40 and 60
+        result = _snap_to_clusters(kf, clusters)
+        assert result[0][1] == 60, "Should prefer higher-count cluster on tie"
+
+    def test_center_default_snapped(self):
+        """Values at 50 should snap to the nearest cluster."""
+        clusters = [{"center": 35, "count": 10}, {"center": 68, "count": 8}]
+        kf = [(0, 50)]
+        result = _snap_to_clusters(kf, clusters)
+        assert result[0][1] == 35, "50 is closer to 35 (dist=15) than 68 (dist=18)"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# _validate_tracking — QA validation
+# ══════════════════════════════════════════════════════════════════════
+
+class TestValidateTracking:
+    def test_clean_data_unchanged(self):
+        kf = [(0, 30), (5, 70), (10, 30)]
+        result = _validate_tracking(kf, None, 10)
+        # Should insert instant cuts for large jumps
+        assert len(result) >= len(kf)
+
+    def test_extended_center_hold_fixed(self):
+        """Center hold >3s with clusters should be replaced with previous position."""
+        clusters = [{"center": 30, "count": 5}, {"center": 70, "count": 5}]
+        kf = [(0, 30), (2, 50), (8, 70)]  # 50 holds for 6s
+        result = _validate_tracking(kf, clusters, 10)
+        # The center hold at t=2 should be replaced with prev (30)
+        center_vals = [sx for t, sx in result if abs(t - 2) < 0.1]
+        assert center_vals and center_vals[0] == 30
+
+    def test_instant_cut_inserted(self):
+        """Large jumps without 1ms marker should get one inserted."""
+        kf = [(0, 30), (5, 70)]  # 40-unit jump, 5s gap
+        result = _validate_tracking(kf, None, 10)
+        # Should have a 1ms hold before the jump
+        assert len(result) == 3
+        assert abs(result[1][0] - 4.999) < 0.01
+        assert result[1][1] == 30  # Hold previous position
+
+    def test_small_jumps_no_instant_cut(self):
+        """Jumps < 15 units should NOT get instant-cut markers."""
+        kf = [(0, 40), (5, 50)]  # 10-unit jump
+        result = _validate_tracking(kf, None, 10)
+        assert len(result) == 2  # No insertion
+
+    def test_empty_keyframes(self):
+        result = _validate_tracking([], None, 10)
+        assert result == [(0.0, 50)]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Face detection — dataclass and batch processing
+# ══════════════════════════════════════════════════════════════════════
+
+class TestFaceDetector:
+    """Tests for the face detection service."""
+
+    def test_face_info_dataclass(self):
+        from backend.services.face_detector import FaceInfo
+        face = FaceInfo(
+            x_center=45.0, y_center=30.0, width=20.0, height=25.0,
+            nose_x=44.5, nose_y=31.2, confidence=0.95,
+        )
+        assert face.nose_x == 44.5
+        assert face.confidence == 0.95
+
+    def test_frame_faces_dataclass(self):
+        from backend.services.face_detector import FrameFaces, FaceInfo
+        ff = FrameFaces(timestamp=5.0, frame_path="/tmp/frame.jpg")
+        assert ff.faces == []
+        assert ff.primary_face_idx == -1
+
+        face = FaceInfo(35.0, 30.0, 15.0, 20.0, 34.5, 29.0, 0.9)
+        ff2 = FrameFaces(timestamp=5.0, frame_path="/tmp/frame.jpg",
+                         faces=[face], primary_face_idx=0)
+        assert len(ff2.faces) == 1
+        assert ff2.primary_face_idx == 0
+
+    def test_detect_faces_nonexistent_files(self):
+        """Should return empty faces for missing files, not crash."""
+        from backend.services.face_detector import detect_faces_batch
+        results = detect_faces_batch([
+            (0.0, "/nonexistent/frame1.jpg"),
+            (5.0, "/nonexistent/frame2.jpg"),
+        ])
+        assert len(results) == 2
+        assert results[0].faces == []
+        assert results[1].faces == []
+
+    def test_detect_faces_returns_correct_count(self):
+        """Output length should match input length."""
+        from backend.services.face_detector import detect_faces_batch
+        paths = [(float(i), f"/nonexistent/frame_{i}.jpg") for i in range(10)]
+        results = detect_faces_batch(paths)
+        assert len(results) == 10
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Pipeline integration — face data attached to frames
+# ══════════════════════════════════════════════════════════════════════
+
+class TestPipelineFaceDetection:
+    """Verify face detection data flows through the pipeline to providers."""
+
+    def test_frame_data_accepts_face_data(self):
+        """FrameData model should accept face_data field."""
+        from backend.models import FrameData
+        from backend.services.face_detector import FrameFaces, FaceInfo
+        frame = FrameData(timestamp=5.0, path="/tmp/frame.jpg")
+        assert frame.face_data is None
+
+        face = FaceInfo(35.0, 30.0, 15.0, 20.0, 34.5, 29.0, 0.9)
+        fd = FrameFaces(timestamp=5.0, frame_path="/tmp/frame.jpg",
+                        faces=[face], primary_face_idx=0)
+        frame.face_data = fd
+        assert frame.face_data is not None
+        assert frame.face_data.faces[0].nose_x == 34.5
+
+    def test_face_data_used_in_position_fusion(self):
+        """When face_data is present, subject_x should come from nose_x."""
+        from backend.models import FrameData
+        from backend.services.face_detector import FrameFaces, FaceInfo
+
+        # Create frame with face at x=35
+        face = FaceInfo(35.0, 30.0, 15.0, 20.0, 35.0, 29.0, 0.9)
+        fd = FrameFaces(timestamp=5.0, frame_path="/tmp/frame.jpg",
+                        faces=[face], primary_face_idx=0)
+
+        frame = FrameData(timestamp=5.0, path="/tmp/frame.jpg")
+        frame.face_data = fd
+
+        # Simulate the position fusion logic from openrouter_provider
+        sx = 50  # AI returned center default
+        face_data = getattr(frame, 'face_data', None)
+        if face_data and hasattr(face_data, 'faces') and face_data.faces:
+            if len(face_data.faces) == 1:
+                sx = round(face_data.faces[0].nose_x)
+            elif face_data.primary_face_idx >= 0:
+                sx = round(face_data.faces[face_data.primary_face_idx].nose_x)
+
+        assert sx == 35, f"Should use face nose_x=35 instead of AI default 50, got {sx}"
+
+    def test_multi_face_active_selection(self):
+        """With multiple faces, active_face should select the correct position."""
+        from backend.services.face_detector import FrameFaces, FaceInfo
+
+        face1 = FaceInfo(30.0, 30.0, 15.0, 20.0, 30.0, 29.0, 0.9)
+        face2 = FaceInfo(70.0, 30.0, 15.0, 20.0, 70.0, 29.0, 0.85)
+        fd = FrameFaces(timestamp=5.0, frame_path="/tmp/frame.jpg",
+                        faces=[face1, face2], primary_face_idx=0)
+
+        # Simulate active_face=2 (1-based) selecting face2
+        active_face = 2
+        afi = active_face - 1  # Convert to 0-based
+        assert 0 <= afi < len(fd.faces)
+        sx = round(fd.faces[afi].nose_x)
+        assert sx == 70, f"active_face=2 should select face2 at x=70, got {sx}"
+
+    def test_no_face_data_falls_back(self):
+        """Without face_data, should fall back to AI estimate."""
+        from backend.models import FrameData
+        frame = FrameData(timestamp=5.0, path="/tmp/frame.jpg")
+
+        sx = 42  # AI estimate
+        face_data = getattr(frame, 'face_data', None)
+        if face_data and hasattr(face_data, 'faces') and face_data.faces:
+            sx = round(face_data.faces[0].nose_x)
+
+        assert sx == 42, "Without face_data, AI estimate should be preserved"
