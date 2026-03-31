@@ -87,8 +87,28 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             detections = cascade.detectMultiScale(
                 gray, scaleFactor=1.1, minNeighbors=5,
-                minSize=(int(w * 0.05), int(h * 0.05)),
+                minSize=(30, 30),
             )
+            # NMS: remove overlapping detections (IoU > 0.3) to prevent
+            # merged bounding boxes spanning multiple faces
+            if len(detections) > 1:
+                dets = sorted(detections.tolist() if hasattr(detections, 'tolist') else list(detections),
+                              key=lambda f: f[2] * f[3], reverse=True)
+                kept = [dets[0]]
+                for det in dets[1:]:
+                    x1, y1, w1, h1 = det
+                    overlaps = False
+                    for kx, ky, kw, kh in kept:
+                        ix1 = max(x1, kx); iy1 = max(y1, ky)
+                        ix2 = min(x1+w1, kx+kw); iy2 = min(y1+h1, ky+kh)
+                        inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+                        union = w1*h1 + kw*kh - inter
+                        if union > 0 and inter / union > 0.3:
+                            overlaps = True
+                            break
+                    if not overlaps:
+                        kept.append(det)
+                detections = kept
             for (x, y, fw, fh) in detections:
                 cx = (x + fw / 2) / w * 100
                 cy = (y + fh / 2) / h * 100

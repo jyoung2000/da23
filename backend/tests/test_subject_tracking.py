@@ -973,6 +973,35 @@ class TestDetectPositionClusters:
         # Should have clusters NOT at 50
         assert all(c < 44 or c > 56 for c in centers), f"Unexpected center cluster: {centers}"
 
+    def test_midpoint_cluster_rejected(self):
+        """A cluster near the midpoint of its neighbors with fewer samples is rejected."""
+        # Left=30 (10 samples), midpoint=55 (5 samples), right=80 (10 samples)
+        # Midpoint of 30 and 80 = 55. Distance 0, span 50. 0 < 50*0.3=15 ✓
+        # count(55)=5 < max(10,10)=10 ✓ → REJECTED
+        kf = (
+            [(i, 30) for i in range(10)]
+            + [(i + 10, 55) for i in range(5)]
+            + [(i + 15, 80) for i in range(10)]
+        )
+        result = _detect_position_clusters(kf)
+        assert result is not None
+        assert len(result) == 2, f"Expected 2 clusters (midpoint rejected), got {len(result)}: {result}"
+        centers = [c["center"] for c in result]
+        assert 50 not in centers and 55 not in centers, f"Midpoint cluster should be gone: {centers}"
+
+    def test_real_cluster_not_rejected(self):
+        """A cluster between neighbors with MORE samples should NOT be rejected."""
+        # Left=20 (3 samples), middle=50 (15 samples), right=80 (3 samples)
+        # count(50)=15 > max(3,3)=3 → NOT rejected
+        kf = (
+            [(i, 20) for i in range(3)]
+            + [(i + 3, 50) for i in range(15)]
+            + [(i + 18, 80) for i in range(3)]
+        )
+        result = _detect_position_clusters(kf)
+        assert result is not None
+        assert len(result) == 3, f"Expected 3 clusters (all real), got {len(result)}: {result}"
+
 
 # ══════════════════════════════════════════════════════════════════════
 # _snap_to_clusters — tie-breaking and nearest assignment

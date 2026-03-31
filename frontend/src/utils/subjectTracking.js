@@ -206,8 +206,6 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
     if (clusters.length < 2) return null;
     const result = clusters
       .map(values => {
-        // Trimmed mean: remove top/bottom 10% before averaging.
-        // More accurate than median for centering while still robust to outliers.
         const sorted = [...values].sort((a, b) => a - b);
         const trim = Math.max(1, Math.floor(sorted.length * 0.1));
         const trimmed = sorted.length > 2 ? sorted.slice(trim, sorted.length - trim) : sorted;
@@ -219,6 +217,21 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
       .sort((a, b) => a.center - b.center);
     for (let i = 1; i < result.length; i++) {
       if (result[i].center - result[i - 1].center < 8) return null;
+    }
+    // ── Midpoint cluster rejection ──
+    // A cluster near the midpoint between its neighbors with fewer samples
+    // is likely an averaging artifact (e.g., merged face detection spanning
+    // both speakers). Remove it.
+    if (result.length >= 3) {
+      for (let i = result.length - 2; i >= 1; i--) {
+        const mid = (result[i - 1].center + result[i + 1].center) / 2;
+        const span = result[i + 1].center - result[i - 1].center;
+        if (Math.abs(result[i].center - mid) < span * 0.3 &&
+            result[i].count < Math.max(result[i - 1].count, result[i + 1].count)) {
+          result.splice(i, 1);
+        }
+      }
+      if (result.length < 2) return null;
     }
     return result;
   }

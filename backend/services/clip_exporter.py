@@ -2245,8 +2245,6 @@ def _detect_position_clusters(
     def _build_result(clusters):
         if len(clusters) < 2:
             return None
-        # Trimmed mean: remove top/bottom 10% for more accurate centering.
-        # Matches frontend buildResult() exactly.
         result = []
         for v in clusters:
             sv = sorted(v)
@@ -2257,6 +2255,16 @@ def _detect_position_clusters(
         result.sort(key=lambda c: c["center"])
         for i in range(1, len(result)):
             if result[i]["center"] - result[i - 1]["center"] < 8:
+                return None
+        # Midpoint cluster rejection — matches frontend exactly
+        if len(result) >= 3:
+            for i in range(len(result) - 2, 0, -1):
+                mid = (result[i - 1]["center"] + result[i + 1]["center"]) / 2
+                span = result[i + 1]["center"] - result[i - 1]["center"]
+                if (abs(result[i]["center"] - mid) < span * 0.3 and
+                        result[i]["count"] < max(result[i - 1]["count"], result[i + 1]["count"])):
+                    result.pop(i)
+            if len(result) < 2:
                 return None
         return result
 

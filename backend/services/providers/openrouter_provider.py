@@ -764,9 +764,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         sem = asyncio.Semaphore(2)
 
         # Track consecutive non-retryable failures (403 auth/billing, 401 unauthorized).
-        # When ALL models fail with the same error, further batches will too — abort early.
         _consecutive_auth_failures = 0
-        _AUTH_FAILURE_ABORT_THRESHOLD = 2  # Abort after 2 consecutive auth/billing failures
+        _AUTH_FAILURE_ABORT_THRESHOLD = 2
+        # Temporal continuity: track previous frame's subject_x for multi-face fallback
+        _prev_sx = 50
 
         async def _analyze_batch(batch, batch_idx, _depth=0):
             nonlocal _consecutive_auth_failures
@@ -900,15 +901,14 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     desc_text = item.get("description", "")
 
                     # ── Position fusion: prefer face detection over AI estimate ──
+                    nonlocal _prev_sx
                     fd = getattr(frame_ref, 'face_data', None)
                     if fd and hasattr(fd, 'faces') and fd.faces:
-                        # Resolve active face index (1-based "active_face" or 0-based "active_face_index")
                         afi = -1
                         af_val = item.get("active_face") or item.get("active_face_index")
                         if af_val is not None:
                             try:
                                 af_int = int(af_val)
-                                # 1-based (active_face) if > 0, 0-based (active_face_index) if schema used
                                 afi = af_int - 1 if af_int > 0 else af_int
                             except (ValueError, TypeError):
                                 pass
@@ -916,13 +916,23 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             sx = round(fd.faces[afi].nose_x)
                         elif len(fd.faces) == 1:
                             sx = round(fd.faces[0].nose_x)
-                        elif fd.primary_face_idx >= 0:
-                            sx = round(fd.faces[fd.primary_face_idx].nose_x)
+                        elif len(fd.faces) >= 2:
+                            # Temporal continuity: pick face closest to previous
+                            # frame's position ("hold on current speaker")
+                            best_f = min(fd.faces, key=lambda f: abs(f.nose_x - _prev_sx))
+                            sx = round(best_f.nose_x)
+                        # Midpoint snap: if sx is far from all detected faces,
+                        # it's likely a merged detection — snap to nearest face
+                        if len(fd.faces) >= 2:
+                            face_xs = [round(f.nose_x) for f in fd.faces]
+                            if min(abs(sx - fx) for fx in face_xs) > 10:
+                                sx = min(face_xs, key=lambda fx: abs(fx - sx))
                     elif sx == 50 and desc_text:
                         # No face data — fall back to text extraction
                         text_sx = _extract_position_from_text(desc_text)
                         if text_sx is not None:
                             sx = text_sx
+                    _prev_sx = sx  # Update temporal continuity tracker
                     active_sx = item.get("active_speaker_x")
                     if active_sx is not None:
                         try:
