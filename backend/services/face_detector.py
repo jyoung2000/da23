@@ -1,32 +1,15 @@
-"""Lightweight face detection using MediaPipe BlazeFace.
+"""Lightweight face detection for subject tracking.
 
-Runs on CPU — no GPU competition with Ollama/Whisper.
-Processes 60 frames in ~0.5 seconds.
-Returns pixel-accurate face positions for subject tracking.
+Uses OpenCV's DNN face detector (always available) with optional MediaPipe
+upgrade. Runs on CPU — no GPU competition with Ollama/Whisper.
+Processes 60 frames in ~1-2 seconds.
 """
 import logging
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Lazy-load mediapipe to avoid import errors when not installed
-_mp = None
-_cv2 = None
-
-
-def _ensure_deps():
-    global _mp, _cv2
-    if _mp is None:
-        try:
-            import mediapipe as mp
-            import cv2
-            _mp = mp
-            _cv2 = cv2
-        except ImportError:
-            raise ImportError(
-                "Face detection requires mediapipe and opencv-python-headless. "
-                "Install with: pip install mediapipe opencv-python-headless"
-            )
 
 
 @dataclass
@@ -36,8 +19,8 @@ class FaceInfo:
     y_center: float      # Vertical center of face bbox, 0-100
     width: float          # Face bbox width as % of frame
     height: float         # Face bbox height as % of frame
-    nose_x: float         # Nose tip x position, 0-100
-    nose_y: float         # Nose tip y position, 0-100
+    nose_x: float         # Best estimate of face center x, 0-100
+    nose_y: float         # Best estimate of face center y, 0-100
     confidence: float     # Detection confidence, 0-1
 
 
@@ -50,26 +33,121 @@ class FrameFaces:
     primary_face_idx: int = -1  # Index of largest/most-prominent face
 
 
-def detect_faces_batch(
-    frame_paths: list[tuple[float, str]],
-    min_confidence: float = 0.5,
-) -> list[FrameFaces]:
-    """Detect faces in a batch of extracted frames using MediaPipe.
+def _detect_with_opencv_dnn(frame_paths, min_confidence):
+    """Detect faces using OpenCV's built-in DNN face detector.
 
-    Args:
-        frame_paths: List of (timestamp, file_path) tuples
-        min_confidence: Minimum detection confidence (0-1)
-
-    Returns:
-        List of FrameFaces, one per input frame
+    Uses the Yunet or Haar cascade detector that ships with OpenCV.
+    No extra downloads needed.
     """
-    _ensure_deps()
-    mp = _mp
-    cv2 = _cv2
+    import cv2
+
     results = []
 
-    with mp.solutions.face_detection.FaceDetection(
-        model_selection=1,  # Full-range model (works at any distance)
+    # Try DNN face detector first (more accurate), fall back to Haar cascade
+    detector = None
+    try:
+        # OpenCV 4.5.4+ has FaceDetectorYN
+        detector = cv2.FaceDetectorYN.create(
+            "",  # Empty string uses built-in model
+            "",
+            (300, 300),
+            min_confidence,
+        )
+    except (cv2.error, AttributeError):
+        pass
+
+    use_haar = detector is None
+
+    if use_haar:
+        # Haar cascade fallback — always available in OpenCV
+        cascade_paths = [
+            os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"),
+            os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_alt2.xml"),
+        ]
+        cascade_path = next((p for p in cascade_paths if os.path.exists(p)), None)
+        if not cascade_path:
+            logger.warning("No Haar cascade file found — face detection disabled")
+            return None
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            logger.warning("Failed to load Haar cascade — face detection disabled")
+            return None
+        logger.info("Using OpenCV Haar cascade face detector")
+
+    for timestamp, path in frame_paths:
+        img = cv2.imread(str(path))
+        if img is None:
+            results.append(FrameFaces(timestamp=timestamp, frame_path=str(path)))
+            continue
+
+        h, w = img.shape[:2]
+        faces: list[FaceInfo] = []
+
+        if use_haar:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            detections = cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5,
+                minSize=(int(w * 0.05), int(h * 0.05)),
+            )
+            for (x, y, fw, fh) in detections:
+                cx = (x + fw / 2) / w * 100
+                cy = (y + fh / 2) / h * 100
+                fw_pct = fw / w * 100
+                fh_pct = fh / h * 100
+                faces.append(FaceInfo(
+                    x_center=round(cx, 1), y_center=round(cy, 1),
+                    width=round(fw_pct, 1), height=round(fh_pct, 1),
+                    nose_x=round(cx, 1), nose_y=round(cy, 1),
+                    confidence=0.8,  # Haar doesn't provide confidence
+                ))
+
+        primary = -1
+        if faces:
+            primary = max(range(len(faces)), key=lambda i: faces[i].width * faces[i].height)
+
+        results.append(FrameFaces(
+            timestamp=timestamp, frame_path=str(path),
+            faces=faces, primary_face_idx=primary,
+        ))
+
+    return results
+
+
+def _detect_with_mediapipe(frame_paths, min_confidence):
+    """Detect faces using MediaPipe — more accurate than Haar cascade.
+
+    Handles both the legacy solutions API and newer API variants.
+    """
+    import mediapipe as mp
+    import cv2
+
+    # Try to find the right API
+    face_detection_module = None
+    FaceKeyPoint = None
+
+    # Method 1: Legacy solutions API (mediapipe < 0.10.8)
+    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_detection'):
+        face_detection_module = mp.solutions.face_detection
+        FaceKeyPoint = face_detection_module.FaceKeyPoint
+
+    # Method 2: Direct import (some versions)
+    if face_detection_module is None:
+        try:
+            from mediapipe.python.solutions import face_detection as fd_mod
+            face_detection_module = fd_mod
+            FaceKeyPoint = fd_mod.FaceKeyPoint
+        except (ImportError, AttributeError):
+            pass
+
+    if face_detection_module is None:
+        logger.warning("MediaPipe face_detection API not available in this version")
+        return None
+
+    results = []
+    get_key_point = getattr(face_detection_module, 'get_key_point', None)
+
+    with face_detection_module.FaceDetection(
+        model_selection=1,
         min_detection_confidence=min_confidence,
     ) as detector:
         for timestamp, path in frame_paths:
@@ -79,68 +157,103 @@ def detect_faces_batch(
                 continue
 
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            detection_result = detector.process(rgb)
+            det_result = detector.process(rgb)
 
             faces: list[FaceInfo] = []
-            if detection_result.detections:
-                for det in detection_result.detections:
+            if det_result.detections:
+                for det in det_result.detections:
                     bbox = det.location_data.relative_bounding_box
-                    face_cx = (bbox.xmin + bbox.width / 2) * 100
-                    face_cy = (bbox.ymin + bbox.height / 2) * 100
-                    face_w = bbox.width * 100
-                    face_h = bbox.height * 100
+                    cx = (bbox.xmin + bbox.width / 2) * 100
+                    cy = (bbox.ymin + bbox.height / 2) * 100
+                    fw = bbox.width * 100
+                    fh = bbox.height * 100
 
-                    # Nose tip is the most accurate face center indicator
-                    nose = mp.solutions.face_detection.get_key_point(
-                        det, mp.solutions.face_detection.FaceKeyPoint.NOSE_TIP,
-                    )
-                    nose_x = nose.x * 100 if nose else face_cx
-                    nose_y = nose.y * 100 if nose else face_cy
+                    # Try to get nose tip for more accurate face center
+                    nose_x, nose_y = cx, cy
+                    if get_key_point and FaceKeyPoint:
+                        try:
+                            nose = get_key_point(det, FaceKeyPoint.NOSE_TIP)
+                            if nose:
+                                nose_x = nose.x * 100
+                                nose_y = nose.y * 100
+                        except Exception:
+                            pass
 
                     conf = det.score[0] if det.score else 0.0
                     faces.append(FaceInfo(
-                        x_center=round(face_cx, 1),
-                        y_center=round(face_cy, 1),
-                        width=round(face_w, 1),
-                        height=round(face_h, 1),
-                        nose_x=round(nose_x, 1),
-                        nose_y=round(nose_y, 1),
+                        x_center=round(cx, 1), y_center=round(cy, 1),
+                        width=round(fw, 1), height=round(fh, 1),
+                        nose_x=round(nose_x, 1), nose_y=round(nose_y, 1),
                         confidence=round(conf, 3),
                     ))
 
-            # Primary face = largest by area
-            primary_idx = -1
+            primary = -1
             if faces:
-                primary_idx = max(
-                    range(len(faces)),
-                    key=lambda i: faces[i].width * faces[i].height,
-                )
+                primary = max(range(len(faces)), key=lambda i: faces[i].width * faces[i].height)
 
             results.append(FrameFaces(
                 timestamp=timestamp, frame_path=str(path),
-                faces=faces, primary_face_idx=primary_idx,
+                faces=faces, primary_face_idx=primary,
             ))
 
-    # Log summary
-    total_faces = sum(len(ff.faces) for ff in results)
-    frames_with_faces = sum(1 for ff in results if ff.faces)
-    multi_face = sum(1 for ff in results if len(ff.faces) >= 2)
+    return results
+
+
+def detect_faces_batch(
+    frame_paths: list[tuple[float, str]],
+    min_confidence: float = 0.5,
+) -> list[FrameFaces]:
+    """Detect faces in extracted frames.
+
+    Tries MediaPipe first (more accurate), falls back to OpenCV Haar cascade.
+    Returns list of FrameFaces, one per input frame.
+    """
+    # Try MediaPipe first
+    try:
+        results = _detect_with_mediapipe(frame_paths, min_confidence)
+        if results is not None:
+            logger.info("Face detection using MediaPipe")
+            _log_summary(results)
+            return results
+    except Exception as e:
+        logger.info("MediaPipe face detection unavailable (%s), trying OpenCV", e)
+
+    # Fall back to OpenCV
+    try:
+        results = _detect_with_opencv_dnn(frame_paths, min_confidence)
+        if results is not None:
+            logger.info("Face detection using OpenCV Haar cascade")
+            _log_summary(results)
+            return results
+    except Exception as e:
+        logger.warning("OpenCV face detection failed: %s", e)
+
+    # Both failed — return empty results (graceful degradation)
+    logger.warning("All face detection methods failed — using AI estimates only")
+    return [
+        FrameFaces(timestamp=ts, frame_path=str(p))
+        for ts, p in frame_paths
+    ]
+
+
+def _log_summary(results: list[FrameFaces]):
+    """Log face detection summary statistics."""
+    total = sum(len(r.faces) for r in results)
+    with_faces = sum(1 for r in results if r.faces)
+    multi = sum(1 for r in results if len(r.faces) >= 2)
     logger.info(
         "Face detection: %d/%d frames have faces (%d total, %d multi-face)",
-        frames_with_faces, len(results), total_faces, multi_face,
+        with_faces, len(results), total, multi,
     )
 
-    if frames_with_faces > 0:
-        all_nose_x = [
-            ff.faces[ff.primary_face_idx].nose_x
-            for ff in results if ff.faces and ff.primary_face_idx >= 0
-        ]
-        if all_nose_x:
-            logger.info(
-                "Face positions (nose_x): min=%.0f, max=%.0f, mean=%.1f, unique=%d",
-                min(all_nose_x), max(all_nose_x),
-                sum(all_nose_x) / len(all_nose_x),
-                len(set(round(x) for x in all_nose_x)),
-            )
-
-    return results
+    nose_xs = [
+        r.faces[r.primary_face_idx].nose_x
+        for r in results if r.faces and r.primary_face_idx >= 0
+    ]
+    if nose_xs:
+        logger.info(
+            "Face positions (nose_x): min=%.0f, max=%.0f, mean=%.1f, unique=%d",
+            min(nose_xs), max(nose_xs),
+            sum(nose_xs) / len(nose_xs),
+            len(set(round(x) for x in nose_xs)),
+        )
