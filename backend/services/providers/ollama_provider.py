@@ -1540,25 +1540,23 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                                 "Ollama frame %d: extracted subject_x=%d from free text (no JSON)",
                                 fi, subject_x,
                             )
-                    # ── Face data fusion: prefer detection over AI estimate ──
+                    # ── Face Registry Fusion ──
                     fd = getattr(frame, 'face_data', None)
-                    if fd and hasattr(fd, 'faces') and fd.faces:
+                    registry = getattr(frame, 'face_registry', None)
+                    if registry and registry.multi_speaker and fd and hasattr(fd, 'faces') and fd.faces:
+                        # Map AI's subject_x to nearest face slot
+                        slot = registry.nearest_slot(subject_x)
+                        if slot:
+                            # Use actual face position from this frame
+                            best_face = min(fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
+                            subject_x = round(best_face.nose_x)
+                    elif fd and hasattr(fd, 'faces') and fd.faces:
                         if len(fd.faces) == 1:
                             subject_x = round(fd.faces[0].nose_x)
                         elif len(fd.faces) >= 2:
-                            face_xs = [round(f.nose_x) for f in fd.faces]
-                            nearest = min(face_xs, key=lambda fx: abs(fx - subject_x))
-                            if abs(nearest - subject_x) <= 15:
-                                subject_x = nearest
-                            else:
-                                subject_x = min(face_xs, key=lambda fx: abs(fx - _prev_sx))
-
-                            # Midpoint snap: if subject_x is between faces and far from all
-                            min_dist = min(abs(subject_x - fx) for fx in face_xs)
-                            if min_dist > 10:
-                                subject_x = min(face_xs, key=lambda fx: abs(fx - subject_x))
+                            nearest = min(fd.faces, key=lambda f: abs(f.nose_x - _prev_sx))
+                            subject_x = round(nearest.nose_x)
                     elif subject_x == 50 and _prev_sx != 50:
-                        # No face data AND center default → hold previous position
                         subject_x = _prev_sx
 
                     _prev_sx = subject_x
@@ -1655,14 +1653,20 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     else:
                         # Use face detection position if available, else neighbor
                         _fd = getattr(frame, 'face_data', None)
+                        _reg = getattr(frame, 'face_registry', None)
                         fallback_sx = None
-                        if _fd and hasattr(_fd, 'faces') and _fd.faces:
+                        if _reg and _reg.multi_speaker and _fd and hasattr(_fd, 'faces') and _fd.faces:
+                            # Registry mode: snap to nearest slot
+                            slot = _reg.nearest_slot(_prev_sx)
+                            if slot:
+                                best = min(_fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
+                                fallback_sx = round(best.nose_x)
+                        elif _fd and hasattr(_fd, 'faces') and _fd.faces:
                             if len(_fd.faces) == 1:
                                 fallback_sx = round(_fd.faces[0].nose_x)
                             elif _fd.primary_face_idx >= 0:
                                 fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
                             elif len(_fd.faces) >= 2:
-                                # Pick face closest to previous position
                                 fallback_sx = round(min(_fd.faces, key=lambda f: abs(f.nose_x - _prev_sx)).nose_x)
                         if fallback_sx is None:
                             fallback_sx = 50
@@ -1762,13 +1766,19 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         next_ts = scenes[j].timestamp
                         break
 
-                # Prefer face detection data over interpolation
+                # Prefer face registry → face detection → interpolation
                 _fd = getattr(frame, 'face_data', None)
-                if _fd and hasattr(_fd, 'faces') and _fd.faces:
+                _reg = getattr(frame, 'face_registry', None)
+                if _reg and _reg.multi_speaker and _fd and hasattr(_fd, 'faces') and _fd.faces:
+                    slot = _reg.nearest_slot(prev_sx if prev_sx is not None else 50)
+                    if slot:
+                        best = min(_fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
+                        interp_sx = round(best.nose_x)
+                    else:
+                        interp_sx = round(_fd.faces[0].nose_x)
+                elif _fd and hasattr(_fd, 'faces') and _fd.faces:
                     if len(_fd.faces) == 1:
                         interp_sx = round(_fd.faces[0].nose_x)
-                    elif _fd.primary_face_idx >= 0:
-                        interp_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
                     elif prev_sx is not None:
                         interp_sx = round(min(_fd.faces, key=lambda f: abs(f.nose_x - prev_sx)).nose_x)
                     else:

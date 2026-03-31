@@ -973,6 +973,7 @@ async def _run_analysis_inner(job_id: str):
     # ── Face detection (CPU-only, ~0.5s for 60 frames) ──
     # Runs pixel-accurate face detection on extracted frames to augment
     # the AI vision model's subject_x estimates. No GPU needed.
+    face_registry = None
     if settings.SUBJECT_TRACKING_ENABLED:
         try:
             from backend.services.face_detector import detect_faces_batch
@@ -984,6 +985,21 @@ async def _run_analysis_inner(job_id: str):
                 frame.face_data = face_data
             faces_found = sum(1 for fd in face_results if fd.faces)
             logger.info("[%s] Face detection complete: %d/%d frames have faces", job_id, faces_found, len(frames))
+
+            # Build face registry — stable face slots from detection data
+            from backend.services.face_registry import build_face_registry
+            face_registry = build_face_registry(face_results)
+            for frame in frames:
+                frame.face_registry = face_registry
+
+            if face_registry.multi_speaker:
+                logger.info(
+                    "[%s] Multi-speaker face registry: %d face slots (%s)",
+                    job_id,
+                    len(face_registry.slots),
+                    ", ".join(f"slot{s.slot_id}@{s.x_center:.0f}%" for s in face_registry.slots),
+                )
+
             # Face detection is complete — all OpenCV resources released.
             import gc
             gc.collect()
@@ -1390,6 +1406,34 @@ async def _run_analysis_inner(job_id: str):
                 logger.exception("[%s] Scene analysis failed, continuing with empty scenes", job_id)
             scenes_result = []
             provider = "none"
+
+        # ── Face registry consistency check ──
+        # After AI + face fusion produces subject_x values, validate every
+        # value against the face registry and snap outliers to the nearest
+        # known face position. This eliminates dead-zone values.
+        if face_registry and face_registry.multi_speaker and scenes_result:
+            slot_centers = [s.x_center for s in face_registry.slots]
+            corrected = 0
+            for scene in scenes_result:
+                sx = scene.subject_x
+                min_dist_to_slot = min(abs(sx - sc) for sc in slot_centers)
+                if min_dist_to_slot > 12:
+                    nearest = round(min(slot_centers, key=lambda sc: abs(sc - sx)))
+                    scene.subject_x = nearest
+                    corrected += 1
+            if corrected > 0:
+                logger.info(
+                    "[%s] Face consistency check: corrected %d/%d scenes (snapped to registry slots)",
+                    job_id, corrected, len(scenes_result),
+                )
+            final_sxs = [s.subject_x for s in scenes_result]
+            final_dist: dict[int, int] = {}
+            for sx in final_sxs:
+                final_dist[sx] = final_dist.get(sx, 0) + 1
+            logger.info(
+                "[SubjectTracking] Post-correction distribution: %s",
+                dict(sorted(final_dist.items())),
+            )
 
         await database.update_job_status(
             job_id,

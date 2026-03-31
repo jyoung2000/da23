@@ -890,25 +890,28 @@ export default function VideoEditor({
     if (!scenes?.length) return { mode: 'no-data', label: 'No AI data', color: '#f59e0b' };
     if (!subjectKeyframes?.length) return { mode: 'error', label: 'Tracking failed', color: '#ef4444' };
     if (hasDynamicSubject) {
-      // Check for multi-position (N-speaker) mode
       const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd,
         isCrop ? srcRatio : null, isCrop ? targetRatio : null);
       const clusters = detectPositionClusters(raw);
       if (clusters && clusters.length >= 2) {
-        const positions = clusters.map(c => `${c.center}%`).join(' ');
+        const positions = clusters.map(c => `${c.center}%`).join(' \u2194 ');
         return {
           mode: 'multi',
-          label: `${clusters.length}-position tracking (${positions})`,
+          label: `Face tracked \u00b7 ${clusters.length} speakers (${positions})`,
           color: '#10b981',
         };
       }
-      return { mode: 'dynamic', label: `Tracking (${subjectKeyframes.length} pts)`, color: '#10b981' };
+      return {
+        mode: 'dynamic',
+        label: `Face tracked \u00b7 ${subjectKeyframes.length} keyframes`,
+        color: '#10b981',
+      };
     }
     const sx = subjectKeyframes[0].x;
     if (Math.abs(sx - 50) < 3) {
       return { mode: 'center', label: 'Centered', color: '#6b7280' };
     }
-    return { mode: 'static', label: 'Face tracked', color: '#10b981' };
+    return { mode: 'static', label: `Face tracked at ${sx}%`, color: '#10b981' };
   }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject, clipStart, clipEnd, srcRatio, targetRatio]);
 
   // ── Segment helpers ────────────────────────────────

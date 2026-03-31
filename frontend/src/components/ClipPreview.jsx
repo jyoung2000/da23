@@ -311,13 +311,17 @@ export default function ClipPreview({
     if (!scenes?.length) return { mode: 'no-data', label: 'No AI data', color: '#f59e0b' };
     if (!subjectKeyframes?.length) return { mode: 'error', label: 'Tracking failed', color: '#ef4444' };
     if (hasDynamicSubject) {
-      return { mode: 'dynamic', label: `Tracking (${subjectKeyframes.length} pts)`, color: '#10b981' };
+      return {
+        mode: 'dynamic',
+        label: `Face tracked \u00b7 ${subjectKeyframes.length} keyframes`,
+        color: '#10b981',
+      };
     }
     const sx = subjectKeyframes[0].x;
     if (Math.abs(sx - 50) < 3) {
       return { mode: 'center', label: 'Centered', color: '#6b7280' };
     }
-    return { mode: 'static', label: 'Face tracked', color: '#10b981' };
+    return { mode: 'static', label: `Face tracked at ${sx}%`, color: '#10b981' };
   }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject]);
 
   const SPEED_OPTIONS = [0.5, 1.0, 1.5, 2.0];
