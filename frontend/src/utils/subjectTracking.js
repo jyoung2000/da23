@@ -236,41 +236,52 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
     return result;
   }
 
-  // ── Pass 1: Try with all values ──
-  const result1 = buildResult(splitCluster(xs));
-  if (result1) return result1;
+  // ── Run ALL passes and pick the best result ──
+  // Pass 1 might find a midpoint phantom cluster that has MORE samples
+  // than real speaker clusters (from Haar cascade merged detections).
+  // Center stripping in Pass 2/3 removes those values and often produces
+  // a cleaner 2-cluster result that should be preferred.
 
-  // ── Pass 2: Strip center noise zone [47, 53] and retry ──
-  // Many vision models default to subject_x ≈ 50. These values bridge the
-  // natural gap between left/right speaker clusters, preventing detection.
+  const result1 = buildResult(splitCluster(xs));
+
+  // Pass 2: Strip center noise zone [47, 53]
   const CENTER_LO = 47, CENTER_HI = 53;
   const nonCenter = xs.filter(x => x < CENTER_LO || x > CENTER_HI);
   const centerCount = xs.length - nonCenter.length;
-
+  let result2 = null;
   if (centerCount > xs.length * 0.10 && nonCenter.length >= minClusterSize * 2) {
     const hasLeft = nonCenter.some(x => x < CENTER_LO);
     const hasRight = nonCenter.some(x => x > CENTER_HI);
     if (hasLeft && hasRight) {
-      const result2 = buildResult(splitCluster(nonCenter));
-      if (result2) return result2;
+      result2 = buildResult(splitCluster(nonCenter));
     }
   }
 
-  // ── Pass 3: Aggressive strip [44, 56] for soft-center values ──
+  // Pass 3: Aggressive strip [44, 56]
   const WIDE_LO = 44, WIDE_HI = 56;
   const farFromCenter = xs.filter(x => x < WIDE_LO || x > WIDE_HI);
   const wideCount = xs.length - farFromCenter.length;
-
+  let result3 = null;
   if (wideCount > xs.length * 0.15 && farFromCenter.length >= minClusterSize * 2) {
     const hasLeft = farFromCenter.some(x => x < WIDE_LO);
     const hasRight = farFromCenter.some(x => x > WIDE_HI);
     if (hasLeft && hasRight) {
-      const result3 = buildResult(splitCluster(farFromCenter));
-      if (result3) return result3;
+      result3 = buildResult(splitCluster(farFromCenter));
     }
   }
 
-  return null;
+  // Pick the best result: prefer fewer clusters (cleaner tracking),
+  // fall back to more clusters if that's all we have.
+  const candidates = [result1, result2, result3].filter(Boolean);
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    if (a.length !== b.length) return a.length - b.length;
+    const order = [result1, result2, result3];
+    return order.indexOf(a) - order.indexOf(b);
+  });
+
+  return candidates[0];
 }
 
 // Backward compat — old name delegates to new function

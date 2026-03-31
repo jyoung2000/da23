@@ -121,6 +121,20 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
                     confidence=0.8,  # Haar doesn't provide confidence
                 ))
 
+        # ── Reject merged detections ──
+        # Haar cascade sometimes detects one large box spanning multiple
+        # faces. A real face is typically 8-15% of frame width.
+        # Filter out any single detection wider than 18% that's centered.
+        MAX_FACE_WIDTH_PCT = 18.0
+        if len(faces) == 1 and faces[0].width > MAX_FACE_WIDTH_PCT:
+            if 35 < faces[0].x_center < 65:
+                logger.debug(
+                    "Frame %.1fs: rejecting merged face detection "
+                    "(width=%.1f%%, center=%.1f%% — likely two speakers)",
+                    timestamp, faces[0].width, faces[0].x_center,
+                )
+                faces = []
+
         primary = -1
         if faces:
             primary = max(range(len(faces)), key=lambda i: faces[i].width * faces[i].height)
