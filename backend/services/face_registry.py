@@ -50,6 +50,18 @@ class FaceRegistry:
                 return s
         return None
 
+    def to_dict(self) -> dict:
+        """Serialize for API response to frontend."""
+        return {
+            "slots": [
+                {"id": s.slot_id, "x": round(s.x_center), "frames": s.frame_count}
+                for s in self.slots
+            ],
+            "total_frames": self.total_frames,
+            "frames_with_faces": self.frames_with_faces,
+            "multi_speaker": self.multi_speaker,
+        }
+
 
 def build_face_registry(
     face_results: list,  # list[FrameFaces]
