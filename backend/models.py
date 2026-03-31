@@ -20,6 +20,7 @@ class FrameData(BaseModel):
     path: str
     base64: Optional[str] = None
     face_data: Optional[object] = None  # FrameFaces from face_detector (set after extraction)
+    face_registry: Optional[object] = None  # FaceRegistry from face_registry module
 
     class Config:
         arbitrary_types_allowed = True

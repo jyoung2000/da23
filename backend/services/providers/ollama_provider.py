@@ -1379,9 +1379,10 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # Track previous description for temporal context
         _prev_descriptions: list[str] = []  # last N descriptions for context
         _CONTEXT_WINDOW = 3  # number of previous descriptions to include
+        _prev_sx = 50  # Temporal continuity tracker for face fusion
 
         async def _analyze_one(fi: int, frame: FrameData):
-            nonlocal completed, stage2_consecutive_failures, stage2_aborted
+            nonlocal completed, stage2_consecutive_failures, stage2_aborted, _prev_sx
             async with sem:
                 if cancel_check:
                     cancel_check()
@@ -1424,7 +1425,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     )
                     json_suffix = _VISION_JSON_SUFFIX
 
-                prompt = ollama_vision_prompt + json_suffix
+                # ── Face detection context ──
+                face_hint = ""
+                fd = getattr(frame, 'face_data', None)
+                registry = getattr(frame, 'face_registry', None)
+                if fd and hasattr(fd, 'faces') and fd.faces:
+                    if registry and registry.multi_speaker:
+                        descs = []
+                        for face in fd.faces:
+                            slot = registry.nearest_slot(face.nose_x)
+                            if slot:
+                                descs.append(f"person{slot.slot_id+1}@x={face.nose_x:.0f}%")
+                        if descs:
+                            face_hint = f"\n{len(fd.faces)} people: {', '.join(descs)}. subject_x = x of SPEAKER."
+                    elif len(fd.faces) == 1:
+                        face_hint = f"\nFace at x={fd.faces[0].nose_x:.0f}%. Use as subject_x."
+                    else:
+                        descs = [f"face{i+1}@x={f.nose_x:.0f}%" for i, f in enumerate(fd.faces)]
+                        face_hint = f"\n{len(fd.faces)} faces: {', '.join(descs)}. subject_x = SPEAKER's x."
+
+                prompt = ollama_vision_prompt + face_hint + json_suffix
                 try:
                     _frame_t0 = _time.monotonic()
                     _cur_timeout = _adaptive_timeout()
@@ -1498,6 +1518,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                                 "Ollama frame %d: extracted subject_x=%d from free text (no JSON)",
                                 fi, subject_x,
                             )
+                    # ── Face Registry Fusion ──
+                    fd = getattr(frame, 'face_data', None)
+                    registry = getattr(frame, 'face_registry', None)
+                    if registry and registry.multi_speaker and fd and hasattr(fd, 'faces') and fd.faces:
+                        slot = registry.nearest_slot(subject_x)
+                        if slot:
+                            best_x = min((f.nose_x for f in fd.faces),
+                                         key=lambda x: abs(x - slot.x_center))
+                            subject_x = round(best_x)
+                    elif fd and hasattr(fd, 'faces') and fd.faces:
+                        if len(fd.faces) == 1:
+                            subject_x = round(fd.faces[0].nose_x)
+                        elif len(fd.faces) >= 2:
+                            nearest = min(fd.faces, key=lambda f: abs(f.nose_x - _prev_sx))
+                            subject_x = round(nearest.nose_x)
+                    elif subject_x == 50 and _prev_sx != 50:
+                        subject_x = _prev_sx
+
+                    _prev_sx = subject_x
+
                     # ── Quality validation ──
                     if description:
                         # Strip JSON fragments from non-JSON-parsed descriptions
@@ -1588,18 +1628,33 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         )
                         stage2_aborted = True
                     else:
-                        # Use neighbor subject_x instead of hardcoded 50
-                        neighbor_sx = 50
-                        for j in range(fi - 1, -1, -1):
-                            if scenes[j] is not None and scenes[j].subject_x != 50:
-                                neighbor_sx = scenes[j].subject_x
-                                break
+                        # Use face detection → registry → neighbor as fallback
+                        _fd = getattr(frame, 'face_data', None)
+                        _reg = getattr(frame, 'face_registry', None)
+                        fallback_sx = None
+                        if _reg and _reg.multi_speaker and _fd and hasattr(_fd, 'faces') and _fd.faces:
+                            slot = _reg.nearest_slot(_prev_sx)
+                            if slot:
+                                best = min(_fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
+                                fallback_sx = round(best.nose_x)
+                        elif _fd and hasattr(_fd, 'faces') and _fd.faces:
+                            if len(_fd.faces) == 1:
+                                fallback_sx = round(_fd.faces[0].nose_x)
+                            elif _fd.primary_face_idx >= 0:
+                                fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
+                        if fallback_sx is None:
+                            fallback_sx = 50
+                            for j in range(fi - 1, -1, -1):
+                                if scenes[j] is not None and scenes[j].subject_x != 50:
+                                    fallback_sx = scenes[j].subject_x
+                                    break
+                        _prev_sx = fallback_sx
                         scenes[fi] = SceneDescription(
                             timestamp=frame.timestamp,
                             description=f"Frame at {frame.timestamp:.0f}s — analysis temporarily unavailable",
                             importance_score=5,
                             thumbnail_path=frame.path,
-                            subject_x=neighbor_sx,
+                            subject_x=fallback_sx,
                         )
                 completed += 1
                 if progress_callback:

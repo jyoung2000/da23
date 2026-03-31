@@ -121,6 +121,16 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
                     confidence=0.8,  # Haar doesn't provide confidence
                 ))
 
+            # Reject merged detections: a single face wider than 18% of frame
+            # centered between 30-70% is actually TWO faces merged into one box
+            if len(faces) == 1 and faces[0].width > 18.0:
+                if 30 < faces[0].x_center < 70:
+                    logger.debug(
+                        "Rejecting merged face detection: width=%.1f%%, center=%.1f%%",
+                        faces[0].width, faces[0].x_center,
+                    )
+                    faces = []
+
         primary = -1
         if faces:
             primary = max(range(len(faces)), key=lambda i: faces[i].width * faces[i].height)

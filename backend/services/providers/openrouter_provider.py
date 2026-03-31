@@ -768,6 +768,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         _AUTH_FAILURE_ABORT_THRESHOLD = 2
         # Temporal continuity: track previous frame's subject_x for multi-face fallback
         _prev_sx = 50
+        _prev_slot_id = -1
 
         def _face_fallback_sx(frame):
             """Get subject_x from face detection data when vision model fails."""
@@ -910,39 +911,70 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             sx = 50
                     desc_text = item.get("description", "")
 
-                    # ── Position fusion: prefer face detection over AI estimate ──
-                    nonlocal _prev_sx
+                    # ── Position fusion: Face Registry + detection ──
+                    nonlocal _prev_sx, _prev_slot_id
                     fd = getattr(frame_ref, 'face_data', None)
-                    if fd and hasattr(fd, 'faces') and fd.faces:
-                        afi = -1
+                    registry = getattr(frame_ref, 'face_registry', None)
+
+                    if registry and registry.multi_speaker and fd and fd.faces:
+                        # REGISTRY MODE: map to known face slots
+                        chosen_slot = None
+
+                        # Try 1: AI returned active_face index
                         af_val = item.get("active_face") or item.get("active_face_index")
                         if af_val is not None:
                             try:
                                 af_int = int(af_val)
-                                afi = af_int - 1 if af_int > 0 else af_int
+                                if 0 < af_int <= len(fd.faces):
+                                    face_x = fd.faces[af_int - 1].nose_x
+                                    chosen_slot = registry.nearest_slot(face_x)
                             except (ValueError, TypeError):
                                 pass
-                        if 0 <= afi < len(fd.faces):
-                            sx = round(fd.faces[afi].nose_x)
-                        elif len(fd.faces) == 1:
+
+                        # Try 2: AI's subject_x is near a slot (not center default)
+                        if chosen_slot is None and abs(sx - 50) > 5:
+                            candidate = registry.nearest_slot(sx)
+                            if candidate and abs(candidate.x_center - sx) <= 20:
+                                chosen_slot = candidate
+
+                        # Try 3: Temporal continuity — hold current slot
+                        if chosen_slot is None:
+                            chosen_slot = registry.slot_by_id(_prev_slot_id)
+
+                        # Try 4: First frame — pick most frequent slot
+                        if chosen_slot is None:
+                            chosen_slot = max(registry.slots, key=lambda s: s.frame_count)
+
+                        # Use actual face position from THIS frame closest to slot
+                        if chosen_slot is not None:
+                            best_x = min((f.nose_x for f in fd.faces),
+                                         key=lambda fx: abs(fx - chosen_slot.x_center))
+                            sx = round(best_x)
+                            _prev_slot_id = chosen_slot.slot_id
+
+                    elif fd and hasattr(fd, 'faces') and fd.faces:
+                        # NON-REGISTRY MODE: direct face fusion
+                        if len(fd.faces) == 1:
                             sx = round(fd.faces[0].nose_x)
                         elif len(fd.faces) >= 2:
-                            # Temporal continuity: pick face closest to previous
-                            # frame's position ("hold on current speaker")
                             best_f = min(fd.faces, key=lambda f: abs(f.nose_x - _prev_sx))
                             sx = round(best_f.nose_x)
-                        # Midpoint snap: if sx is far from all detected faces,
-                        # it's likely a merged detection — snap to nearest face
+                        # Midpoint snap
                         if len(fd.faces) >= 2:
                             face_xs = [round(f.nose_x) for f in fd.faces]
                             if min(abs(sx - fx) for fx in face_xs) > 10:
                                 sx = min(face_xs, key=lambda fx: abs(fx - sx))
+
                     elif sx == 50 and desc_text:
                         # No face data — fall back to text extraction
                         text_sx = _extract_position_from_text(desc_text)
                         if text_sx is not None:
                             sx = text_sx
-                    _prev_sx = sx  # Update temporal continuity tracker
+
+                    if sx == 50 and _prev_sx != 50:
+                        sx = _prev_sx  # Hold previous position
+
+                    _prev_sx = sx
                     active_sx = item.get("active_speaker_x")
                     if active_sx is not None:
                         try:

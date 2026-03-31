@@ -2268,12 +2268,11 @@ def _detect_position_clusters(
                 return None
         return result
 
-    # Pass 1: all values
+    # Run ALL passes, pick the result with fewest clusters
     result1 = _build_result(_split(xs))
-    if result1:
-        return result1
 
     # Pass 2: strip center noise [47, 53]
+    result2 = None
     CENTER_LO, CENTER_HI = 47, 53
     non_center = [x for x in xs if x < CENTER_LO or x > CENTER_HI]
     center_count = len(xs) - len(non_center)
@@ -2282,10 +2281,9 @@ def _detect_position_clusters(
             and any(x < CENTER_LO for x in non_center)
             and any(x > CENTER_HI for x in non_center)):
         result2 = _build_result(_split(non_center))
-        if result2:
-            return result2
 
     # Pass 3: aggressive strip [44, 56]
+    result3 = None
     WIDE_LO, WIDE_HI = 44, 56
     far = [x for x in xs if x < WIDE_LO or x > WIDE_HI]
     wide_count = len(xs) - len(far)
@@ -2294,10 +2292,13 @@ def _detect_position_clusters(
             and any(x < WIDE_LO for x in far)
             and any(x > WIDE_HI for x in far)):
         result3 = _build_result(_split(far))
-        if result3:
-            return result3
 
-    return None
+    # Pick best: prefer fewer clusters (cleanest tracking)
+    candidates = [r for r in [result1, result2, result3] if r is not None]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: len(r))
+    return candidates[0]
 
 
 def _snap_to_clusters(
