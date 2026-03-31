@@ -456,7 +456,7 @@ export default function ClipSEO() {
         ? ASPECT_RATIO_VALUES[aspectRatio]
         : _srcRatio;
       const _isCrop = Math.abs(_srcRatio - _targetRatio) > 0.01;
-      return processKeyframes(job.scenes, startTime, endTime, _isCrop ? _srcRatio : null, _isCrop ? _targetRatio : null);
+      return processKeyframes(job.scenes, startTime, endTime, _isCrop ? _srcRatio : null, _isCrop ? _targetRatio : null, null, job.scene_cut_timestamps || null);
     },
     [job?.scenes, startTime, endTime, aspectRatio, sourceDims],
   );

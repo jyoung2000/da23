@@ -749,6 +749,23 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # Model-aware batch size: some models (reka-edge) only support 2-3 images
         batch_size = self._get_max_images(self._vision_model)
         vision_max_tokens = self._get_vision_max_tokens(self._vision_model)
+
+        # Reduce batch size for multi-speaker content so the model
+        # analyzes fewer frames per call with more attention per frame
+        multi_face_count = sum(
+            1 for f in frames
+            if getattr(f, 'face_data', None)
+            and hasattr(f.face_data, 'faces')
+            and len(f.face_data.faces) >= 2
+        )
+        if len(frames) > 0 and multi_face_count / len(frames) > 0.15:
+            old_bs = batch_size
+            batch_size = max(4, batch_size // 2)
+            logger.info(
+                "Multi-speaker video (%.0f%% multi-face) — reducing batch from %d to %d",
+                multi_face_count / len(frames) * 100, old_bs, batch_size,
+            )
+
         logger.info(
             "Vision batch config for '%s': batch_size=%d, max_tokens=%d",
             self._vision_model, batch_size, vision_max_tokens,
@@ -811,6 +828,15 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     "The face positions are pixel-accurate. TRUST them over your own estimate."
                 )},
             ]
+            # Multi-frame diversity instruction
+            if len(batch) >= 2:
+                content.append({"type": "text", "text": (
+                    "IMPORTANT: Each frame may show a DIFFERENT speaker or camera angle. "
+                    "Analyze each frame INDEPENDENTLY. "
+                    "Look for: who has their mouth open (speaking), "
+                    "who is gesturing, which direction people are looking. "
+                    "subject_x MUST vary between frames if the speaker changes."
+                )})
             for frame in batch:
                 if frame.base64:
                     content.append({
@@ -957,6 +983,32 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         subject_x=sx,
                         active_speaker_x=active_sx,
                     ))
+                # ── Batch diversity validation ──
+                # When all subject_x in a batch are identical and >= 4 frames,
+                # the model likely pattern-matched instead of analyzing per-frame.
+                # Override with face detection positions if available.
+                batch_scenes = batch_results[batch_idx]
+                if len(batch_scenes) >= 4:
+                    batch_sx = [s.subject_x for s in batch_scenes]
+                    if len(set(batch_sx)) == 1:
+                        overridden = 0
+                        for si, scene in enumerate(batch_scenes):
+                            frame_ref = batch[si] if si < len(batch) else batch[-1]
+                            fd = getattr(frame_ref, 'face_data', None)
+                            if fd and hasattr(fd, 'faces') and fd.faces:
+                                if fd.primary_face_idx >= 0:
+                                    scene.subject_x = round(fd.faces[fd.primary_face_idx].nose_x)
+                                    overridden += 1
+                                elif len(fd.faces) == 1:
+                                    scene.subject_x = round(fd.faces[0].nose_x)
+                                    overridden += 1
+                        if overridden > 0:
+                            logger.warning(
+                                "Batch %d: all %d frames had identical subject_x=%d — "
+                                "overrode %d with face detection positions",
+                                batch_idx, len(batch_sx), batch_sx[0], overridden,
+                            )
+
                 # Ensure every frame in batch has a scene entry — some models
                 # return fewer JSON items than images sent.
                 existing_ts = {s.timestamp for s in batch_results[batch_idx]}

@@ -2366,6 +2366,84 @@ def _validate_tracking(
     return fixed
 
 
+def _dense_face_detection_for_clip(
+    video_path: str,
+    clip_start: float,
+    clip_end: float,
+    sample_rate: float = 2.0,
+) -> list[tuple[float, int]]:
+    """Extract dense frames for a clip and run face detection.
+
+    For a 30s clip at 2s intervals, this gives 15 face samples
+    instead of the 2-3 from the sparse full-video analysis.
+    Runs on CPU in ~1-2 seconds.
+
+    Returns list of (clip_relative_time, subject_x) keyframes from face data.
+    """
+    import tempfile
+
+    duration = clip_end - clip_start
+    if duration <= 0:
+        return []
+
+    num_frames = min(30, max(5, int(duration / sample_rate)))
+
+    try:
+        from backend.services.face_detector import detect_faces_batch
+    except ImportError:
+        logger.debug("Face detector unavailable for dense clip detection")
+        return []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Extract frames just for this clip at lower resolution
+        cmd = [
+            "ffmpeg", "-y", "-threads", "2",
+            "-ss", str(clip_start),
+            "-t", str(duration),
+            "-i", video_path,
+            "-vf", (
+                f"fps=1/{sample_rate},"
+                "scale='min(640,iw)':'min(360,ih)'"
+                ":force_original_aspect_ratio=decrease"
+            ),
+            "-vsync", "vfr", "-q:v", "15",
+            os.path.join(tmpdir, "clip_frame_%04d.jpg"),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
+
+        # Build (timestamp, path) list
+        frame_files = sorted(
+            f for f in os.listdir(tmpdir) if f.startswith("clip_frame_")
+        )
+        if not frame_files:
+            return []
+
+        frame_paths = []
+        for i, fname in enumerate(frame_files):
+            ts = clip_start + i * sample_rate
+            frame_paths.append((ts, os.path.join(tmpdir, fname)))
+
+        # Run face detection (CPU, ~0.5-1s)
+        face_results = detect_faces_batch(frame_paths, min_confidence=0.4)
+
+        # Convert to keyframes using primary face position
+        keyframes = []
+        for fd in face_results:
+            if fd.faces and fd.primary_face_idx >= 0:
+                face = fd.faces[fd.primary_face_idx]
+                rel_t = fd.timestamp - clip_start
+                keyframes.append((rel_t, round(face.nose_x)))
+
+        logger.info(
+            "Dense clip face detection: %d/%d frames with faces (%.1fs clip, %.1fs intervals)",
+            len(keyframes), len(frame_paths), duration, sample_rate,
+        )
+        return keyframes
+
+
 def _build_subject_keyframes(
     scenes: list,
     clip_start: float,
@@ -2587,6 +2665,62 @@ def _handle_scene_cuts(
         logger.info(
             "[SubjectTracking] _handle_scene_cuts: %d instant-cut keyframes inserted (threshold=%d)",
             cuts_inserted, jump_threshold,
+        )
+
+    return result
+
+
+def _inject_shot_boundary_cuts(
+    keyframes: list[tuple[float, int]],
+    scene_cut_timestamps: list[float] | None,
+    clip_start: float,
+    clip_end: float,
+) -> list[tuple[float, int]]:
+    """Force instant cuts at camera shot boundaries.
+
+    Scene cuts (camera angle changes) should ALWAYS trigger instant reframe,
+    regardless of how much subject_x changed. This matches how professional
+    editors work — they cut-to instantly, never pan across a camera cut.
+    """
+    if not scene_cut_timestamps or len(keyframes) <= 1:
+        return list(keyframes)
+
+    clip_dur = clip_end - clip_start
+    # Convert to clip-relative time, filter to within clip bounds
+    clip_cuts = sorted(
+        t - clip_start
+        for t in scene_cut_timestamps
+        if clip_start + 0.1 < t < clip_end - 0.1
+    )
+    if not clip_cuts:
+        return list(keyframes)
+
+    result = list(keyframes)
+    inserted = 0
+    for cut_time in clip_cuts:
+        # Find the keyframe just before and after this cut
+        insert_idx = len(result)
+        for i in range(len(result)):
+            if result[i][0] >= cut_time:
+                insert_idx = i
+                break
+
+        before_sx = result[insert_idx - 1][1] if insert_idx > 0 else result[0][1]
+        after_sx = result[insert_idx][1] if insert_idx < len(result) else before_sx
+
+        # If positions differ by more than 3 units, inject instant cut
+        if abs(after_sx - before_sx) > 3:
+            hold_time = round(cut_time - 0.001, 3)
+            prev_t = result[insert_idx - 1][0] if insert_idx > 0 else 0
+            if hold_time > prev_t:
+                result.insert(insert_idx, (hold_time, before_sx))
+                result.insert(insert_idx + 1, (cut_time, after_sx))
+                inserted += 2
+
+    if inserted > 0:
+        logger.info(
+            "[SubjectTracking] _inject_shot_boundary_cuts: %d instant-cut keyframes "
+            "from %d scene boundaries", inserted, len(clip_cuts),
         )
 
     return result
@@ -4808,6 +4942,7 @@ async def export_clip(
     video_height: int = 1080,
     subject_x: int = 50,
     subject_scenes: list | None = None,
+    scene_cut_timestamps: list[float] | None = None,
     progress_callback=None,
     cancel_event: "asyncio.Event | None" = None,
     export_quality: str = "1080p",
@@ -5367,6 +5502,33 @@ async def export_clip(
             if subject_scenes and aspect_ratio and not all_tracking_off:
                 # ── PHASE 0: Build raw keyframes ──
                 raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
+
+                # ── Dense clip-level face detection ──
+                # Full-video analysis gives ~3 face samples per 30s clip.
+                # Dense detection extracts frames at 2s intervals for the clip
+                # and runs face detection, giving 15+ accurate face positions.
+                dense_kf = _dense_face_detection_for_clip(video_path, start, end, sample_rate=2.0)
+                if dense_kf:
+                    # Merge dense face keyframes with AI-derived keyframes.
+                    # Face positions are pixel-accurate; prefer them over AI estimates.
+                    existing_times = {round(t, 1) for t, _ in raw_kf}
+                    added = 0
+                    for t, sx in dense_kf:
+                        if round(t, 1) not in existing_times:
+                            raw_kf.append((t, sx))
+                            added += 1
+                        else:
+                            # Replace AI estimate with face detection position
+                            for idx, (rt, _) in enumerate(raw_kf):
+                                if abs(rt - t) < 1.0:
+                                    raw_kf[idx] = (rt, sx)
+                                    break
+                    raw_kf.sort()
+                    logger.info(
+                        "[SubjectTracking] clip %s: dense face detection added %d keyframes (total %d)",
+                        clip_id, added, len(raw_kf),
+                    )
+
                 logger.info(
                     "[SubjectTracking] clip %s: %d raw keyframes from %d scenes",
                     clip_id, len(raw_kf), len(subject_scenes),
@@ -5434,6 +5596,7 @@ async def export_clip(
 
                     # handleSceneCuts inserts 1ms instant-jump transitions
                     after_cuts = _handle_scene_cuts(deduped)
+                    after_cuts = _inject_shot_boundary_cuts(after_cuts, scene_cut_timestamps, start, end)
 
                     # Final bounds enforcement
                     safe_lo, safe_hi = _compute_safe_range(_src_ratio, _target_ratio)
@@ -5472,6 +5635,7 @@ async def export_clip(
                         _spk_kf = _build_speaker_keyframes(transcript, _spk_map, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
                         if _spk_kf and len(_spk_kf) >= 2:
                             after_cuts = _handle_scene_cuts(_spk_kf)
+                            after_cuts = _inject_shot_boundary_cuts(after_cuts, scene_cut_timestamps, start, end)
                             safe_lo, safe_hi = _compute_safe_range(_src_ratio, _target_ratio)
                             keyframes = [(t, max(safe_lo, min(safe_hi, round(sx)))) for t, sx in after_cuts]
                             kf_xs = [kf[1] for kf in keyframes]
@@ -5497,6 +5661,7 @@ async def export_clip(
                     after_compress = _compress_range(raw_kf, max_range=compress_max, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_dead_zone = _apply_dead_zone(after_compress, threshold=dz_threshold, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_cuts = _handle_scene_cuts(after_dead_zone)
+                    after_cuts = _inject_shot_boundary_cuts(after_cuts, scene_cut_timestamps, start, end)
                     after_smooth = _smooth_keyframes_bidirectional(after_cuts, max_speed=smooth_speed, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_holds = _merge_holds(after_smooth, tolerance=hold_tolerance)
 

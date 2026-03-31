@@ -198,6 +198,7 @@ export default function VideoEditor({
   sourceHeight = 1080,
   subjectX = 50,
   scenes,
+  sceneCuts = null,
   initialTime,
   initialVolume,
   initialSpeed,
@@ -875,8 +876,8 @@ export default function VideoEditor({
 
   const subjectKeyframes = useMemo(() => {
     if (!scenes?.length || clipStart == null || clipEnd == null) return null;
-    return processKeyframes(scenes, clipStart, clipEnd, isCrop ? srcRatio : null, isCrop ? targetRatio : null, transcript || null);
-  }, [scenes, clipStart, clipEnd, isCrop, srcRatio, targetRatio, transcript]);
+    return processKeyframes(scenes, clipStart, clipEnd, isCrop ? srcRatio : null, isCrop ? targetRatio : null, transcript || null, sceneCuts || null);
+  }, [scenes, clipStart, clipEnd, isCrop, srcRatio, targetRatio, transcript, sceneCuts]);
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),

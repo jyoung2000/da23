@@ -108,6 +108,7 @@ class JobResult(BaseModel):
     translated_transcript: list[TranscriptSegment] = []  # Translated subtitle segments
     clips: list[ClipCandidate] = []
     speaker_names: dict[str, str] = {}  # {"Speaker 1": "Eric", "Speaker 2": "Alice"}
+    scene_cut_timestamps: list[float] = []  # Timestamps of camera cuts from frame extraction
     exported_clips: list[dict] = []
     subtitle_settings: Optional[dict] = None  # Canonical subtitle settings — server is source of truth
     error: Optional[str] = None

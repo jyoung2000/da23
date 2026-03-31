@@ -944,7 +944,7 @@ async def _run_analysis_inner(job_id: str):
     # independent FFmpeg reads of the source video, writing to different outputs.
     async with _stage_timer(job_id, "frame+audio extraction"):
         try:
-            frames, _ = await asyncio.wait_for(
+            extraction_result, _ = await asyncio.wait_for(
                 asyncio.gather(
                     extract_frames(
                         video_path, frames_dir,
@@ -956,6 +956,7 @@ async def _run_analysis_inner(job_id: str):
                 ),
                 timeout=_EXTRACTION_TIMEOUT,
             )
+            frames, scene_cut_timestamps = extraction_result
         except asyncio.TimeoutError:
             logger.error("[%s] Frame+audio extraction timed out after %ds", job_id, _EXTRACTION_TIMEOUT)
             raise RuntimeError(
@@ -963,6 +964,11 @@ async def _run_analysis_inner(job_id: str):
                 "The video file may be very large or the container is under heavy load."
             )
     total_frames = len(frames)
+
+    # Store scene cut timestamps for shot-boundary-aware tracking
+    if scene_cut_timestamps:
+        await database.update_job_status(job_id, scene_cut_timestamps=scene_cut_timestamps)
+        logger.info("[%s] Stored %d scene cut timestamps for tracking", job_id, len(scene_cut_timestamps))
 
     # ── Face detection (CPU-only, ~0.5s for 60 frames) ──
     # Runs pixel-accurate face detection on extracted frames to augment

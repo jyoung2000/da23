@@ -807,6 +807,7 @@ async def run_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
                         video_height=vid_h,
                         subject_x=clip_subject_x,
                         subject_scenes=clip_scenes or None,
+                        scene_cut_timestamps=getattr(job, 'scene_cut_timestamps', None) or None,
                         export_quality=req.export_quality,
                     )
 

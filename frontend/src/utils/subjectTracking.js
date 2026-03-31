@@ -446,6 +446,53 @@ export function handleSceneCuts(keyframes, jumpThreshold = 15) {
 }
 
 /**
+ * Force instant cuts at camera shot boundaries.
+ * Scene cuts (camera angle changes) should ALWAYS trigger instant reframe,
+ * regardless of how much subject_x changed.
+ */
+export function injectShotBoundaryCuts(keyframes, sceneCuts, clipStart, clipEnd) {
+  if (!sceneCuts || !sceneCuts.length || !keyframes || keyframes.length <= 1) {
+    return keyframes ? [...keyframes] : [];
+  }
+
+  const clipDur = clipEnd - clipStart;
+  // Convert to clip-relative time, filter to within clip bounds
+  const clipCutTimes = sceneCuts
+    .map(t => t - clipStart)
+    .filter(t => t > 0.1 && t < clipDur - 0.1)
+    .sort((a, b) => a - b);
+
+  if (!clipCutTimes.length) return [...keyframes];
+
+  const result = [...keyframes];
+  let inserted = 0;
+
+  for (const cutTime of clipCutTimes) {
+    let insertIdx = result.length;
+    for (let i = 0; i < result.length; i++) {
+      if (result[i].t >= cutTime) { insertIdx = i; break; }
+    }
+
+    const beforeX = insertIdx > 0 ? result[insertIdx - 1].x : result[0].x;
+    const afterX = insertIdx < result.length ? result[insertIdx].x : beforeX;
+
+    if (Math.abs(afterX - beforeX) > 3) {
+      const holdTime = Math.round((cutTime - 0.001) * 1000) / 1000;
+      const prevT = insertIdx > 0 ? result[insertIdx - 1].t : 0;
+      if (holdTime > prevT) {
+        result.splice(insertIdx, 0,
+          { t: holdTime, x: beforeX },
+          { t: cutTime, x: afterX },
+        );
+        inserted += 2;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Compress the range of subject_x values to prevent erratic swinging.
  *
  * If the full range of sx values exceeds maxRange, compress toward the
@@ -724,7 +771,7 @@ export function mergeHolds(keyframes, tolerance = 3) {
  * @param {number|null} targetRatio - Target crop aspect ratio (optional)
  * @returns {Array<{t: number, x: number}>} Fully processed keyframes
  */
-export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null, transcript = null) {
+export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null, transcript = null, sceneCuts = null) {
   // ── PHASE 0: Build raw keyframes ──
   const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
   if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];
@@ -815,7 +862,8 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
 
     // handleSceneCuts inserts 1ms instant-jump transitions at speaker changes
     // (delta between clusters is always > 15, so every change triggers an instant cut)
-    const afterCuts = handleSceneCuts(deduped);
+    let afterCuts = handleSceneCuts(deduped);
+    afterCuts = injectShotBoundaryCuts(afterCuts, sceneCuts, clipStart, clipEnd);
 
     // Final bounds enforcement
     let result;
@@ -900,8 +948,9 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
 
   const afterCompress = compressRange(raw, compressMaxRange, srcRatio, targetRatio);
   const afterDeadZone = applyDeadZone(afterCompress, deadZoneThreshold, srcRatio, targetRatio);
-  const afterCuts = handleSceneCuts(afterDeadZone);
-  const afterSmooth = smoothKeyframesBidirectional(afterCuts, smoothMaxSpeed, srcRatio, targetRatio);
+  let afterCuts3 = handleSceneCuts(afterDeadZone);
+  afterCuts3 = injectShotBoundaryCuts(afterCuts3, sceneCuts, clipStart, clipEnd);
+  const afterSmooth = smoothKeyframesBidirectional(afterCuts3, smoothMaxSpeed, srcRatio, targetRatio);
   const afterHolds = mergeHolds(afterSmooth, holdTolerance);
 
   // Final bounds enforcement — ensure every keyframe x is clamped to [0, 100]

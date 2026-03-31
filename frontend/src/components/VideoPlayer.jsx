@@ -18,7 +18,7 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, aspectRatio, sourceWidth = 1920, sourceHeight = 1080, subjectX = 50, scenes, initialTime }) {
+export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, aspectRatio, sourceWidth = 1920, sourceHeight = 1080, subjectX = 50, scenes, sceneCuts = null, initialTime }) {
   const { isMobile } = useResponsive();
   const videoRef = useRef(null);
   const containerRef = useRef(null);
@@ -190,7 +190,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     () => {
       if (!scenes?.length || clipStart == null || clipEnd == null) return null;
       const _isCrop = isCrop;
-      const processed = processKeyframes(scenes, clipStart, clipEnd, _isCrop ? srcRatio : null, _isCrop ? targetRatio : null);
+      const processed = processKeyframes(scenes, clipStart, clipEnd, _isCrop ? srcRatio : null, _isCrop ? targetRatio : null, null, sceneCuts || null);
       if (processed && isDynamic(processed)) {
         console.log(`[SubjectTracking] VideoPlayer: ${processed.length} keyframes (pipeline: build→cuts→compress→deadzone→smooth→holds) (${clipStart.toFixed(1)}s-${clipEnd.toFixed(1)}s), x range: ${Math.min(...processed.map(k=>k.x))}-${Math.max(...processed.map(k=>k.x))}`);
       }

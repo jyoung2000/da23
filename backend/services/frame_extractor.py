@@ -341,8 +341,11 @@ async def extract_frames(
     max_frames: Optional[int] = None,
     video_duration: Optional[float] = None,
     video_codec: Optional[str] = None,
-) -> list[FrameData]:
+) -> tuple[list[FrameData], list[float]]:
     """Extract frames using scene detection + minimum interval fallback.
+
+    Returns (frames, scene_cut_timestamps) where scene_cut_timestamps contains
+    the timestamps of frames triggered by scene detection (camera cuts).
 
     Strategy:
     1. Scene detection (threshold 0.3) captures visual transitions
@@ -541,7 +544,6 @@ async def extract_frames(
         raise RuntimeError(f"FFmpeg frame extraction failed:\n{error_msg}")
 
     # Collect extracted frames with actual timestamps from PTS
-    frames = []
     frame_files = sorted(
         f for f in os.listdir(output_dir) if f.startswith("frame_") and f.endswith(".jpg")
     )
@@ -552,27 +554,19 @@ async def extract_frames(
             "contain only audio, or use an unsupported codec."
         )
 
-    # If we got more frames than max, keep the most evenly spaced subset
-    was_capped = False
-    if len(frame_files) > max_frames:
-        original_count = len(frame_files)
-        step = len(frame_files) / max_frames
-        indices = [int(i * step) for i in range(max_frames)]
-        frame_files = [frame_files[i] for i in indices]
-        was_capped = True
-        logger.info("Capped frames from %d to %d", original_count, max_frames)
-
+    # Build ALL frames first with rough timestamps — we need timestamps
+    # BEFORE capping so we can identify scene-change frames to preserve.
+    all_frames = []
     for idx, fname in enumerate(frame_files):
         path = os.path.join(output_dir, fname)
-        # For capped frames with known duration, estimate timestamps proportionally
-        if was_capped and video_duration and video_duration > 0:
-            timestamp = (idx / max(len(frame_files) - 1, 1)) * video_duration
+        if video_duration and video_duration > 0 and len(frame_files) > 1:
+            timestamp = (idx / (len(frame_files) - 1)) * video_duration
         else:
-            timestamp = idx * rate  # Fallback; will be refined below
-        frames.append(FrameData(timestamp=float(timestamp), path=path))
+            timestamp = idx * rate
+        all_frames.append(FrameData(timestamp=float(timestamp), path=path))
 
-    # Refine timestamps using ffprobe on extracted frames (concurrent)
-    # Skip for large frame counts (>80) to avoid spawning too many ffprobe processes
+    # Refine timestamps using ffprobe on extracted frames (concurrent).
+    # Run on ALL frames (up to 200) so scene-change detection has accurate data.
     async def _probe_frame_pts(frame_path: str) -> float | None:
         probe_cmd = [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -590,25 +584,73 @@ async def extract_frames(
             pass
         return None
 
-    if len(frames) <= 80:
+    if len(all_frames) <= 200:
         try:
             pts_results = await asyncio.gather(
-                *(_probe_frame_pts(frame.path) for frame in frames),
+                *(_probe_frame_pts(frame.path) for frame in all_frames),
                 return_exceptions=True,
             )
-            for frame, pts in zip(frames, pts_results):
+            for frame, pts in zip(all_frames, pts_results):
                 if isinstance(pts, float):
                     frame.timestamp = pts
         except Exception as e:
             logger.warning("Could not refine frame timestamps: %s", e)
     else:
-        logger.info("Skipping per-frame ffprobe PTS refinement for %d frames (>80)", len(frames))
+        logger.info("Skipping per-frame ffprobe PTS refinement for %d frames (>200)", len(all_frames))
+
+    # ── Smart frame capping: preserve scene-change frames ──
+    # Scene-change frames have irregular spacing (not multiples of rate).
+    # They mark camera cuts where crop position must snap instantly —
+    # the MOST important frames for subject tracking.
+    scene_cut_timestamps: list[float] = []
+    was_capped = False
+
+    # Identify scene-change frames from irregular timestamp gaps
+    scene_change_indices: set[int] = set()
+    if len(all_frames) >= 2:
+        for i in range(1, len(all_frames)):
+            gap = all_frames[i].timestamp - all_frames[i - 1].timestamp
+            if gap < rate * 0.7:
+                scene_change_indices.add(i)
+                scene_cut_timestamps.append(all_frames[i].timestamp)
+
+    if len(all_frames) > max_frames:
+        original_count = len(all_frames)
+
+        # Always keep: first frame, last frame, all scene-change frames
+        priority_indices = {0, len(all_frames) - 1} | scene_change_indices
+
+        # Fill remaining slots with evenly-spaced interval frames
+        remaining_budget = max_frames - len(priority_indices)
+        if remaining_budget > 0:
+            non_priority = [i for i in range(len(all_frames)) if i not in priority_indices]
+            if non_priority:
+                step = max(1, len(non_priority) / remaining_budget)
+                for j in range(min(remaining_budget, len(non_priority))):
+                    priority_indices.add(non_priority[int(j * step)])
+
+        indices = sorted(priority_indices)[:max_frames]
+        kept_set = set(indices)
+        frames = [all_frames[i] for i in indices]
+        # Filter scene cuts to only those that survived capping
+        scene_cut_timestamps = [
+            all_frames[i].timestamp for i in scene_change_indices if i in kept_set
+        ]
+        was_capped = True
+        scene_kept = len(scene_change_indices & kept_set)
+        logger.info(
+            "Smart-capped frames from %d to %d (kept %d/%d scene-change frames)",
+            original_count, len(frames), scene_kept, len(scene_change_indices),
+        )
+    else:
+        frames = all_frames
 
     logger.info(
-        "Scene-aware extraction complete: %d frames from %s (scene detection + %ds interval)",
-        len(frames), video_path, rate,
+        "Scene-aware extraction complete: %d frames from %s "
+        "(scene detection + %ds interval, %d scene cuts identified)",
+        len(frames), video_path, rate, len(scene_cut_timestamps),
     )
-    return frames
+    return frames, scene_cut_timestamps
 
 
 def resize_frame_if_needed(path: str) -> str:
