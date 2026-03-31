@@ -1653,18 +1653,30 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         )
                         stage2_aborted = True
                     else:
-                        # Use neighbor subject_x instead of hardcoded 50
-                        neighbor_sx = 50
-                        for j in range(fi - 1, -1, -1):
-                            if scenes[j] is not None and scenes[j].subject_x != 50:
-                                neighbor_sx = scenes[j].subject_x
-                                break
+                        # Use face detection position if available, else neighbor
+                        _fd = getattr(frame, 'face_data', None)
+                        fallback_sx = None
+                        if _fd and hasattr(_fd, 'faces') and _fd.faces:
+                            if len(_fd.faces) == 1:
+                                fallback_sx = round(_fd.faces[0].nose_x)
+                            elif _fd.primary_face_idx >= 0:
+                                fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
+                            elif len(_fd.faces) >= 2:
+                                # Pick face closest to previous position
+                                fallback_sx = round(min(_fd.faces, key=lambda f: abs(f.nose_x - _prev_sx)).nose_x)
+                        if fallback_sx is None:
+                            fallback_sx = 50
+                            for j in range(fi - 1, -1, -1):
+                                if scenes[j] is not None and scenes[j].subject_x != 50:
+                                    fallback_sx = scenes[j].subject_x
+                                    break
+                        _prev_sx = fallback_sx
                         scenes[fi] = SceneDescription(
                             timestamp=frame.timestamp,
                             description=f"Frame at {frame.timestamp:.0f}s — analysis temporarily unavailable",
                             importance_score=5,
                             thumbnail_path=frame.path,
-                            subject_x=neighbor_sx,
+                            subject_x=fallback_sx,
                         )
                 completed += 1
                 if progress_callback:
@@ -1750,7 +1762,18 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         next_ts = scenes[j].timestamp
                         break
 
-                if prev_sx is not None and next_sx is not None and prev_ts is not None and next_ts is not None:
+                # Prefer face detection data over interpolation
+                _fd = getattr(frame, 'face_data', None)
+                if _fd and hasattr(_fd, 'faces') and _fd.faces:
+                    if len(_fd.faces) == 1:
+                        interp_sx = round(_fd.faces[0].nose_x)
+                    elif _fd.primary_face_idx >= 0:
+                        interp_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
+                    elif prev_sx is not None:
+                        interp_sx = round(min(_fd.faces, key=lambda f: abs(f.nose_x - prev_sx)).nose_x)
+                    else:
+                        interp_sx = round(_fd.faces[0].nose_x)
+                elif prev_sx is not None and next_sx is not None and prev_ts is not None and next_ts is not None:
                     dt = next_ts - prev_ts
                     if dt > 0:
                         frac = (frame.timestamp - prev_ts) / dt
