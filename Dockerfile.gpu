@@ -79,27 +79,28 @@ RUN cd /tmp && \
 
 # Install DM Sans font (default subtitle font)
 RUN mkdir -p /usr/share/fonts/truetype/dmsans && \
-    curl -fsSL -o /usr/share/fonts/truetype/dmsans/DMSans.ttf \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /usr/share/fonts/truetype/dmsans/DMSans.ttf \
       "https://github.com/google/fonts/raw/main/ofl/dmsans/DMSans%5Bopsz%2Cwght%5D.ttf" && \
-    curl -fsSL -o /usr/share/fonts/truetype/dmsans/DMSans-Italic.ttf \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /usr/share/fonts/truetype/dmsans/DMSans-Italic.ttf \
       "https://github.com/google/fonts/raw/main/ofl/dmsans/DMSans-Italic%5Bopsz%2Cwght%5D.ttf" && \
     fc-cache -f -v
 
 # Install popular Google Fonts for subtitle use
+# Use --retry with backoff to handle GitHub rate limiting (429)
 RUN mkdir -p /usr/share/fonts/truetype/google-fonts && \
     cd /usr/share/fonts/truetype/google-fonts && \
-    curl -fsSL -o Montserrat.ttf "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf" && \
-    curl -fsSL -o OpenSans.ttf "https://github.com/google/fonts/raw/main/ofl/opensans/OpenSans%5Bwdth%2Cwght%5D.ttf" && \
-    curl -fsSL -o Roboto.ttf "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto%5Bwdth%2Cwght%5D.ttf" && \
-    curl -fsSL -o Poppins-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Regular.ttf" && \
-    curl -fsSL -o Poppins-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf" && \
-    curl -fsSL -o Inter.ttf "https://github.com/google/fonts/raw/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf" && \
-    curl -fsSL -o Nunito.ttf "https://github.com/google/fonts/raw/main/ofl/nunito/Nunito%5Bwght%5D.ttf" && \
-    curl -fsSL -o Lato-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Regular.ttf" && \
-    curl -fsSL -o Lato-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Bold.ttf" && \
-    curl -fsSL -o Oswald.ttf "https://github.com/google/fonts/raw/main/ofl/oswald/Oswald%5Bwght%5D.ttf" && \
-    curl -fsSL -o PlayfairDisplay.ttf "https://github.com/google/fonts/raw/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf" && \
-    curl -fsSL -o BebasNeue-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Montserrat.ttf "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o OpenSans.ttf "https://github.com/google/fonts/raw/main/ofl/opensans/OpenSans%5Bwdth%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Roboto.ttf "https://github.com/google/fonts/raw/main/ofl/roboto/Roboto%5Bwdth%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Poppins-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Regular.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Poppins-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/poppins/Poppins-Bold.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Inter.ttf "https://github.com/google/fonts/raw/main/ofl/inter/Inter%5Bopsz%2Cwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Nunito.ttf "https://github.com/google/fonts/raw/main/ofl/nunito/Nunito%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Lato-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Regular.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Lato-Bold.ttf "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Bold.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o Oswald.ttf "https://github.com/google/fonts/raw/main/ofl/oswald/Oswald%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o PlayfairDisplay.ttf "https://github.com/google/fonts/raw/main/ofl/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf" && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o BebasNeue-Regular.ttf "https://github.com/google/fonts/raw/main/ofl/bebasneue/BebasNeue-Regular.ttf" && \
     fc-cache -f -v
 
 # Register /data/fonts with fontconfig so libass picks up custom fonts
