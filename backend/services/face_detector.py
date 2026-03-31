@@ -127,7 +127,7 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
         # Filter out any single detection wider than 18% that's centered.
         MAX_FACE_WIDTH_PCT = 18.0
         if len(faces) == 1 and faces[0].width > MAX_FACE_WIDTH_PCT:
-            if 35 < faces[0].x_center < 65:
+            if 30 < faces[0].x_center < 70:
                 logger.debug(
                     "Frame %.1fs: rejecting merged face detection "
                     "(width=%.1f%%, center=%.1f%% — likely two speakers)",
