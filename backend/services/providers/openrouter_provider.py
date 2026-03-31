@@ -769,6 +769,16 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # Temporal continuity: track previous frame's subject_x for multi-face fallback
         _prev_sx = 50
 
+        def _face_fallback_sx(frame):
+            """Get subject_x from face detection data when vision model fails."""
+            fd = getattr(frame, 'face_data', None)
+            if fd and hasattr(fd, 'faces') and fd.faces:
+                if len(fd.faces) == 1:
+                    return round(fd.faces[0].nose_x)
+                if fd.primary_face_idx >= 0:
+                    return round(fd.faces[fd.primary_face_idx].nose_x)
+            return 50
+
         async def _analyze_batch(batch, batch_idx, _depth=0):
             nonlocal _consecutive_auth_failures
             """Process a vision batch with auto-split on limit errors (max depth 2)."""
@@ -781,7 +791,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         description="Frame analysis unavailable — API key limit exceeded",
                         importance_score=5,
                         thumbnail_path=frame.path,
-                        subject_x=50,
+                        subject_x=_face_fallback_sx(frame),
                     ))
                 return
 
@@ -871,7 +881,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         description="Frame analysis unavailable",
                         importance_score=5,
                         thumbnail_path=frame.path,
-                        subject_x=50,
+                        subject_x=_face_fallback_sx(frame),
                     ))
                 return
             # Success — reset the auth failure counter
@@ -961,7 +971,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             description="Frame not analyzed by model",
                             importance_score=5,
                             thumbnail_path=frame.path,
-                            subject_x=50,
+                            subject_x=_face_fallback_sx(frame),
                         ))
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 logger.warning(f"Failed to parse frame analysis: {e}")
@@ -972,7 +982,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         description=fallback_desc[:200],
                         importance_score=5,
                         thumbnail_path=frame.path,
-                        subject_x=50,
+                        subject_x=_face_fallback_sx(frame),
                     ))
 
         async def _process_batch(batch_idx: int):
