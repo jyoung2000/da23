@@ -122,7 +122,7 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
                 # further from center (where the bias is larger).
                 edge_dist = abs(cx - 50)
                 if edge_dist > 10:
-                    pull = fw_pct * (edge_dist / 50) * 1.5
+                    pull = fw_pct * (edge_dist / 50) * 2.5
                     cx = cx + pull if cx < 50 else cx - pull
                 faces.append(FaceInfo(
                     x_center=round(cx, 1), y_center=round(cy, 1),
