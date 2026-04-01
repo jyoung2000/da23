@@ -92,14 +92,43 @@ def build_face_registry(
             frames_with_faces=0,
         )
 
+    # ── Two-pass clustering: first without midzone, then assign midzone ──
+    # The mid-zone [40-60%] contains noise from merged detections, AI defaults,
+    # and faces that are slightly off-center. If we cluster with these included,
+    # they chain nearby real positions into one bloated cluster (e.g. [48-86%]).
+    # Instead: build slots from non-midzone faces, then optionally assign
+    # midzone faces to the nearest established slot.
+    MIDZONE_LO, MIDZONE_HI = 40, 60
+    outer_faces = [f for f in all_faces if f[0] < MIDZONE_LO or f[0] > MIDZONE_HI]
+    midzone_faces = [f for f in all_faces if MIDZONE_LO <= f[0] <= MIDZONE_HI]
+
+    # If no outer faces, fall back to using all faces
+    if not outer_faces:
+        outer_faces = all_faces
+        midzone_faces = []
+
     # Sort by x position and cluster by gap
-    all_faces.sort(key=lambda f: f[0])
-    clusters: list[list[tuple]] = [[all_faces[0]]]
-    for face in all_faces[1:]:
+    outer_faces.sort(key=lambda f: f[0])
+    clusters: list[list[tuple]] = [[outer_faces[0]]]
+    for face in outer_faces[1:]:
         if face[0] - clusters[-1][-1][0] > cluster_gap:
             clusters.append([face])
         else:
             clusters[-1].append(face)
+
+    # Assign midzone faces to nearest cluster (if within 20% of cluster mean)
+    for mf in midzone_faces:
+        best_cluster = None
+        best_dist = float('inf')
+        for cl in clusters:
+            cl_mean = sum(f[0] for f in cl) / len(cl)
+            dist = abs(mf[0] - cl_mean)
+            if dist < best_dist:
+                best_dist = dist
+                best_cluster = cl
+        # Only assign if reasonably close (within 15% of a real cluster)
+        if best_cluster is not None and best_dist <= 15:
+            best_cluster.append(mf)
 
     # Build slots from clusters with enough appearances
     slots = []

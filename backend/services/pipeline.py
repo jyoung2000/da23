@@ -1418,7 +1418,7 @@ async def _run_analysis_inner(job_id: str):
             for scene in scenes_result:
                 sx = scene.subject_x
                 min_dist_to_slot = min(abs(sx - sc) for sc in slot_centers)
-                if min_dist_to_slot > 12:
+                if min_dist_to_slot > 8:
                     nearest = round(min(slot_centers, key=lambda sc: abs(sc - sx)))
                     scene.subject_x = nearest
                     corrected += 1
