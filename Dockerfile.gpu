@@ -116,6 +116,10 @@ RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt && \
     pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
     pip3 install --no-cache-dir pyannote.audio>=3.1.0 torch>=2.0.0 && \
+    # MediaPipe installed separately: its protobuf<4 requirement conflicts with
+    # torch/pyannote which need protobuf>=4. Using --no-deps skips that constraint.
+    # The runtime protobuf version (>=4) works fine with mediapipe 0.10.8.
+    pip3 install --no-cache-dir --no-deps mediapipe==0.10.8 && \
     # Register pip-installed NVIDIA libs so ctranslate2/torch can find them at runtime
     # (path varies by Python version — 3.10 on Ubuntu 22.04, 3.11 if installed from apt)
     python3 -c "import nvidia.cublas; print(nvidia.cublas.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \

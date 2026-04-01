@@ -68,7 +68,8 @@ RUN pip install --upgrade pip && \
 
 # Install pyannote.audio for neural speaker diarization (CPU torch for non-GPU builds)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir pyannote.audio>=3.1.0
+    pip install --no-cache-dir pyannote.audio>=3.1.0 && \
+    pip install --no-cache-dir --no-deps mediapipe==0.10.8
 
 # Install CUDA runtime libraries via pip for GPU passthrough support.
 # These PyPI packages provide the CUDA shared libraries that ctranslate2
