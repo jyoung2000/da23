@@ -255,7 +255,25 @@ def main():
         # ── Audio preprocessing (matches in-process path in transcription.py) ──
         # Normalize volume so Whisper gets consistent input levels.
         # Whisper was trained on -20 LUFS audio; quiet/loud recordings degrade accuracy.
+        # For translate tasks (e.g. Japanese→English), use gentler noise gate and
+        # compression to preserve quiet backchannel responses, whispered asides,
+        # and expressive speech that carries meaning in the source language.
         preprocessed_path = args.audio
+        is_translate = args.task == "translate"
+        # Gentler settings for translate: lower noise gate (-55dB vs -45dB), softer
+        # compression (2:1 vs 4:1), more makeup gain to lift quiet speech.
+        if is_translate:
+            _af_base = (
+                "highpass=f=50,"
+                "acompressor=threshold=-35dB:ratio=2:attack=10:release=200:makeup=8dB,"
+                "agate=threshold=-55dB:attack=10:release=100"
+            )
+        else:
+            _af_base = (
+                "highpass=f=50,"
+                "acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
+                "agate=threshold=-45dB:attack=5:release=50"
+            )
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 preprocessed_path = tmp.name
@@ -264,9 +282,7 @@ def main():
             # Pass 1: Measure loudness statistics
             measure_cmd = [
                 "ffmpeg", "-y", "-i", args.audio,
-                "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
-                       "agate=threshold=-45dB:attack=5:release=50,"
-                       "loudnorm=I=-20:TP=-1.5:LRA=7:print_format=json",
+                "-af", f"{_af_base},loudnorm=I=-20:TP=-1.5:LRA=7:print_format=json",
                 "-f", "null", "-",
             ]
             measure_result = subprocess.run(measure_cmd, capture_output=True, text=True, timeout=120)
@@ -285,9 +301,7 @@ def main():
             if loudnorm_stats:
                 # Pass 2: Apply measured corrections (precise normalization)
                 normalize_filter = (
-                    f"highpass=f=50,"
-                    f"acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
-                    f"agate=threshold=-45dB:attack=5:release=50,"
+                    f"{_af_base},"
                     f"loudnorm=I=-20:TP=-1.5:LRA=7:linear=true"
                     f":measured_I={loudnorm_stats.get('input_i', '-24.0')}"
                     f":measured_TP={loudnorm_stats.get('input_tp', '-2.0')}"
@@ -306,8 +320,7 @@ def main():
                     logger.warning("Two-pass loudnorm failed, falling back to single-pass")
                     cmd_fallback = [
                         "ffmpeg", "-y", "-i", args.audio,
-                        "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
-                               "agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7",
+                        "-af", f"{_af_base},loudnorm=I=-20:TP=-1.5:LRA=7",
                         "-ar", "16000", "-ac", "1",
                         preprocessed_path,
                     ]
@@ -320,8 +333,7 @@ def main():
                 # Fallback: single-pass if measurement failed
                 cmd = [
                     "ffmpeg", "-y", "-i", args.audio,
-                    "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
-                           "agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7",
+                    "-af", f"{_af_base},loudnorm=I=-20:TP=-1.5:LRA=7",
                     "-ar", "16000", "-ac", "1",
                     preprocessed_path,
                 ]

@@ -378,7 +378,8 @@ async def transcribe_audio_subprocess(
             "--best-of", str(effective_best_of),
             "--task", task,
             # Quality parameters (match in-process path exactly)
-            "--no-speech-threshold", "0.8",
+            # Translate: lower threshold to capture quiet backchannel/whispered speech
+            "--no-speech-threshold", "0.6" if task == "translate" else "0.8",
             "--log-prob-threshold", "-1.5",
             "--compression-ratio-threshold", "2.4",
             "--repetition-penalty", "1.1",
@@ -1343,6 +1344,10 @@ def _transcribe_sync(
     _recommended_beam = whisper_device_info.get("recommended_beam_size")
     effective_beam = _recommended_beam if _recommended_beam is not None else settings.WHISPER_BEAM_SIZE
     effective_best_of = 1 if effective_beam <= 1 else 3
+    # Translate tasks (e.g. Japanese→English) need lower no_speech_threshold
+    # because quiet backchannel responses, whispered asides, and expressive
+    # speech get high no_speech_prob from Whisper's English acoustic model.
+    _no_speech_thresh = 0.6 if task == "translate" else 0.8
     transcribe_kwargs = {
         "task": task,
         "beam_size": effective_beam,
@@ -1350,7 +1355,7 @@ def _transcribe_sync(
         "vad_filter": settings.WHISPER_VAD_FILTER,
         "condition_on_previous_text": (task != "translate"),
         "word_timestamps": True,
-        "no_speech_threshold": 0.8,
+        "no_speech_threshold": _no_speech_thresh,
         "log_prob_threshold": -1.5,
         "compression_ratio_threshold": 2.4,
         "repetition_penalty": 1.1,
@@ -1369,10 +1374,16 @@ def _transcribe_sync(
             "onset": 0.2,                      # Low threshold captures whispers and soft speech
             "min_speech_duration_ms": 100,     # Don't discard very short utterances
         }
-    # CJK languages have higher natural compression ratios — relax threshold
+    # CJK languages have higher natural compression ratios — relax threshold.
+    # Also applies to translate tasks where the source is CJK (Whisper still
+    # processes the CJK audio internally before translating to English).
     _is_cjk_hint = language.lower() in ("ja", "ko", "zh", "zh-cn", "zh-tw") if language else False
     if _is_cjk_hint:
         transcribe_kwargs["compression_ratio_threshold"] = 3.0
+    elif task == "translate":
+        # Translate output (English) from any source can have higher compression
+        # due to structural differences between languages
+        transcribe_kwargs["compression_ratio_threshold"] = 2.8
 
     if language:
         transcribe_kwargs["language"] = language
@@ -1397,6 +1408,20 @@ def _transcribe_sync(
     # Normalize volume so Whisper gets consistent input levels.
     # Whisper was trained on -20 LUFS audio; quiet recordings or loud
     # ones with clipping both degrade accuracy.
+    # For translate tasks: gentler noise gate and compression to preserve
+    # quiet backchannel responses and expressive speech.
+    if task == "translate":
+        _af_base = (
+            "highpass=f=50,"
+            "acompressor=threshold=-35dB:ratio=2:attack=10:release=200:makeup=8dB,"
+            "agate=threshold=-55dB:attack=10:release=100"
+        )
+    else:
+        _af_base = (
+            "highpass=f=50,"
+            "acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
+            "agate=threshold=-45dB:attack=5:release=50"
+        )
     preprocessed_path = audio_path
     try:
         import subprocess
@@ -1408,7 +1433,7 @@ def _transcribe_sync(
         # Pass 1: Measure loudness statistics
         measure_cmd = [
             "ffmpeg", "-y", "-i", audio_path,
-            "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7:print_format=json",
+            "-af", f"{_af_base},loudnorm=I=-20:TP=-1.5:LRA=7:print_format=json",
             "-f", "null", "-",
         ]
         measure_result = subprocess.run(measure_cmd, capture_output=True, text=True, timeout=120)
@@ -1434,11 +1459,7 @@ def _transcribe_sync(
             target_offset = loudnorm_stats.get("target_offset", "0.0")
 
             normalize_filter = (
-                f"highpass=f=50,"
-                # Dynamic range compression: boost quiet speech, tame peaks
-                f"acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,"
-                # Noise gate: suppress background hiss amplified by compression
-                f"agate=threshold=-45dB:attack=5:release=50,"
+                f"{_af_base},"
                 f"loudnorm=I=-20:TP=-1.5:LRA=7:linear=true"
                 f":measured_I={measured_i}:measured_TP={measured_tp}"
                 f":measured_LRA={measured_lra}:measured_thresh={measured_thresh}"
@@ -1455,7 +1476,7 @@ def _transcribe_sync(
                 logger.warning("Two-pass loudnorm failed, falling back to single-pass")
                 cmd_fallback = [
                     "ffmpeg", "-y", "-i", audio_path,
-                    "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7",
+                    "-af", f"{_af_base},loudnorm=I=-20:TP=-1.5:LRA=7",
                     "-ar", "16000", "-ac", "1",
                     preprocessed_path,
                 ]
@@ -1466,7 +1487,7 @@ def _transcribe_sync(
             # Fallback: single-pass if measurement failed
             cmd = [
                 "ffmpeg", "-y", "-i", audio_path,
-                "-af", "highpass=f=50,acompressor=threshold=-30dB:ratio=4:attack=5:release=100:makeup=6dB,agate=threshold=-45dB:attack=5:release=50,loudnorm=I=-20:TP=-1.5:LRA=7",
+                "-af", f"{_af_base},loudnorm=I=-20:TP=-1.5:LRA=7",
                 "-ar", "16000", "-ac", "1",
                 preprocessed_path,
             ]
