@@ -60,11 +60,20 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       }
     };
     const onDur = () => setDuration(video.duration);
+    const onError = () => {
+      // Retry once on load error (handles transient partial content failures)
+      if (!video._retried) {
+        video._retried = true;
+        video.load();
+      }
+    };
     video.addEventListener('timeupdate', onTime);
     video.addEventListener('loadedmetadata', onDur);
+    video.addEventListener('error', onError);
     return () => {
       video.removeEventListener('timeupdate', onTime);
       video.removeEventListener('loadedmetadata', onDur);
+      video.removeEventListener('error', onError);
     };
   }, [clipEnd]);
 
@@ -291,6 +300,7 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       <video
         ref={videoRef}
         src={src}
+        preload="auto"
         style={{
           display: 'block',
           ...(isFullscreen ? {

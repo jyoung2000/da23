@@ -2095,8 +2095,12 @@ def _compute_safe_range(src_ratio: float, target_ratio: float, edge_buffer: int 
     R = src_ratio / target_ratio
     if R <= 1.01:
         return (5, 95)
-    sx_at_min = (edge_buffer * (R - 1) + 50) / R
-    sx_at_max = ((100 - edge_buffer) * (R - 1) + 50) / R
+    # Scale edge buffer with magnification ratio so high-R crops (16:9→9:16)
+    # don't push faces to the frame edge. A face is ~10% of source width;
+    # at R≈3.16 the crop window is ~31% of source, so we need more margin.
+    scaled_buffer = min(20, round(edge_buffer + (R - 1) * 3))
+    sx_at_min = (scaled_buffer * (R - 1) + 50) / R
+    sx_at_max = ((100 - scaled_buffer) * (R - 1) + 50) / R
     return (
         max(5, math.ceil(sx_at_min)),
         min(95, math.floor(sx_at_max)),

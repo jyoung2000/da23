@@ -442,13 +442,22 @@ export default function ClipPreview({
       }
     };
 
+    const onError = () => {
+      // Retry once on load error (handles transient partial content failures)
+      if (!video._retried) {
+        video._retried = true;
+        video.load();
+      }
+    };
     video.addEventListener('loadedmetadata', onLoaded);
     video.addEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('error', onError);
     if (video.readyState >= 1) onLoaded();
 
     return () => {
       video.removeEventListener('loadedmetadata', onLoaded);
       video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('error', onError);
     };
   }, [clipStart, clipEnd]);
 
@@ -1019,6 +1028,7 @@ export default function ClipPreview({
         <video
           ref={fgVideoRef}
           src={src}
+          preload="auto"
           playsInline
           style={videoStyle}
           onClick={togglePlay}

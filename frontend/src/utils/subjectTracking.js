@@ -34,9 +34,16 @@ export function computeSafeRange(srcRatio, targetRatio, edgeBuffer = 8) {
     // No horizontal overflow — any subject_x is fine
     return { min: 5, max: 95 };
   }
+  // Scale edgeBuffer with magnification ratio so that at high R values
+  // (e.g. 16:9→9:16, R≈3.16) the crop can't push a face to the frame edge.
+  // A face is ~10% of frame width. At R=3.16 the crop window is ~31% of
+  // source width, so 10% of source = ~32% of crop. We need the crop center
+  // to stay at least half a face width from the crop edge.
+  // edgeBuffer=8 works for R<2, but at R≈3 we need ~14-15.
+  const scaledBuffer = Math.min(20, Math.round(edgeBuffer + (R - 1) * 3));
   // Invert the centerPct formula: sx = (pct * (R - 1) + 50) / R
-  const sxAtMin = (edgeBuffer * (R - 1) + 50) / R;
-  const sxAtMax = ((100 - edgeBuffer) * (R - 1) + 50) / R;
+  const sxAtMin = (scaledBuffer * (R - 1) + 50) / R;
+  const sxAtMax = ((100 - scaledBuffer) * (R - 1) + 50) / R;
   return {
     min: Math.ceil(Math.max(5, sxAtMin)),
     max: Math.floor(Math.min(95, sxAtMax)),
