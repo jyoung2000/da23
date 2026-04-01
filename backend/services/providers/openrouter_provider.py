@@ -792,9 +792,9 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             fd = getattr(frame, 'face_data', None)
             if fd and hasattr(fd, 'faces') and fd.faces:
                 if len(fd.faces) == 1:
-                    return round(fd.faces[0].nose_x)
+                    return round(fd.faces[0].x_center)
                 if fd.primary_face_idx >= 0:
-                    return round(fd.faces[fd.primary_face_idx].nose_x)
+                    return round(fd.faces[fd.primary_face_idx].x_center)
             return 50
 
         async def _analyze_batch(batch, batch_idx, _depth=0):
@@ -972,17 +972,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
 
                         # Step 4: Use actual face position from THIS frame
                         if chosen_slot is not None:
-                            best_face = min(fd.faces, key=lambda f: abs(f.nose_x - chosen_slot.x_center))
-                            sx = round(best_face.nose_x)
+                            # Use x_center (bbox midpoint) for centering, not nose_x
+                            # which can be offset when head is turned
+                            best_face = min(fd.faces, key=lambda f: abs(f.x_center - chosen_slot.x_center))
+                            sx = round(best_face.x_center)
                             _prev_slot_id = chosen_slot.slot_id
 
                     elif fd and hasattr(fd, 'faces') and fd.faces:
-                        # No registry — direct face fusion
+                        # No registry — direct face fusion using bbox center
                         if len(fd.faces) == 1:
-                            sx = round(fd.faces[0].nose_x)
+                            sx = round(fd.faces[0].x_center)
                         elif len(fd.faces) >= 2:
-                            best_f = min(fd.faces, key=lambda f: abs(f.nose_x - _prev_sx))
-                            sx = round(best_f.nose_x)
+                            best_f = min(fd.faces, key=lambda f: abs(f.x_center - _prev_sx))
+                            sx = round(best_f.x_center)
                     elif sx == 50 and _prev_sx != 50:
                         sx = _prev_sx
 
@@ -1020,10 +1022,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             fd = getattr(frame_ref, 'face_data', None)
                             if fd and hasattr(fd, 'faces') and fd.faces:
                                 if fd.primary_face_idx >= 0:
-                                    scene.subject_x = round(fd.faces[fd.primary_face_idx].nose_x)
+                                    scene.subject_x = round(fd.faces[fd.primary_face_idx].x_center)
                                     overridden += 1
                                 elif len(fd.faces) == 1:
-                                    scene.subject_x = round(fd.faces[0].nose_x)
+                                    scene.subject_x = round(fd.faces[0].x_center)
                                     overridden += 1
                         if overridden > 0:
                             logger.warning(

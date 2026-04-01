@@ -1191,9 +1191,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         _fallback_sx = 50 + offset
                         if _fd and hasattr(_fd, 'faces') and _fd.faces:
                             if len(_fd.faces) == 1:
-                                _fallback_sx = round(_fd.faces[0].nose_x)
+                                _fallback_sx = round(_fd.faces[0].x_center)
                             elif _fd.primary_face_idx >= 0:
-                                _fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
+                                _fallback_sx = round(_fd.faces[_fd.primary_face_idx].x_center)
                         scenes.append(SceneDescription(
                             timestamp=frame.timestamp,
                             description=f"Frame at {mins}:{secs:02d} (vision unavailable — CLIP on CPU, model needs GPU)",
@@ -1223,9 +1223,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         _fallback_sx = 50 + offset
                         if _fd and hasattr(_fd, 'faces') and _fd.faces:
                             if len(_fd.faces) == 1:
-                                _fallback_sx = round(_fd.faces[0].nose_x)
+                                _fallback_sx = round(_fd.faces[0].x_center)
                             elif _fd.primary_face_idx >= 0:
-                                _fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
+                                _fallback_sx = round(_fd.faces[_fd.primary_face_idx].x_center)
                         scenes.append(SceneDescription(
                             timestamp=frame.timestamp,
                             description=f"Frame at {mins}:{secs:02d} (vision model crashed — check Ollama logs)",
@@ -1547,15 +1547,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         # Map AI's subject_x to nearest face slot
                         slot = registry.nearest_slot(subject_x)
                         if slot:
-                            # Use actual face position from this frame
-                            best_face = min(fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
-                            subject_x = round(best_face.nose_x)
+                            # Use bbox center for centering (not nose which shifts with head turn)
+                            best_face = min(fd.faces, key=lambda f: abs(f.x_center - slot.x_center))
+                            subject_x = round(best_face.x_center)
                     elif fd and hasattr(fd, 'faces') and fd.faces:
                         if len(fd.faces) == 1:
-                            subject_x = round(fd.faces[0].nose_x)
+                            subject_x = round(fd.faces[0].x_center)
                         elif len(fd.faces) >= 2:
-                            nearest = min(fd.faces, key=lambda f: abs(f.nose_x - _prev_sx))
-                            subject_x = round(nearest.nose_x)
+                            nearest = min(fd.faces, key=lambda f: abs(f.x_center - _prev_sx))
+                            subject_x = round(nearest.x_center)
                     elif subject_x == 50 and _prev_sx != 50:
                         subject_x = _prev_sx
 
@@ -1659,15 +1659,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             # Registry mode: snap to nearest slot
                             slot = _reg.nearest_slot(_prev_sx)
                             if slot:
-                                best = min(_fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
-                                fallback_sx = round(best.nose_x)
+                                best = min(_fd.faces, key=lambda f: abs(f.x_center - slot.x_center))
+                                fallback_sx = round(best.x_center)
                         elif _fd and hasattr(_fd, 'faces') and _fd.faces:
                             if len(_fd.faces) == 1:
-                                fallback_sx = round(_fd.faces[0].nose_x)
+                                fallback_sx = round(_fd.faces[0].x_center)
                             elif _fd.primary_face_idx >= 0:
-                                fallback_sx = round(_fd.faces[_fd.primary_face_idx].nose_x)
+                                fallback_sx = round(_fd.faces[_fd.primary_face_idx].x_center)
                             elif len(_fd.faces) >= 2:
-                                fallback_sx = round(min(_fd.faces, key=lambda f: abs(f.nose_x - _prev_sx)).nose_x)
+                                fallback_sx = round(min(_fd.faces, key=lambda f: abs(f.x_center - _prev_sx)).x_center)
                         if fallback_sx is None:
                             fallback_sx = 50
                             for j in range(fi - 1, -1, -1):
@@ -1772,17 +1772,17 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 if _reg and _reg.multi_speaker and _fd and hasattr(_fd, 'faces') and _fd.faces:
                     slot = _reg.nearest_slot(prev_sx if prev_sx is not None else 50)
                     if slot:
-                        best = min(_fd.faces, key=lambda f: abs(f.nose_x - slot.x_center))
-                        interp_sx = round(best.nose_x)
+                        best = min(_fd.faces, key=lambda f: abs(f.x_center - slot.x_center))
+                        interp_sx = round(best.x_center)
                     else:
-                        interp_sx = round(_fd.faces[0].nose_x)
+                        interp_sx = round(_fd.faces[0].x_center)
                 elif _fd and hasattr(_fd, 'faces') and _fd.faces:
                     if len(_fd.faces) == 1:
-                        interp_sx = round(_fd.faces[0].nose_x)
+                        interp_sx = round(_fd.faces[0].x_center)
                     elif prev_sx is not None:
-                        interp_sx = round(min(_fd.faces, key=lambda f: abs(f.nose_x - prev_sx)).nose_x)
+                        interp_sx = round(min(_fd.faces, key=lambda f: abs(f.x_center - prev_sx)).x_center)
                     else:
-                        interp_sx = round(_fd.faces[0].nose_x)
+                        interp_sx = round(_fd.faces[0].x_center)
                 elif prev_sx is not None and next_sx is not None and prev_ts is not None and next_ts is not None:
                     dt = next_ts - prev_ts
                     if dt > 0:

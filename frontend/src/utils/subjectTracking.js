@@ -28,7 +28,7 @@ const SAFE_MARGIN = 10;
  * @param {number} edgeBuffer - Buffer from objectPosition 0%/100% (default 8)
  * @returns {{ min: number, max: number }} Safe subject_x range
  */
-export function computeSafeRange(srcRatio, targetRatio, edgeBuffer = 8) {
+export function computeSafeRange(srcRatio, targetRatio, edgeBuffer = 3) {
   const R = srcRatio / targetRatio;
   if (R <= 1.01) {
     // No horizontal overflow — any subject_x is fine

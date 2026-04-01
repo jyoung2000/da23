@@ -84,7 +84,7 @@ def build_face_registry(
             # Skip faces that are suspiciously wide (merged detections)
             if face.width > 18.0 and 30 < face.x_center < 70:
                 continue
-            all_faces.append((face.nose_x, face.width, face.height, fi))
+            all_faces.append((face.x_center, face.width, face.height, fi))
 
     if not all_faces:
         return FaceRegistry(

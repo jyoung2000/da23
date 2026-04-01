@@ -2084,7 +2084,7 @@ def _compute_video_out_dims(
     return src_w, src_h
 
 
-def _compute_safe_range(src_ratio: float, target_ratio: float, edge_buffer: int = 8) -> tuple[int, int]:
+def _compute_safe_range(src_ratio: float, target_ratio: float, edge_buffer: int = 3) -> tuple[int, int]:
     """Compute safe subject_x range for a given aspect ratio conversion.
 
     Ensures that any subject_x within this range will produce a non-clamped
