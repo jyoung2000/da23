@@ -69,7 +69,22 @@ RUN pip install --upgrade pip && \
 # Install pyannote.audio for neural speaker diarization (CPU torch for non-GPU builds)
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir pyannote.audio>=3.1.0 && \
-    pip install --no-cache-dir --no-deps mediapipe==0.10.8
+    # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
+    pip install --no-cache-dir \
+        flatbuffers>=23.1.4 \
+        attrs>=23.1.0 \
+        sounddevice>=0.4.6 \
+        absl-py>=1.0.0 && \
+    # MediaPipe itself — skip deps to avoid protobuf<4 constraint
+    pip install --no-cache-dir --no-deps mediapipe==0.10.8 && \
+    # Verify MediaPipe can actually load (fail build early if broken)
+    python3 -c "import mediapipe; print(f'MediaPipe {mediapipe.__version__} installed')" && \
+    python3 -c "import mediapipe.python.solutions.face_mesh; print('FaceMesh available')"
+
+# Download YuNet model for face detection fallback (~350KB, one-time)
+RUN mkdir -p /app/backend/models && \
+    curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
 # Install CUDA runtime libraries via pip for GPU passthrough support.
 # These PyPI packages provide the CUDA shared libraries that ctranslate2

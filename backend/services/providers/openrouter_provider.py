@@ -970,16 +970,19 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             if chosen_slot is None and registry.slots:
                                 chosen_slot = max(registry.slots, key=lambda s: s.frame_count)
 
-                        # Step 4: Use the slot to VALIDATE which speaker is active,
-                        # but keep the AI's subject_x value. The AI sees the actual
-                        # image and its position estimate is often more accurate than
-                        # the Haar cascade bbox center. Only override with slot center
-                        # if the AI returned a useless default (50) or no slot matched.
+                        # Step 4: Use the detected face position (from FaceMesh/YuNet)
+                        # when available — it's much more accurate than the AI's
+                        # subject_x estimate. Only fall back to AI or slot center
+                        # when no face data exists for this frame.
                         if chosen_slot is not None:
                             _prev_slot_id = chosen_slot.slot_id
-                            # Only override AI's sx if it's far from the chosen slot
-                            # (meaning AI likely got confused or returned a default)
-                            if abs(sx - chosen_slot.x_center) > 20:
+                            if fd and fd.faces:
+                                # Use actual detected face closest to chosen slot
+                                best_face = min(fd.faces,
+                                    key=lambda f: abs(f.x_center - chosen_slot.x_center))
+                                sx = round(best_face.x_center)
+                            elif abs(sx - chosen_slot.x_center) > 15:
+                                # No face data — use slot center as fallback
                                 sx = round(chosen_slot.x_center)
 
                     elif fd and hasattr(fd, 'faces') and fd.faces:

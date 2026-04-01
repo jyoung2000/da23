@@ -37,25 +37,49 @@ class FrameFaces:
 def _detect_with_opencv_dnn(frame_paths, min_confidence):
     """Detect faces using OpenCV's built-in DNN face detector.
 
-    Uses the Yunet or Haar cascade detector that ships with OpenCV.
-    No extra downloads needed.
+    Tries YuNet DNN detector first (much more accurate, gives nose/mouth landmarks),
+    falls back to Haar cascade if YuNet model is unavailable.
     """
     import cv2
 
     results = []
 
-    # Try DNN face detector first (more accurate), fall back to Haar cascade
+    # Try YuNet DNN face detector first (much more accurate than Haar cascade)
     detector = None
     try:
-        # OpenCV 4.5.4+ has FaceDetectorYN
-        detector = cv2.FaceDetectorYN.create(
-            "",  # Empty string uses built-in model
-            "",
-            (300, 300),
-            min_confidence,
-        )
-    except (cv2.error, AttributeError):
-        pass
+        yunet_paths = [
+            os.path.join(os.path.dirname(cv2.__file__), "data",
+                         "face_detection_yunet_2023mar.onnx"),
+            "/usr/local/share/opencv4/face_detection_yunet_2023mar.onnx",
+            "/usr/share/opencv4/face_detection_yunet_2023mar.onnx",
+            os.path.join(os.path.dirname(__file__), "..", "models",
+                         "face_detection_yunet_2023mar.onnx"),
+        ]
+        yunet_path = next((p for p in yunet_paths if os.path.exists(p)), None)
+
+        if yunet_path is None:
+            # Download the model (one-time, ~350KB)
+            import urllib.request
+            model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+            os.makedirs(model_dir, exist_ok=True)
+            yunet_path = os.path.join(model_dir, "face_detection_yunet_2023mar.onnx")
+            if not os.path.exists(yunet_path):
+                url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+                logger.info("Downloading YuNet face detection model...")
+                urllib.request.urlretrieve(url, yunet_path)
+                logger.info("YuNet model downloaded to %s", yunet_path)
+
+        if yunet_path and os.path.exists(yunet_path):
+            detector = cv2.FaceDetectorYN.create(
+                yunet_path,
+                "",
+                (320, 320),  # Will be resized per-frame
+                min_confidence,
+                0.3,  # NMS threshold
+            )
+            logger.info("Using OpenCV YuNet DNN face detector")
+    except (cv2.error, AttributeError, Exception) as e:
+        logger.debug("YuNet not available: %s", e)
 
     use_haar = detector is None
 
@@ -84,7 +108,44 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
         h, w = img.shape[:2]
         faces: list[FaceInfo] = []
 
-        if use_haar:
+        if not use_haar and detector is not None:
+            # YuNet DNN detection — much more accurate, gives landmarks
+            detector.setInputSize((w, h))
+            _, det_result = detector.detect(img)
+            if det_result is not None:
+                for face in det_result:
+                    # YuNet returns: [x, y, w, h, right_eye_x, right_eye_y,
+                    #   left_eye_x, left_eye_y, nose_x, nose_y,
+                    #   right_mouth_x, right_mouth_y, left_mouth_x, left_mouth_y, score]
+                    fx, fy, fw_px, fh_px = face[0], face[1], face[2], face[3]
+                    nose_x_px, nose_y_px = face[8], face[9]
+                    score = face[14]
+
+                    cx = (fx + fw_px / 2) / w * 100
+                    cy = (fy + fh_px / 2) / h * 100
+                    fw_pct = fw_px / w * 100
+                    fh_pct = fh_px / h * 100
+                    nose_x_pct = nose_x_px / w * 100
+                    nose_y_pct = nose_y_px / h * 100
+
+                    # Compute lip aperture from mouth landmarks
+                    right_mouth_y = face[11]
+                    left_mouth_y = face[13]
+                    mouth_center_y = (right_mouth_y + left_mouth_y) / 2
+                    lip_aperture = abs(mouth_center_y - nose_y_px) / max(fh_px, 1) * 0.3
+
+                    faces.append(FaceInfo(
+                        x_center=round(cx, 1),
+                        y_center=round(cy, 1),
+                        width=round(fw_pct, 1),
+                        height=round(fh_pct, 1),
+                        nose_x=round(nose_x_pct, 1),
+                        nose_y=round(nose_y_pct, 1),
+                        confidence=round(float(score), 3),
+                        lip_aperture=round(lip_aperture, 3),
+                    ))
+
+        elif use_haar:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             detections = cascade.detectMultiScale(
                 gray, scaleFactor=1.1, minNeighbors=5,
@@ -115,14 +176,12 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
                 cy = (y + fh / 2) / h * 100
                 fw_pct = fw / w * 100
                 fh_pct = fh / h * 100
-                # Haar cascade bboxes are systematically biased outward —
-                # they extend more into background than toward the face center.
-                # Pull the detected position inward, proportional to both face
-                # width and distance from center. Stronger correction for faces
-                # further from center (where the bias is larger).
+                # Haar bboxes extend slightly more into background than toward
+                # face center. Apply a small inward correction (max 3%) instead
+                # of an aggressive heuristic that can overcorrect.
                 edge_dist = abs(cx - 50)
-                if edge_dist > 10:
-                    pull = fw_pct * (edge_dist / 50) * 2.5
+                if edge_dist > 15:
+                    pull = min(3.0, fw_pct * 0.15)
                     cx = cx + pull if cx < 50 else cx - pull
                 faces.append(FaceInfo(
                     x_center=round(cx, 1), y_center=round(cy, 1),

@@ -1547,9 +1547,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         # Map AI's subject_x to nearest face slot
                         slot = registry.nearest_slot(subject_x)
                         if slot:
-                            # Only override AI's estimate if it's far from the slot
-                            if abs(subject_x - slot.x_center) > 20:
-                                subject_x = round(slot.x_center)
+                            # Use actual detected face closest to chosen slot
+                            # (much more accurate than AI estimate)
+                            best_face = min(fd.faces,
+                                key=lambda f: abs(f.x_center - slot.x_center))
+                            subject_x = round(best_face.x_center)
                     elif fd and hasattr(fd, 'faces') and fd.faces:
                         if len(fd.faces) == 1:
                             subject_x = round(fd.faces[0].x_center)

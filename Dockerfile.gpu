@@ -116,15 +116,26 @@ RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt && \
     pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
     pip3 install --no-cache-dir pyannote.audio>=3.1.0 torch>=2.0.0 && \
-    # MediaPipe installed separately: its protobuf<4 requirement conflicts with
-    # torch/pyannote which need protobuf>=4. Using --no-deps skips that constraint.
-    # The runtime protobuf version (>=4) works fine with mediapipe 0.10.8.
+    # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
+    pip3 install --no-cache-dir \
+        flatbuffers>=23.1.4 \
+        attrs>=23.1.0 \
+        sounddevice>=0.4.6 \
+        absl-py>=1.0.0 && \
+    # MediaPipe itself — skip deps to avoid protobuf<4 constraint
     pip3 install --no-cache-dir --no-deps mediapipe==0.10.8 && \
+    # Verify MediaPipe can actually load (fail build early if broken)
+    python3 -c "import mediapipe; print(f'MediaPipe {mediapipe.__version__} installed')" && \
+    python3 -c "import mediapipe.python.solutions.face_mesh; print('FaceMesh available')" && \
     # Register pip-installed NVIDIA libs so ctranslate2/torch can find them at runtime
-    # (path varies by Python version — 3.10 on Ubuntu 22.04, 3.11 if installed from apt)
     python3 -c "import nvidia.cublas; print(nvidia.cublas.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
     python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
     ldconfig
+
+# Download YuNet model for face detection fallback (~350KB, one-time)
+RUN mkdir -p /app/backend/models && \
+    curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
 # Copy backend source
 COPY backend/ ./backend/

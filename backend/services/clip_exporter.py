@@ -2142,6 +2142,47 @@ def _center_crop_offset(sx: int, src_w: int, crop_w: int) -> int:
     return max(0, min(max_offset, x_offset))
 
 
+def _verify_face_centering(
+    sx: int, src_w: int, crop_w: int,
+    label: str = "",
+) -> int:
+    """Verify the face is well-centered in the crop and adjust if needed.
+
+    Computes where the subject (at sx% of source) ends up in the crop.
+    If the face is more than 10% off-center, adjusts the offset to
+    improve centering while staying within bounds.
+
+    Returns the adjusted crop x_offset.
+    """
+    x_offset = _center_crop_offset(sx, src_w, crop_w)
+    subject_pixel = src_w * sx / 100
+    if crop_w <= 0:
+        return x_offset
+    face_in_crop_pct = (subject_pixel - x_offset) / crop_w * 100
+    off_center = face_in_crop_pct - 50
+
+    if abs(off_center) > 10:
+        # Face is significantly off-center — try to improve
+        ideal_offset = round(subject_pixel - crop_w / 2)
+        max_offset = src_w - crop_w
+        adjusted = max(0, min(max_offset, ideal_offset))
+
+        new_face_pct = (subject_pixel - adjusted) / crop_w * 100
+        new_off = new_face_pct - 50
+
+        if abs(new_off) < abs(off_center):
+            logger.info(
+                "[SubjectTracking] Face centering fix%s: sx=%d, was %.1f%% in crop "
+                "(%.1f%% off), now %.1f%% (%.1f%% off), offset %d→%d",
+                f" ({label})" if label else "",
+                sx, face_in_crop_pct, off_center, new_face_pct, new_off,
+                x_offset, adjusted,
+            )
+            return adjusted
+
+    return x_offset
+
+
 def _build_speaker_position_map(scenes: list, transcript: list | None) -> dict[str, int]:
     """Correlate scene positions with transcript speaker labels.
     Matches frontend buildSpeakerPositionMap() exactly."""
@@ -3026,7 +3067,7 @@ def _build_crop_x_expr(
     def _sx_to_offset(sx: int) -> int:
         """Convert subject_x to a centering crop offset with safety clamping."""
         if src_w > 0 and crop_w > 0:
-            return _center_crop_offset(sx, src_w, crop_w)
+            return _verify_face_centering(sx, src_w, crop_w)
         # Fallback to proportional if dimensions not provided
         return max(0, min(max_offset, int(max_offset * sx / 100)))
 
@@ -3533,7 +3574,7 @@ def _build_filter_chain(
                 else:
                     # All keyframes same value → static centered
                     sx = _safe_subject_x(subject_keyframes[0][1])
-                    x_offset = _center_crop_offset(sx, src_w, crop_w)
+                    x_offset = _verify_face_centering(sx, src_w, crop_w, label="converged")
                     filters.append(f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset}")
                     logger.info(
                         "[SubjectTracking] STATIC CROP (converged keyframes): sx=%d → x_offset=%d, "
@@ -3546,7 +3587,7 @@ def _build_filter_chain(
                     sx = _safe_subject_x(subject_keyframes[0][1])
                 else:
                     sx = _safe_subject_x(subject_x)
-                x_offset = _center_crop_offset(sx, src_w, crop_w)
+                x_offset = _verify_face_centering(sx, src_w, crop_w, label="static")
                 filters.append(f"crop={crop_w}:{crop_h}:{x_offset}:{y_offset}")
                 subject_pixel = src_w * sx / 100
                 crop_center = x_offset + crop_w / 2
@@ -3558,6 +3599,30 @@ def _build_filter_chain(
                 )
 
         filters.append(f"scale={out_w}:{out_h}")
+
+        # ── Centering verification for preview-export parity ──
+        if subject_keyframes:
+            for label_kf, kf in [("first", subject_keyframes[0]), ("last", subject_keyframes[-1])]:
+                t_kf, sx_kf = kf
+                sx_safe = _safe_subject_x(sx_kf, src_ratio=src_ratio, target_ratio=target_ratio)
+                offset_kf = _center_crop_offset(sx_safe, src_w, crop_w)
+                face_pixel = src_w * sx_kf / 100
+                face_in_crop = (face_pixel - offset_kf) / crop_w * 100 if crop_w > 0 else 50
+
+                # Compute what the preview shows
+                R = src_ratio / target_ratio if target_ratio > 0 else 1
+                preview_pct = (R * sx_safe - 50) / (R - 1) if R > 1.01 else sx_safe
+                preview_pct = max(0, min(100, preview_pct))
+
+                logger.info(
+                    "[SubjectTracking] Parity check (%s kf): sx=%d → safe=%d, "
+                    "export: offset=%dpx face@%.0f%% of crop, "
+                    "preview: objectPosition=%.1f%%, "
+                    "error=%.1f%%",
+                    label_kf, sx_kf, sx_safe, offset_kf, face_in_crop,
+                    preview_pct, abs(face_in_crop - 50),
+                )
+
     elif needs_quality_scale:
         # No aspect ratio change but quality requires resizing — scale preserving aspect ratio
         # Use -2 for width so FFmpeg auto-computes an even width from the target height
