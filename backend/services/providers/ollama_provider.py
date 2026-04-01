@@ -1547,9 +1547,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         # Map AI's subject_x to nearest face slot
                         slot = registry.nearest_slot(subject_x)
                         if slot:
-                            # Use bbox center for centering (not nose which shifts with head turn)
-                            best_face = min(fd.faces, key=lambda f: abs(f.x_center - slot.x_center))
-                            subject_x = round(best_face.x_center)
+                            # Use the SLOT CENTER (stable median) not the frame's bbox.
+                            # Haar cascade bboxes overshoot on faces near frame edges.
+                            subject_x = round(slot.x_center)
                     elif fd and hasattr(fd, 'faces') and fd.faces:
                         if len(fd.faces) == 1:
                             subject_x = round(fd.faces[0].x_center)
@@ -1659,8 +1659,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             # Registry mode: snap to nearest slot
                             slot = _reg.nearest_slot(_prev_sx)
                             if slot:
-                                best = min(_fd.faces, key=lambda f: abs(f.x_center - slot.x_center))
-                                fallback_sx = round(best.x_center)
+                                fallback_sx = round(slot.x_center)
                         elif _fd and hasattr(_fd, 'faces') and _fd.faces:
                             if len(_fd.faces) == 1:
                                 fallback_sx = round(_fd.faces[0].x_center)
@@ -1772,8 +1771,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 if _reg and _reg.multi_speaker and _fd and hasattr(_fd, 'faces') and _fd.faces:
                     slot = _reg.nearest_slot(prev_sx if prev_sx is not None else 50)
                     if slot:
-                        best = min(_fd.faces, key=lambda f: abs(f.x_center - slot.x_center))
-                        interp_sx = round(best.x_center)
+                        interp_sx = round(slot.x_center)
                     else:
                         interp_sx = round(_fd.faces[0].x_center)
                 elif _fd and hasattr(_fd, 'faces') and _fd.faces:

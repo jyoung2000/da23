@@ -115,6 +115,15 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
                 cy = (y + fh / 2) / h * 100
                 fw_pct = fw / w * 100
                 fh_pct = fh / h * 100
+                # Haar cascade bboxes are systematically biased outward —
+                # they extend more into background than toward the face center.
+                # Pull the detected position inward, proportional to both face
+                # width and distance from center. Stronger correction for faces
+                # further from center (where the bias is larger).
+                edge_dist = abs(cx - 50)
+                if edge_dist > 10:
+                    pull = fw_pct * (edge_dist / 50) * 1.5
+                    cx = cx + pull if cx < 50 else cx - pull
                 faces.append(FaceInfo(
                     x_center=round(cx, 1), y_center=round(cy, 1),
                     width=round(fw_pct, 1), height=round(fh_pct, 1),

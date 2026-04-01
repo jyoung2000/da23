@@ -130,18 +130,42 @@ def build_face_registry(
         if best_cluster is not None and best_dist <= 15:
             best_cluster.append(mf)
 
-    # Build slots from clusters with enough appearances
+    # Build slots from clusters with enough appearances.
+    # Use median (not mean) for x_center — robust to Haar cascade outliers
+    # where the bbox extends asymmetrically into the background.
+    # Also trim extreme outliers (outside IQR * 1.5) before computing.
     slots = []
     for cluster in clusters:
         unique_frames = len(set(f[3] for f in cluster))
         if unique_frames < min_appearances:
             continue
-        x_positions = [f[0] for f in cluster]
+        x_positions = sorted([f[0] for f in cluster])
         widths = [f[1] for f in cluster]
         heights = [f[2] for f in cluster]
+
+        # IQR-based outlier trimming (AutoFlip-style temporal filtering)
+        if len(x_positions) >= 5:
+            q1_idx = len(x_positions) // 4
+            q3_idx = 3 * len(x_positions) // 4
+            q1 = x_positions[q1_idx]
+            q3 = x_positions[q3_idx]
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            trimmed = [x for x in x_positions if lower <= x <= upper]
+            if len(trimmed) >= min_appearances:
+                x_positions = trimmed
+
+        # Median for robustness
+        mid = len(x_positions) // 2
+        if len(x_positions) % 2 == 0 and len(x_positions) >= 2:
+            median_x = (x_positions[mid - 1] + x_positions[mid]) / 2
+        else:
+            median_x = x_positions[mid]
+
         slots.append(FaceSlot(
             slot_id=len(slots),
-            x_center=round(sum(x_positions) / len(x_positions), 1),
+            x_center=round(median_x, 1),
             x_min=round(min(x_positions), 1),
             x_max=round(max(x_positions), 1),
             frame_count=unique_frames,

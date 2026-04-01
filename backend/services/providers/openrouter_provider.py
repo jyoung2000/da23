@@ -970,12 +970,12 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             if chosen_slot is None and registry.slots:
                                 chosen_slot = max(registry.slots, key=lambda s: s.frame_count)
 
-                        # Step 4: Use actual face position from THIS frame
+                        # Step 4: Use the SLOT CENTER (stable median) not the frame's
+                        # bbox center. Haar cascade bboxes overshoot by 10-15% on
+                        # faces near frame edges. The registry slot center is an
+                        # IQR-trimmed median across many frames — much more accurate.
                         if chosen_slot is not None:
-                            # Use x_center (bbox midpoint) for centering, not nose_x
-                            # which can be offset when head is turned
-                            best_face = min(fd.faces, key=lambda f: abs(f.x_center - chosen_slot.x_center))
-                            sx = round(best_face.x_center)
+                            sx = round(chosen_slot.x_center)
                             _prev_slot_id = chosen_slot.slot_id
 
                     elif fd and hasattr(fd, 'faces') and fd.faces:
