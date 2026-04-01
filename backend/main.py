@@ -32,8 +32,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# Also write all logs to a file so they can be exported from the UI
+# Also write all logs to a file so they can be exported from the UI.
+# Clear log files on every container start so /logs only shows the current run.
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+for _old_log in [LOG_FILE, LOG_FILE + ".1", LOG_FILE + ".2", LOG_FILE + ".3"]:
+    try:
+        open(_old_log, "w").close()
+    except OSError:
+        pass
 _file_handler = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
 )
