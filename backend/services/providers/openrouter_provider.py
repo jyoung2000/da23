@@ -970,13 +970,17 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             if chosen_slot is None and registry.slots:
                                 chosen_slot = max(registry.slots, key=lambda s: s.frame_count)
 
-                        # Step 4: Use the SLOT CENTER (stable median) not the frame's
-                        # bbox center. Haar cascade bboxes overshoot by 10-15% on
-                        # faces near frame edges. The registry slot center is an
-                        # IQR-trimmed median across many frames — much more accurate.
+                        # Step 4: Use the slot to VALIDATE which speaker is active,
+                        # but keep the AI's subject_x value. The AI sees the actual
+                        # image and its position estimate is often more accurate than
+                        # the Haar cascade bbox center. Only override with slot center
+                        # if the AI returned a useless default (50) or no slot matched.
                         if chosen_slot is not None:
-                            sx = round(chosen_slot.x_center)
                             _prev_slot_id = chosen_slot.slot_id
+                            # Only override AI's sx if it's far from the chosen slot
+                            # (meaning AI likely got confused or returned a default)
+                            if abs(sx - chosen_slot.x_center) > 20:
+                                sx = round(chosen_slot.x_center)
 
                     elif fd and hasattr(fd, 'faces') and fd.faces:
                         # No registry — direct face fusion using bbox center
@@ -1009,13 +1013,14 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         active_speaker_x=active_sx,
                     ))
                 # ── Batch diversity validation ──
-                # When all subject_x in a batch are identical and >= 4 frames,
-                # the model likely pattern-matched instead of analyzing per-frame.
-                # Override with face detection positions if available.
+                # When all subject_x in a batch are identical at exactly 50 (center default),
+                # the model likely failed to analyze. Override with face detection.
+                # Do NOT override non-50 identical values — the AI may legitimately
+                # see the same speaker in all frames of a batch.
                 batch_scenes = batch_results[batch_idx]
                 if len(batch_scenes) >= 4:
                     batch_sx = [s.subject_x for s in batch_scenes]
-                    if len(set(batch_sx)) == 1:
+                    if len(set(batch_sx)) == 1 and batch_sx[0] == 50:
                         overridden = 0
                         for si, scene in enumerate(batch_scenes):
                             frame_ref = batch[si] if si < len(batch) else batch[-1]
@@ -1029,9 +1034,9 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                                     overridden += 1
                         if overridden > 0:
                             logger.warning(
-                                "Batch %d: all %d frames had identical subject_x=%d — "
+                                "Batch %d: all %d frames had center-default subject_x=50 — "
                                 "overrode %d with face detection positions",
-                                batch_idx, len(batch_sx), batch_sx[0], overridden,
+                                batch_idx, len(batch_sx), overridden,
                             )
 
                 # Ensure every frame in batch has a scene entry — some models

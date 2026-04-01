@@ -1418,7 +1418,10 @@ async def _run_analysis_inner(job_id: str):
             for scene in scenes_result:
                 sx = scene.subject_x
                 min_dist_to_slot = min(abs(sx - sc) for sc in slot_centers)
-                if min_dist_to_slot > 8:
+                # Only snap truly outlier values — those in the dead zone
+                # between speakers. A larger threshold preserves the AI's
+                # more accurate position estimates near each speaker.
+                if min_dist_to_slot > 15:
                     nearest = round(min(slot_centers, key=lambda sc: abs(sc - sx)))
                     scene.subject_x = nearest
                     corrected += 1
