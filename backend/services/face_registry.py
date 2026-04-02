@@ -75,8 +75,11 @@ def build_face_registry(
     single "slot". Transient detections (< min_appearances) are
     discarded as noise.
     """
-    # Collect all individual face positions
-    all_faces = []  # [(x_center, width, height, frame_idx)]
+    # Collect all individual face positions — use nose_x (actual face center
+    # from landmarks) rather than x_center (bbox center). nose_x is more
+    # accurate: FaceMesh gives sub-pixel nose tip, YuNet gives nose keypoint.
+    # The bbox center can be 10-20% off for side-profile faces.
+    all_faces = []  # [(nose_x, width, height, frame_idx)]
     for fi, fr in enumerate(face_results):
         if not fr.faces:
             continue
@@ -84,7 +87,7 @@ def build_face_registry(
             # Skip faces that are suspiciously wide (merged detections)
             if face.width > 18.0 and 30 < face.x_center < 70:
                 continue
-            all_faces.append((face.x_center, face.width, face.height, fi))
+            all_faces.append((face.nose_x, face.width, face.height, fi))
 
     if not all_faces:
         return FaceRegistry(
