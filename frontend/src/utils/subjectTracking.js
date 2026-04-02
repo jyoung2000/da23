@@ -40,7 +40,9 @@ export function computeSafeRange(srcRatio, targetRatio, edgeBuffer = 3) {
   // source width, so 10% of source = ~32% of crop. We need the crop center
   // to stay at least half a face width from the crop edge.
   // edgeBuffer=8 works for R<2, but at R≈3 we need ~14-15.
-  const scaledBuffer = Math.min(20, Math.round(edgeBuffer + (R - 1) * 3));
+  // Use gentler scaling (2x instead of 3x) to avoid over-clamping edge
+  // speakers in 2-person podcast layouts (e.g. faces at x=20% and x=80%).
+  const scaledBuffer = Math.min(15, Math.round(edgeBuffer + (R - 1) * 2));
   // Invert the centerPct formula: sx = (pct * (R - 1) + 50) / R
   const sxAtMin = (scaledBuffer * (R - 1) + 50) / R;
   const sxAtMax = ((100 - scaledBuffer) * (R - 1) + 50) / R;

@@ -93,11 +93,21 @@ def build_active_speaker_timeline(
                     key=lambda sid: sum(slot_scores[sid]) / len(slot_scores[sid])
                 )
                 avg_lar = sum(slot_scores[best_slot_id]) / len(slot_scores[best_slot_id])
-                events.append(SpeakerEvent(
-                    start=seg_start, end=seg_end,
-                    slot_id=best_slot_id,
-                    confidence=min(1.0, avg_lar / 0.05),
-                ))
+                # Only assign a speaker if LAR is above the speaking threshold.
+                # When no one is clearly speaking (both slots have near-zero LAR),
+                # emit slot_id=-1 so the pipeline doesn't incorrectly override
+                # the visual subject_x with a random slot pick.
+                if avg_lar >= LAR_SPEAKING_THRESHOLD:
+                    events.append(SpeakerEvent(
+                        start=seg_start, end=seg_end,
+                        slot_id=best_slot_id,
+                        confidence=min(1.0, avg_lar / 0.05),
+                    ))
+                else:
+                    events.append(SpeakerEvent(
+                        start=seg_start, end=seg_end,
+                        slot_id=-1, confidence=min(1.0, avg_lar / 0.05),
+                    ))
                 continue
 
         # Fallback: pick face with highest lip aperture
@@ -108,7 +118,7 @@ def build_active_speaker_timeline(
                 if face.lip_aperture > best_lar:
                     best_lar = face.lip_aperture
                     best_face_x = face.nose_x
-        if best_face_x is not None and face_registry:
+        if best_face_x is not None and best_lar >= LAR_SPEAKING_THRESHOLD and face_registry:
             slot = face_registry.nearest_slot(best_face_x)
             events.append(SpeakerEvent(
                 start=seg_start, end=seg_end,

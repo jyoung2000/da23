@@ -1764,20 +1764,44 @@ async def _run_analysis_inner(job_id: str):
                     sum(e.end - e.start for e in active_speaker_events),
                 )
                 # Correct scenes where lip tracking disagrees with subject_x
+                # Only apply correction when confidence is high enough to be reliable.
+                # Low confidence (< 0.3) means lip aperture data was ambiguous —
+                # the visual scene analysis is more trustworthy in that case.
                 lip_corrected = 0
-                for scene in scenes:
-                    active_slot_id = get_active_slot_at_time(
-                        active_speaker_events, scene.timestamp,
-                    )
-                    if active_slot_id >= 0:
-                        slot = face_registry.slot_by_id(active_slot_id)
-                        if slot and abs(scene.subject_x - slot.x_center) > 15:
-                            scene.subject_x = round(slot.x_center)
-                            lip_corrected += 1
-                if lip_corrected > 0:
+                avg_confidence = sum(e.confidence for e in active_speaker_events) / max(len(active_speaker_events), 1)
+                min_correction_confidence = 0.3  # Don't trust lip-audio below 30%
+                logger.info(
+                    "[%s] Active speaker avg confidence=%.2f (threshold=%.2f for correction)",
+                    job_id, avg_confidence, min_correction_confidence,
+                )
+                if avg_confidence >= min_correction_confidence:
+                    for scene in scenes:
+                        active_slot_id = get_active_slot_at_time(
+                            active_speaker_events, scene.timestamp,
+                        )
+                        if active_slot_id >= 0:
+                            # Find the event at this timestamp and check its confidence
+                            event_confidence = 0.0
+                            for ev in active_speaker_events:
+                                if ev.start <= scene.timestamp <= ev.end:
+                                    event_confidence = ev.confidence
+                                    break
+                            if event_confidence < min_correction_confidence:
+                                continue  # Skip low-confidence corrections
+                            slot = face_registry.slot_by_id(active_slot_id)
+                            if slot and abs(scene.subject_x - slot.x_center) > 15:
+                                scene.subject_x = round(slot.x_center)
+                                lip_corrected += 1
+                    if lip_corrected > 0:
+                        logger.info(
+                            "[%s] Lip-audio correction: updated %d/%d scenes to match active speaker (avg_conf=%.2f)",
+                            job_id, lip_corrected, len(scenes), avg_confidence,
+                        )
+                else:
                     logger.info(
-                        "[%s] Lip-audio correction: updated %d/%d scenes to match active speaker",
-                        job_id, lip_corrected, len(scenes),
+                        "[%s] Lip-audio correction SKIPPED: avg confidence %.2f < threshold %.2f — "
+                        "visual scene analysis is more reliable",
+                        job_id, avg_confidence, min_correction_confidence,
                     )
         except Exception as e:
             logger.warning("[%s] Active speaker detection failed (non-fatal): %s", job_id, e)
@@ -1816,7 +1840,7 @@ async def _run_analysis_inner(job_id: str):
     try:
         layout_update = {
             "face_registry_data": face_registry_dict,
-            "default_layout_mode": default_layout_mode,
+            "default_layout_mode": str(default_layout_mode),  # Ensure plain string, not LayoutMode enum
         }
         if layout_timeline:
             layout_update["layout_timeline"] = [s.to_dict() for s in layout_timeline.segments]

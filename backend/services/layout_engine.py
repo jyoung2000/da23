@@ -47,18 +47,28 @@ class LayoutSegment:
     pip_size_pct: float = 25.0
 
     def to_dict(self) -> dict:
+        # Ensure all values are plain Python types (no numpy.float32 etc.)
+        def _sanitize(v):
+            if hasattr(v, 'item'):  # numpy scalar
+                return v.item()
+            return v
+
+        clean_positions = []
+        for fp in self.face_positions:
+            clean_positions.append({k: _sanitize(v) for k, v in fp.items()})
+
         return {
-            "start": self.start,
-            "end": self.end,
-            "layout_mode": self.layout_mode,
-            "face_positions": self.face_positions,
+            "start": float(self.start),
+            "end": float(self.end),
+            "layout_mode": str(self.layout_mode),
+            "face_positions": clean_positions,
             "transition_type": self.transition_type,
-            "left_face_slot": self.left_face_slot,
-            "right_face_slot": self.right_face_slot,
-            "primary_face_slot": self.primary_face_slot,
-            "pip_face_slot": self.pip_face_slot,
+            "left_face_slot": int(self.left_face_slot),
+            "right_face_slot": int(self.right_face_slot),
+            "primary_face_slot": int(self.primary_face_slot),
+            "pip_face_slot": int(self.pip_face_slot),
             "pip_position": self.pip_position,
-            "pip_size_pct": self.pip_size_pct,
+            "pip_size_pct": float(self.pip_size_pct),
         }
 
 
