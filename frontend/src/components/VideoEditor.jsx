@@ -1452,7 +1452,7 @@ export default function VideoEditor({
       const trackingOn = !activeSeg || activeSeg.subjectTrackingEnabled !== false;
       const sx = trackingOn
         ? interpolateSubjectX(subjectKeyframes, relTime)
-        : (safeSubjectX ? safeSubjectX(subjectX) : subjectX);
+        : (safeSubjectX ? safeSubjectX(subjectX, srcRatio, targetRatio) : subjectX);
       let centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
       // Smooth transition when aspect ratio just changed
       if (transitionStartRef.current !== null && lastAppliedPctRef.current !== null) {

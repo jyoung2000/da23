@@ -444,12 +444,12 @@ def detect_faces_batch(
     except Exception as e:
         logger.info("MediaPipe FaceDetection unavailable (%s), trying OpenCV", e)
 
-    # Fall back to OpenCV
+    # Fall back to OpenCV (YuNet DNN → Haar cascade)
     try:
         results = _detect_with_opencv_dnn(frame_paths, min_confidence)
         if results is not None:
             elapsed = _t.monotonic() - t0
-            logger.info("Face detection using OpenCV Haar cascade (%.1fs for %d frames)", elapsed, len(frame_paths))
+            logger.info("Face detection using OpenCV DNN/Haar (%.1fs for %d frames)", elapsed, len(frame_paths))
             _log_summary(results)
             return results
     except Exception as e:

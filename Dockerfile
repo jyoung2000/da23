@@ -12,6 +12,10 @@ FROM python:3.11-slim
 # Make NVIDIA GPUs visible when passed through with --gpus
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+# Force pure-Python protobuf so MediaPipe 0.10.8 graph configs parse correctly
+# with protobuf>=4 (required by torch/pyannote). The C++ implementation
+# rejects 3.x-format graph definitions under protobuf 4.x.
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # Install system dependencies (ca-certificates ensures HTTPS model downloads work)
 RUN apt-get update && apt-get install -y --no-install-recommends \

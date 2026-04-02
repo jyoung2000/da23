@@ -977,21 +977,25 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                         if chosen_slot is not None:
                             _prev_slot_id = chosen_slot.slot_id
                             if fd and fd.faces:
-                                # Use actual detected face closest to chosen slot
+                                # Use actual detected face closest to chosen slot.
+                                # Match by x_center (bbox), but use nose_x for the
+                                # crop position — nose_x is the actual face center
+                                # (from FaceMesh/YuNet landmarks), more accurate
+                                # than the bbox center for centering the crop.
                                 best_face = min(fd.faces,
                                     key=lambda f: abs(f.x_center - chosen_slot.x_center))
-                                sx = round(best_face.x_center)
+                                sx = round(best_face.nose_x)
                             elif abs(sx - chosen_slot.x_center) > 15:
                                 # No face data — use slot center as fallback
                                 sx = round(chosen_slot.x_center)
 
                     elif fd and hasattr(fd, 'faces') and fd.faces:
-                        # No registry — direct face fusion using bbox center
+                        # No registry — use nose_x for accurate face centering
                         if len(fd.faces) == 1:
-                            sx = round(fd.faces[0].x_center)
+                            sx = round(fd.faces[0].nose_x)
                         elif len(fd.faces) >= 2:
                             best_f = min(fd.faces, key=lambda f: abs(f.x_center - _prev_sx))
-                            sx = round(best_f.x_center)
+                            sx = round(best_f.nose_x)
                     elif sx == 50 and _prev_sx != 50:
                         sx = _prev_sx
 
@@ -1030,10 +1034,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                             fd = getattr(frame_ref, 'face_data', None)
                             if fd and hasattr(fd, 'faces') and fd.faces:
                                 if fd.primary_face_idx >= 0:
-                                    scene.subject_x = round(fd.faces[fd.primary_face_idx].x_center)
+                                    scene.subject_x = round(fd.faces[fd.primary_face_idx].nose_x)
                                     overridden += 1
                                 elif len(fd.faces) == 1:
-                                    scene.subject_x = round(fd.faces[0].x_center)
+                                    scene.subject_x = round(fd.faces[0].nose_x)
                                     overridden += 1
                         if overridden > 0:
                             logger.warning(

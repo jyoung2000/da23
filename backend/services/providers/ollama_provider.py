@@ -1547,17 +1547,19 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         # Map AI's subject_x to nearest face slot
                         slot = registry.nearest_slot(subject_x)
                         if slot:
-                            # Use actual detected face closest to chosen slot
-                            # (much more accurate than AI estimate)
+                            # Use actual detected face nose position (from
+                            # FaceMesh/YuNet landmarks) — more accurate than
+                            # bbox center for centering the crop.
                             best_face = min(fd.faces,
                                 key=lambda f: abs(f.x_center - slot.x_center))
-                            subject_x = round(best_face.x_center)
+                            subject_x = round(best_face.nose_x)
                     elif fd and hasattr(fd, 'faces') and fd.faces:
+                        # Use nose_x for accurate face centering
                         if len(fd.faces) == 1:
-                            subject_x = round(fd.faces[0].x_center)
+                            subject_x = round(fd.faces[0].nose_x)
                         elif len(fd.faces) >= 2:
                             nearest = min(fd.faces, key=lambda f: abs(f.x_center - _prev_sx))
-                            subject_x = round(nearest.x_center)
+                            subject_x = round(nearest.nose_x)
                     elif subject_x == 50 and _prev_sx != 50:
                         subject_x = _prev_sx
 
