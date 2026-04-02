@@ -1988,6 +1988,7 @@ export default function Analysis() {
               sourceHeight={sourceDims.h}
               subjectX={clipSubjectX}
               scenes={job.scenes || []}
+              sceneCuts={job.scene_cut_timestamps || null}
               initialVolume={clipSettings.playbackVolume}
               initialSpeed={clipSettings.playbackSpeed}
               onTimeUpdate={setVideoCurrentTime}
@@ -2091,6 +2092,7 @@ export default function Analysis() {
               sourceHeight={sourceDims.h}
               subjectX={50}
               scenes={job.scenes || []}
+              sceneCuts={job.scene_cut_timestamps || null}
               initialVolume={clipSettings.playbackVolume}
               initialSpeed={clipSettings.playbackSpeed}
               onTimeUpdate={setVideoCurrentTime}

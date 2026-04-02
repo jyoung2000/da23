@@ -1935,6 +1935,7 @@ export default function ViralClips() {
             sourceHeight={previewSourceDims.h}
             subjectX={previewSubjectX}
             scenes={previewScenes}
+            sceneCuts={jobs.find(j => j.job_id === previewClip?.jobId)?.scene_cut_timestamps || null}
             subtitlesEnabled={previewClipSettings.subtitlesEnabled || false}
             subtitleSettings={previewClipSettings}
             transcript={previewTranscript}
