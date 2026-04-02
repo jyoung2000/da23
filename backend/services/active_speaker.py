@@ -163,3 +163,183 @@ def get_active_slot_at_time(events: list[SpeakerEvent], timestamp: float) -> int
     if prev:
         return prev[-1].slot_id
     return events[0].slot_id
+
+
+def build_active_speaker_timeline_v2(
+    face_results: list,
+    transcript_segments: list,
+    face_registry=None,
+    window_seconds: float = 1.0,
+) -> list[SpeakerEvent]:
+    """V2: Uses face identity embeddings for accurate speaker tracking.
+
+    Improvements over V1:
+    1. Uses identity_id (from embeddings) instead of positional matching
+    2. Considers lip aperture AND transcript timing simultaneously
+    3. Handles speaker overlap (both speaking) by selecting the primary
+    4. Produces events at higher temporal resolution (1s windows vs 2s)
+    5. Outputs a confidence score per event based on lip-audio correlation
+    """
+    if not face_results or not transcript_segments:
+        return []
+
+    has_identity = any(
+        f.identity_id >= 0
+        for fr in face_results
+        for f in fr.faces
+    )
+    if not has_identity:
+        logger.info("No identity data — falling back to V1 active speaker detection")
+        return build_active_speaker_timeline(
+            face_results, transcript_segments, face_registry, window_seconds
+        )
+
+    has_lip_data = any(
+        f.lip_aperture > 0
+        for fr in face_results
+        for f in fr.faces
+    )
+    if not has_lip_data:
+        logger.info("No lip aperture data available — skipping active speaker detection")
+        return []
+
+    frame_map = {}
+    for fr in face_results:
+        frame_map[fr.timestamp] = fr
+    frame_times = sorted(frame_map.keys())
+
+    events = []
+
+    for seg in transcript_segments:
+        seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
+        seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
+
+        nearby_frames = [
+            frame_map[ft]
+            for ft in frame_times
+            if seg_start - window_seconds <= ft <= seg_end + window_seconds
+        ]
+
+        if not nearby_frames:
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end, slot_id=-1, confidence=0.0
+            ))
+            continue
+
+        # Score each identity by lip aperture during this speech window
+        identity_scores: dict[int, list[float]] = {}
+        for fr in nearby_frames:
+            for face in fr.faces:
+                if face.identity_id < 0:
+                    continue
+                identity_scores.setdefault(face.identity_id, []).append(face.lip_aperture)
+
+        if identity_scores:
+            # Pick identity with highest average lip aperture
+            best_id = max(
+                identity_scores,
+                key=lambda iid: sum(identity_scores[iid]) / len(identity_scores[iid])
+            )
+            avg_lar = sum(identity_scores[best_id]) / len(identity_scores[best_id])
+
+            # Mark speaking faces
+            for fr in nearby_frames:
+                for face in fr.faces:
+                    if face.identity_id == best_id:
+                        face.is_speaking = True
+
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end,
+                slot_id=best_id,
+                confidence=min(1.0, avg_lar / 0.05),
+            ))
+        else:
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end, slot_id=-1, confidence=0.0
+            ))
+
+    # Merge consecutive events with the same speaker
+    if events:
+        merged = [events[0]]
+        for ev in events[1:]:
+            if ev.slot_id == merged[-1].slot_id and ev.start - merged[-1].end < 1.0:
+                merged[-1] = SpeakerEvent(
+                    start=merged[-1].start, end=ev.end,
+                    slot_id=ev.slot_id,
+                    confidence=max(merged[-1].confidence, ev.confidence),
+                )
+            else:
+                merged.append(ev)
+        events = merged
+
+    logger.info(
+        "Active speaker V2 timeline: %d events, %d unique speakers, avg confidence=%.2f",
+        len(events),
+        len(set(e.slot_id for e in events if e.slot_id >= 0)),
+        sum(e.confidence for e in events) / max(len(events), 1),
+    )
+
+    return events
+
+
+def map_speakers_to_face_slots(
+    transcript_segments: list,
+    face_registry,
+    face_results: list,
+) -> dict[str, int]:
+    """Map Whisper speaker labels ("Speaker 1") to face registry slot IDs.
+
+    Algorithm:
+    1. For each transcript segment with a speaker label, find the frame
+       closest to the segment's midpoint
+    2. In that frame, find the face with the highest lip aperture
+    3. That face's identity_id maps to this speaker label
+    4. Aggregate across all segments — majority vote per speaker
+
+    Returns: {"Speaker 1": 0, "Speaker 2": 1, ...}
+    """
+    if not face_registry or not face_results or not transcript_segments:
+        return {}
+
+    frame_map = {}
+    for fr in face_results:
+        frame_map[fr.timestamp] = fr
+    frame_times = sorted(frame_map.keys())
+
+    # Collect votes: speaker_label -> [slot_id, ...]
+    votes: dict[str, list[int]] = {}
+
+    for seg in transcript_segments:
+        speaker = seg.speaker if hasattr(seg, 'speaker') else seg.get('speaker', '')
+        if not speaker:
+            continue
+        seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
+        seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
+        midpoint = (seg_start + seg_end) / 2
+
+        # Find closest frame to midpoint
+        closest_time = min(frame_times, key=lambda t: abs(t - midpoint), default=None)
+        if closest_time is None:
+            continue
+        fr = frame_map[closest_time]
+        if not fr.faces:
+            continue
+
+        # Find face with highest lip aperture
+        best_face = max(fr.faces, key=lambda f: f.lip_aperture, default=None)
+        if best_face is None:
+            continue
+
+        slot = face_registry.nearest_slot(best_face.nose_x)
+        if slot:
+            votes.setdefault(speaker, []).append(slot.slot_id)
+
+    # Majority vote
+    result = {}
+    for speaker, slot_votes in votes.items():
+        from collections import Counter
+        counts = Counter(slot_votes)
+        result[speaker] = counts.most_common(1)[0][0]
+
+    logger.info("Speaker-to-slot mapping: %s", result)
+    return result

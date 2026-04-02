@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime } from '../utils/subjectTracking';
 import { outlineTextShadow } from '../utils/textOutline';
 import useResponsive from '../hooks/useResponsive';
 
@@ -270,6 +270,9 @@ export default function ClipPreview({
   inline = false,
   initialVolume,
   initialSpeed,
+  layoutTimeline = null,
+  faceRegistry = null,
+  defaultLayoutMode = 'single',
 }) {
   const { isMobile } = useResponsive();
   const fgVideoRef = useRef(null);
@@ -979,12 +982,81 @@ export default function ClipPreview({
     );
   };
 
+  // Determine active layout mode for current frame
+  const activeLayoutMode = useMemo(() => {
+    if (!layoutTimeline?.length || defaultLayoutMode === 'single') return 'single';
+    return defaultLayoutMode;
+  }, [layoutTimeline, defaultLayoutMode]);
+
   // --- Video area ---
   // Single wrapper div (no key="crop"/"original") to preserve the <video> element
   // across crop/non-crop transitions. Different keys would destroy and recreate
   // the video element, causing flash and loss of playback position.
   const renderVideoArea = () => {
     const srcRatioLocal = sourceWidth / sourceHeight;
+
+    // Layout-aware rendering: SPLIT mode shows two video instances stacked
+    if (activeLayoutMode === 'split' && isCrop && faceRegistry?.slots?.length >= 2) {
+      const sortedSlots = [...(faceRegistry.slots || [])].sort((a, b) => a.x - b.x);
+      const topSpeakerX = sortedSlots[0]?.x ?? 25;
+      const bottomSpeakerX = sortedSlots[1]?.x ?? 75;
+      const topPct = subjectXToCenterPct(topSpeakerX, srcRatioLocal, targetRatio);
+      const bottomPct = subjectXToCenterPct(bottomSpeakerX, srcRatioLocal, targetRatio);
+
+      return (
+        <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+          {trackingStatus && (
+            <div style={{
+              position: 'absolute', top: 8, right: 8, zIndex: 15,
+              display: 'flex', alignItems: 'center', gap: 5,
+              padding: '3px 8px', borderRadius: 6,
+              background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
+              fontSize: 11, color: '#e5e7eb', pointerEvents: 'none',
+            }}>
+              <span style={{
+                width: 6, height: 6, borderRadius: '50%',
+                background: '#22c55e',
+              }} />
+              Split view
+            </div>
+          )}
+          <div style={{ display: 'flex', flexDirection: 'column', width: '100%', height: '100%' }}>
+            <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+              <video
+                ref={fgVideoRef}
+                src={src}
+                preload="auto"
+                playsInline
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  display: 'block',
+                  objectFit: 'cover',
+                  objectPosition: `${topPct}% 50%`,
+                }}
+                onClick={togglePlay}
+              />
+            </div>
+            <div style={{ height: '3px', background: 'rgba(0,0,0,0.3)', flexShrink: 0 }} />
+            <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
+              <video
+                src={src}
+                preload="auto"
+                playsInline
+                style={{
+                  width: '100%',
+                  height: '100%',
+                  display: 'block',
+                  objectFit: 'cover',
+                  objectPosition: `${bottomPct}% 50%`,
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     const videoStyle = {
       width: '100%',
       height: '100%',

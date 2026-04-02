@@ -356,6 +356,11 @@ async def export_clip_endpoint(
                 shape_overlays=[s.model_dump() for s in req.shape_overlays] if req.shape_overlays else None,
                 audio_overlays=[a.model_dump() for a in req.audio_overlays] if req.audio_overlays else None,
                 overlay_compositing_order=req.overlay_compositing_order if req.overlay_compositing_order else None,
+                layout_mode=getattr(req, 'layout_mode', 'auto'),
+                pip_position=getattr(req, 'pip_position', 'bottom_right'),
+                pip_size_pct=getattr(req, 'pip_size_pct', 25.0),
+                face_registry_data=getattr(job, 'face_registry_data', None),
+                layout_timeline_data=getattr(job, 'layout_timeline', None),
             )
 
             elapsed = int(time.monotonic() - export_start)

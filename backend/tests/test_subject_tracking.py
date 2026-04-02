@@ -231,19 +231,19 @@ class TestBuildCropXExpr:
 
 class TestBuildFilterChain:
     def test_no_aspect_no_subs(self):
-        vf, is_complex = _build_filter_chain(None, 1920, 1080, None)
+        vf, is_complex, _ = _build_filter_chain(None, 1920, 1080, None)
         assert vf is None
         assert is_complex is False
 
     def test_aspect_ratio_with_static_subject(self):
-        vf, is_complex = _build_filter_chain("9:16", 1920, 1080, None, subject_x=30)
+        vf, is_complex, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=30)
         assert vf is not None
         assert "crop=" in vf
         assert "scale=" in vf
 
     def test_aspect_ratio_with_dynamic_keyframes(self):
         kf = [(0.0, 20), (5.0, 50), (10.0, 80)]
-        vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
+        vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
         assert vf is not None
         # Dynamic keyframes should produce expression-based crop
         assert "crop=" in vf
@@ -252,13 +252,13 @@ class TestBuildFilterChain:
 
     def test_same_aspect_ratio_no_crop(self):
         """16:9 source → 16:9 target → no crop needed."""
-        vf, _ = _build_filter_chain("16:9", 1920, 1080, None, subject_x=30)
+        vf, _, _ = _build_filter_chain("16:9", 1920, 1080, None, subject_x=30)
         # Should just scale, no crop (src ratio == target ratio)
         if vf:
             assert "scale=" in vf
 
     def test_subtitles_only(self):
-        vf, _ = _build_filter_chain(None, 1920, 1080, "/tmp/test.ass")
+        vf, _, _ = _build_filter_chain(None, 1920, 1080, "/tmp/test.ass")
         assert vf is not None
         assert "subtitles=" in vf
 
@@ -472,7 +472,7 @@ class TestBoundaryInterpolation:
         unique_sx = set(k[1] for k in smoothed)
         assert len(unique_sx) > 1, "Expected dynamic keyframes with multiple unique sx values"
 
-        vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=smoothed)
+        vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=smoothed)
         assert vf is not None
         assert "clip(" in vf, f"Expected dynamic expression, got: {vf}"
 
@@ -486,7 +486,7 @@ class TestBoundaryInterpolation:
         kf = _build_subject_keyframes(scenes, 0.0, 30.0)
         smoothed = _smooth_keyframes(kf)
 
-        vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=smoothed)
+        vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=smoothed)
         assert vf is not None
         # Static crop — should NOT contain dynamic expression
         assert "clip(" not in vf or "if(" not in vf

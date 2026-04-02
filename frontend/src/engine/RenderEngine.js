@@ -530,6 +530,18 @@ export default class RenderEngine {
     this._stImported = true;
   }
 
+  /**
+   * Set layout data for multi-speaker compositing.
+   * @param {Array|null} layoutTimeline - [{start, end, layout_mode, ...}]
+   * @param {object|null} faceRegistry - {slots: [{id, x, frames}]}
+   * @param {string} defaultMode - "single", "split", etc.
+   */
+  setLayoutData(layoutTimeline, faceRegistry, defaultMode) {
+    this._layoutTimeline = layoutTimeline;
+    this._faceRegistry = faceRegistry;
+    this._defaultLayoutMode = defaultMode || 'single';
+  }
+
   _renderVideo(ctx, clip, currentTime, settings, mediaElements) {
     const mediaEl = mediaElements?.get(clip.mediaRef || clip.id);
     if (!mediaEl || !(mediaEl instanceof HTMLVideoElement)) return;
@@ -537,6 +549,36 @@ export default class RenderEngine {
     const { width, height } = this;
     const vw = mediaEl.videoWidth || width;
     const vh = mediaEl.videoHeight || height;
+
+    // Layout-aware rendering: split mode draws two halves from same video
+    if (this._defaultLayoutMode === 'split' && this._faceRegistry?.slots?.length >= 2) {
+      const sortedSlots = [...this._faceRegistry.slots].sort((a, b) => a.x - b.x);
+      const separatorPx = 3;
+      const halfH = Math.floor((height - separatorPx) / 2);
+      const srcAR = vw / vh;
+      const halfAR = width / halfH;
+
+      // Each half: crop from source centered on speaker
+      for (let i = 0; i < 2; i++) {
+        const speakerX = sortedSlots[i]?.x ?? 50;
+        let csx = 0, csy = 0, csw = vw, csh = vh;
+        if (srcAR > halfAR) {
+          csw = Math.round(vh * halfAR);
+          const subjectPx = vw * speakerX / 100;
+          csx = Math.round(Math.max(0, Math.min(vw - csw, subjectPx - csw / 2)));
+        } else {
+          csh = Math.round(vw / halfAR);
+          csy = Math.round((vh - csh) / 2);
+        }
+        const dy = i === 0 ? 0 : halfH + separatorPx;
+        ctx.drawImage(mediaEl, csx, csy, csw, csh, 0, dy, width, halfH);
+      }
+
+      // Draw separator line
+      ctx.fillStyle = 'rgba(0,0,0,0.3)';
+      ctx.fillRect(0, halfH, width, separatorPx);
+      return;
+    }
 
     // Calculate crop region for aspect ratio
     const srcAR = vw / vh;

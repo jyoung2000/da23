@@ -1252,3 +1252,69 @@ export function validateCentering(keyframes, srcRatio, targetRatio) {
 
   return { keyframes: fixed, corrections };
 }
+
+
+/**
+ * Compute layout-aware crop regions for a given timestamp.
+ *
+ * @param {number} t - Current playback time (relative to clip start)
+ * @param {Array} layoutTimeline - [{start, end, layout_mode, face_positions, left_face_slot, right_face_slot}]
+ * @param {number} srcW - Source video width
+ * @param {number} srcH - Source video height
+ * @param {string} targetAspect - Target aspect ratio string ("9:16", etc.)
+ * @param {object} faceRegistry - {slots: [{id, x, frames}], multi_speaker}
+ * @returns {Object} Layout render info:
+ *   For SINGLE: { mode: "single" }
+ *   For SPLIT:  { mode: "split", topX: number, bottomX: number }
+ *   For PIP:    { mode: "pip", mainX: number, pipX: number, pipPosition: string, pipSize: number }
+ *   For TRIPLE: { mode: "triple", positions: [x1, x2, x3] }
+ *   For SCREENSHARE: { mode: "screenshare", speakerX: number }
+ */
+export function computeLayoutAtTime(t, layoutTimeline, srcW, srcH, targetAspect, faceRegistry) {
+  if (!layoutTimeline || !layoutTimeline.length) {
+    return { mode: 'single' };
+  }
+
+  // Find active layout segment
+  const seg = layoutTimeline.find(s => t >= s.start && t < s.end);
+  if (!seg || seg.layout_mode === 'single') {
+    return { mode: 'single' };
+  }
+
+  const slots = faceRegistry?.slots || [];
+  const slotMap = {};
+  for (const s of slots) {
+    slotMap[s.id] = s.x;
+  }
+
+  if (seg.layout_mode === 'split') {
+    const leftX = slotMap[seg.left_face_slot] ?? 25;
+    const rightX = slotMap[seg.right_face_slot] ?? 75;
+    return { mode: 'split', topX: leftX, bottomX: rightX };
+  }
+
+  if (seg.layout_mode === 'pip') {
+    const mainX = slotMap[seg.primary_face_slot] ?? 50;
+    const pipX = slotMap[seg.pip_face_slot] ?? 50;
+    return {
+      mode: 'pip',
+      mainX,
+      pipX,
+      pipPosition: seg.pip_position || 'bottom_right',
+      pipSize: seg.pip_size_pct || 25,
+    };
+  }
+
+  if (seg.layout_mode === 'triple') {
+    const positions = slots.slice(0, 3).map(s => s.x);
+    while (positions.length < 3) positions.push(50);
+    return { mode: 'triple', positions };
+  }
+
+  if (seg.layout_mode === 'screenshare') {
+    const speakerX = slots.length > 0 ? slots[0].x : 50;
+    return { mode: 'screenshare', speakerX };
+  }
+
+  return { mode: 'single' };
+}

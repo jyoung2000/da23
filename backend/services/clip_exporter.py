@@ -3437,6 +3437,272 @@ def _filter_keyframes_by_segment_tracking(
     return deduped
 
 
+def _build_split_filter(
+    src_w: int, src_h: int,
+    out_w: int, out_h: int,
+    left_x_pct: float,
+    right_x_pct: float,
+    separator_px: int = 3,
+) -> str:
+    """Build FFmpeg filtergraph for side-by-side split layout.
+
+    Each speaker gets a horizontal strip of the source cropped to their face,
+    then scaled to fit half the output height.
+    """
+    half_h = (out_h - separator_px) // 2
+    half_h = half_h - (half_h % 2)
+    # Each half needs aspect ratio out_w/half_h
+    half_ratio = out_w / half_h
+
+    # Crop region for each speaker from the source
+    crop_h = src_h
+    crop_w = min(src_w, int(src_h * half_ratio))
+    crop_w = crop_w - (crop_w % 2)
+
+    def sx_to_offset(sx_pct):
+        subject_px = src_w * sx_pct / 100
+        offset = int(subject_px - crop_w / 2)
+        return max(0, min(src_w - crop_w, offset))
+
+    x_left = sx_to_offset(left_x_pct)
+    x_right = sx_to_offset(right_x_pct)
+
+    # Separator line drawn via pad + overlay isn't needed — just use vstack
+    # with a small gap handled by pad filter
+    return (
+        f"split[s1][s2];"
+        f"[s1]crop={crop_w}:{crop_h}:{x_left}:0,scale={out_w}:{half_h}[top];"
+        f"[s2]crop={crop_w}:{crop_h}:{x_right}:0,scale={out_w}:{half_h}[bot];"
+        f"[top]pad={out_w}:{half_h + separator_px}:0:0:color=black[padtop];"
+        f"[padtop][bot]vstack=inputs=2[v]"
+    )
+
+
+def _build_pip_filter(
+    src_w: int, src_h: int,
+    out_w: int, out_h: int,
+    main_x_pct: float,
+    pip_x_pct: float,
+    pip_position: str = "bottom_right",
+    pip_size_pct: float = 25.0,
+) -> str:
+    """Build FFmpeg filtergraph for picture-in-picture layout."""
+    target_ratio = out_w / out_h
+
+    # Main speaker: full frame crop centered on their face
+    crop_h = src_h
+    crop_w = min(src_w, int(src_h * target_ratio))
+    crop_w = crop_w - (crop_w % 2)
+    main_offset = max(0, min(src_w - crop_w, int(src_w * main_x_pct / 100 - crop_w / 2)))
+
+    # PIP speaker: same crop approach but smaller output
+    pip_w = int(out_w * pip_size_pct / 100)
+    pip_h = int(out_h * pip_size_pct / 100)
+    pip_w = pip_w - (pip_w % 2)
+    pip_h = pip_h - (pip_h % 2)
+    pip_offset = max(0, min(src_w - crop_w, int(src_w * pip_x_pct / 100 - crop_w / 2)))
+
+    # PIP overlay position
+    margin = int(out_w * 0.03)  # 3% margin
+    pip_positions = {
+        "bottom_right": (out_w - pip_w - margin, out_h - pip_h - margin),
+        "bottom_left": (margin, out_h - pip_h - margin),
+        "top_right": (out_w - pip_w - margin, margin),
+        "top_left": (margin, margin),
+    }
+    pip_x, pip_y = pip_positions.get(pip_position, pip_positions["bottom_right"])
+
+    return (
+        f"split[main][pip];"
+        f"[main]crop={crop_w}:{crop_h}:{main_offset}:0,scale={out_w}:{out_h}[mainsc];"
+        f"[pip]crop={crop_w}:{crop_h}:{pip_offset}:0,scale={pip_w}:{pip_h}[pipsc];"
+        f"[mainsc][pipsc]overlay={pip_x}:{pip_y}[v]"
+    )
+
+
+def _build_triple_filter(
+    src_w: int, src_h: int,
+    out_w: int, out_h: int,
+    face_x_positions: list,
+) -> str:
+    """Build FFmpeg filtergraph for 3-speaker grid layout.
+
+    Top row: two speakers side by side (each half width, ~40% height)
+    Bottom: one speaker centered (~60% height)
+    """
+    top_h = int(out_h * 0.4)
+    top_h = top_h - (top_h % 2)
+    bot_h = out_h - top_h
+    bot_h = bot_h - (bot_h % 2)
+    half_w = out_w // 2
+    half_w = half_w - (half_w % 2)
+
+    # Sort faces by x position
+    sorted_x = sorted(face_x_positions[:3])
+    while len(sorted_x) < 3:
+        sorted_x.append(50)
+
+    # Compute crop for each speaker
+    def crop_for_speaker(sx_pct, target_w, target_h):
+        ratio = target_w / target_h
+        cw = min(src_w, int(src_h * ratio))
+        ch = src_h
+        cw = cw - (cw % 2)
+        offset = max(0, min(src_w - cw, int(src_w * sx_pct / 100 - cw / 2)))
+        return cw, ch, offset
+
+    cw1, ch1, x1 = crop_for_speaker(sorted_x[0], half_w, top_h)
+    cw2, ch2, x2 = crop_for_speaker(sorted_x[1], half_w, top_h)
+    cw3, ch3, x3 = crop_for_speaker(sorted_x[2], out_w, bot_h)
+
+    return (
+        f"split=3[a][b][c];"
+        f"[a]crop={cw1}:{ch1}:{x1}:0,scale={half_w}:{top_h}[tl];"
+        f"[b]crop={cw2}:{ch2}:{x2}:0,scale={half_w}:{top_h}[tr];"
+        f"[c]crop={cw3}:{ch3}:{x3}:0,scale={out_w}:{bot_h}[bot];"
+        f"[tl][tr]hstack=inputs=2[toprow];"
+        f"[toprow][bot]vstack=inputs=2[v]"
+    )
+
+
+def _build_screenshare_filter(
+    src_w: int, src_h: int,
+    out_w: int, out_h: int,
+    speaker_x_pct: float = 50,
+    screen_pct: float = 60,
+) -> str:
+    """Build FFmpeg filtergraph for screenshare layout.
+
+    Top: screen content (60% of output height)
+    Bottom: speaker face (40% of output height)
+    """
+    screen_h = int(out_h * screen_pct / 100)
+    screen_h = screen_h - (screen_h % 2)
+    speaker_h = out_h - screen_h
+    speaker_h = speaker_h - (speaker_h % 2)
+
+    # Screen: center crop from full frame
+    screen_ratio = out_w / screen_h
+    scr_cw = min(src_w, int(src_h * screen_ratio))
+    scr_cw = scr_cw - (scr_cw % 2)
+    scr_x = (src_w - scr_cw) // 2
+
+    # Speaker: crop centered on face
+    spk_ratio = out_w / speaker_h
+    spk_cw = min(src_w, int(src_h * spk_ratio))
+    spk_cw = spk_cw - (spk_cw % 2)
+    spk_x = max(0, min(src_w - spk_cw, int(src_w * speaker_x_pct / 100 - spk_cw / 2)))
+
+    return (
+        f"split[scr][spk];"
+        f"[scr]crop={scr_cw}:{src_h}:{scr_x}:0,scale={out_w}:{screen_h}[screen];"
+        f"[spk]crop={spk_cw}:{src_h}:{spk_x}:0,scale={out_w}:{speaker_h}[speaker];"
+        f"[screen][speaker]vstack=inputs=2[v]"
+    )
+
+
+def _build_layout_filter_chain(
+    layout_timeline,
+    src_w: int,
+    src_h: int,
+    target_aspect: str,
+    export_quality: str,
+    clip_start: float,
+    clip_end: float,
+    ass_path: str = None,
+    subtitle_force_style: str = "",
+    video_effects: dict = None,
+) -> tuple:
+    """Build FFmpeg filter chain for multi-layout compositing.
+
+    Returns (filter_chain, is_complex, subtitle_filter).
+
+    For SINGLE mode: returns None so caller delegates to existing _build_filter_chain.
+    For SPLIT/TRIPLE/PIP/SCREENSHARE: returns a complex filtergraph.
+    """
+    from backend.models import LayoutMode
+
+    if not layout_timeline or not layout_timeline.segments:
+        return None, False, ""
+
+    # If all segments are SINGLE, let the caller use the existing path
+    all_single = all(s.layout_mode == LayoutMode.SINGLE for s in layout_timeline.segments)
+    if all_single:
+        return None, False, ""
+
+    # Get output dimensions
+    dims_table = ASPECT_RATIO_DIMS_BY_QUALITY.get(export_quality, ASPECT_RATIO_DIMS)
+    out_w, out_h = dims_table.get(target_aspect, (1920, 1080))
+    out_w = out_w - (out_w % 2)
+    out_h = out_h - (out_h % 2)
+
+    # For now, use the dominant non-single layout for the whole clip
+    # (dynamic mid-clip switching requires segment-based encoding)
+    primary_seg = max(
+        layout_timeline.segments,
+        key=lambda s: s.end - s.start if s.layout_mode != LayoutMode.SINGLE else 0,
+    )
+    mode = primary_seg.layout_mode
+    registry = layout_timeline.face_registry
+
+    filter_chain = None
+
+    if mode == LayoutMode.SPLIT and registry and len(registry.slots) >= 2:
+        sorted_slots = sorted(registry.slots, key=lambda s: s.x_center)
+        left_x = sorted_slots[0].x_center
+        right_x = sorted_slots[1].x_center
+        filter_chain = _build_split_filter(
+            src_w, src_h, out_w, out_h,
+            left_x, right_x,
+        )
+        logger.info(
+            "[Layout] SPLIT filter: left=%.0f%%, right=%.0f%%, output=%dx%d",
+            left_x, right_x, out_w, out_h,
+        )
+
+    elif mode == LayoutMode.PICTURE_IN_PICTURE and registry and len(registry.slots) >= 2:
+        sorted_slots = sorted(registry.slots, key=lambda s: s.frame_count, reverse=True)
+        main_x = sorted_slots[0].x_center
+        pip_x = sorted_slots[1].x_center
+        pip_pos = primary_seg.pip_position
+        pip_size = primary_seg.pip_size_pct
+        filter_chain = _build_pip_filter(
+            src_w, src_h, out_w, out_h,
+            main_x, pip_x,
+            pip_position=pip_pos, pip_size_pct=pip_size,
+        )
+        logger.info(
+            "[Layout] PIP filter: main=%.0f%%, pip=%.0f%% (%s, %.0f%%), output=%dx%d",
+            main_x, pip_x, pip_pos, pip_size, out_w, out_h,
+        )
+
+    elif mode == LayoutMode.TRIPLE and registry and len(registry.slots) >= 3:
+        face_xs = [s.x_center for s in sorted(registry.slots, key=lambda s: s.x_center)[:3]]
+        filter_chain = _build_triple_filter(
+            src_w, src_h, out_w, out_h, face_xs,
+        )
+        logger.info("[Layout] TRIPLE filter: faces at %s, output=%dx%d", face_xs, out_w, out_h)
+
+    elif mode == LayoutMode.SCREENSHARE:
+        # Find the speaker's face position
+        speaker_x = 50
+        if registry and registry.slots:
+            speaker_x = registry.slots[0].x_center
+        filter_chain = _build_screenshare_filter(
+            src_w, src_h, out_w, out_h,
+            speaker_x_pct=speaker_x,
+        )
+        logger.info("[Layout] SCREENSHARE filter: speaker at %.0f%%, output=%dx%d", speaker_x, out_w, out_h)
+
+    if filter_chain is None:
+        return None, False, ""
+
+    # The layout filters produce [v] output — it's a complex filtergraph
+    sub = _subtitle_filter(ass_path, force_style=subtitle_force_style) if ass_path else ""
+
+    return filter_chain, True, sub
+
+
 def _build_filter_chain(
     aspect_ratio: str | None,
     src_w: int,
@@ -5025,6 +5291,11 @@ async def export_clip(
     shape_overlays: list | None = None,
     audio_overlays: list | None = None,
     overlay_compositing_order: list | None = None,
+    layout_mode: str = "auto",
+    pip_position: str = "bottom_right",
+    pip_size_pct: float = 25.0,
+    face_registry_data: dict | None = None,
+    layout_timeline_data: list | None = None,
 ) -> str:
     """Export a clip from video using FFmpeg.
 
@@ -5839,18 +6110,97 @@ async def export_clip(
                             clip_id, subject_x,
                         )
 
+            # ── Layout-aware filter chain selection ──
+            # If a non-single layout mode is requested (or auto-detected),
+            # use the layout compositing pipeline instead of simple crop+pan.
+            _layout_vf = None
+            _layout_used = False
+            if layout_mode and layout_mode != "single":
+                try:
+                    _layout_tl = None
+                    if layout_mode == "auto" and layout_timeline_data:
+                        # Reconstruct LayoutTimeline from serialized data
+                        from backend.services.layout_engine import LayoutTimeline, LayoutSegment
+                        from backend.services.face_registry import FaceRegistry, FaceSlot
+                        _reg = None
+                        if face_registry_data:
+                            _slots = [
+                                FaceSlot(slot_id=s["id"], x_center=s["x"], x_min=s["x"], x_max=s["x"],
+                                         frame_count=s.get("frames", 0), avg_width=0, avg_height=0)
+                                for s in face_registry_data.get("slots", [])
+                            ]
+                            _reg = FaceRegistry(slots=_slots,
+                                                total_frames=face_registry_data.get("total_frames", 0),
+                                                frames_with_faces=face_registry_data.get("frames_with_faces", 0))
+                        _segs = [LayoutSegment(**s) for s in layout_timeline_data]
+                        _layout_tl = LayoutTimeline(
+                            segments=_segs,
+                            default_mode=_segs[0].layout_mode if _segs else "single",
+                            face_registry=_reg,
+                            total_layout_changes=max(0, len(_segs) - 1),
+                        )
+                    elif layout_mode in ("split", "triple", "pip", "screenshare") and face_registry_data:
+                        # User forced a specific layout — build a single-segment timeline
+                        from backend.services.layout_engine import LayoutTimeline, LayoutSegment
+                        from backend.services.face_registry import FaceRegistry, FaceSlot
+                        _slots = [
+                            FaceSlot(slot_id=s["id"], x_center=s["x"], x_min=s["x"], x_max=s["x"],
+                                     frame_count=s.get("frames", 0), avg_width=0, avg_height=0)
+                            for s in face_registry_data.get("slots", [])
+                        ]
+                        _reg = FaceRegistry(slots=_slots,
+                                            total_frames=face_registry_data.get("total_frames", 0),
+                                            frames_with_faces=face_registry_data.get("frames_with_faces", 0))
+                        _seg = LayoutSegment(
+                            start=0, end=end - start,
+                            layout_mode=layout_mode,
+                            pip_position=pip_position,
+                            pip_size_pct=pip_size_pct,
+                        )
+                        if layout_mode == "split" and len(_slots) >= 2:
+                            sorted_s = sorted(_slots, key=lambda s: s.x_center)
+                            _seg.left_face_slot = sorted_s[0].slot_id
+                            _seg.right_face_slot = sorted_s[1].slot_id
+                        _layout_tl = LayoutTimeline(
+                            segments=[_seg],
+                            default_mode=layout_mode,
+                            face_registry=_reg,
+                            total_layout_changes=0,
+                        )
+
+                    if _layout_tl:
+                        _layout_vf, _layout_complex, _layout_sub = _build_layout_filter_chain(
+                            _layout_tl, video_width, video_height,
+                            target_aspect=aspect_ratio or "16:9",
+                            export_quality=export_quality,
+                            clip_start=start, clip_end=end,
+                            ass_path=ass_path,
+                            subtitle_force_style=subtitle_force_style,
+                            video_effects=video_effects if has_video_effects else None,
+                        )
+                        if _layout_vf:
+                            _layout_used = True
+                            logger.info("[Layout] Using layout filter chain for clip %s (mode=%s)", clip_id, layout_mode)
+                except Exception as e:
+                    logger.warning("[Layout] Layout filter chain failed (non-fatal), falling back to single: %s", e)
+
             # Build filter chain and re-encode
-            vf, is_complex, _subtitle_vf = _build_filter_chain(
-                aspect_ratio, video_width, video_height, ass_path,
-                subject_x=subject_x,
-                subject_keyframes=keyframes,
-                export_quality=export_quality,
-                subtitle_force_style=subtitle_force_style,
-                video_path=video_path,
-                start_time=start,
-                video_effects=video_effects if has_video_effects else None,
-                clip_duration=end - start,
-            )
+            if _layout_used:
+                vf = _layout_vf
+                is_complex = True
+                _subtitle_vf = _layout_sub
+            else:
+                vf, is_complex, _subtitle_vf = _build_filter_chain(
+                    aspect_ratio, video_width, video_height, ass_path,
+                    subject_x=subject_x,
+                    subject_keyframes=keyframes,
+                    export_quality=export_quality,
+                    subtitle_force_style=subtitle_force_style,
+                    video_path=video_path,
+                    start_time=start,
+                    video_effects=video_effects if has_video_effects else None,
+                    clip_duration=end - start,
+                )
 
             # Append text overlay drawtext filters.
             # For per-segment speed paths, text overlays must be applied AFTER

@@ -15,6 +15,16 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class LayoutMode(str, Enum):
+    """Video layout modes for multi-speaker reframing."""
+    SINGLE = "single"          # One speaker centered (current behavior)
+    SPLIT = "split"            # Two speakers side-by-side (vertical split)
+    TRIPLE = "triple"          # Three speakers in grid
+    PICTURE_IN_PICTURE = "pip" # Main speaker large + secondary small overlay
+    SCREENSHARE = "screenshare" # Screen content top, speaker bottom
+    GAMEPLAY = "gameplay"      # Gameplay top 70%, speaker bottom 30%
+
+
 class FrameData(BaseModel):
     timestamp: float
     path: str
@@ -33,6 +43,12 @@ class SceneDescription(BaseModel):
     thumbnail_path: str
     subject_x: int = 50  # 0-100, horizontal subject position (0=left, 50=center, 100=right)
     active_speaker_x: Optional[int] = None  # 0-100, position of the person who is talking (if detectable)
+    layout_mode: str = "single"           # Recommended layout for this timestamp
+    face_count: int = 0                   # Number of faces detected at this timestamp
+    face_positions: list[dict] = []       # [{slot_id, x, y, w, h, is_speaking, identity_id}]
+    has_screen_content: bool = False       # Whether frame contains screen share / slides / text
+    primary_object_x: Optional[int] = None # Non-face object tracking position (0-100)
+    primary_object_type: Optional[str] = None  # "ball", "product", "hand", "text", etc.
 
 
 class WordTimestamp(BaseModel):
@@ -114,6 +130,9 @@ class JobResult(BaseModel):
     subtitle_settings: Optional[dict] = None  # Canonical subtitle settings — server is source of truth
     error: Optional[str] = None
     estimated_cost_usd: Optional[float] = None
+    face_registry_data: Optional[dict] = None   # Serialized FaceRegistry with embeddings
+    layout_timeline: list[dict] = []            # [{start, end, layout_mode, face_positions}]
+    default_layout_mode: str = "single"         # Overall recommended layout for the video
 
 
 class ClipSEO(BaseModel):
@@ -286,6 +305,9 @@ class ExportRequest(BaseModel):
     audio_overlays: list[AudioOverlay] = []  # Additional audio items (music, SFX)
     overlay_compositing_order: list[dict] = []  # Global render order for cross-type compositing
     edited_subtitle_segments: Optional[list[TranscriptSegment]] = None  # User-edited subtitle timing from timeline
+    layout_mode: str = "auto"  # "auto" | "single" | "split" | "triple" | "pip" | "screenshare"
+    pip_position: str = "bottom_right"  # For PIP mode
+    pip_size_pct: float = 25.0          # For PIP mode
 
 
 class FullVideoExportRequest(BaseModel):

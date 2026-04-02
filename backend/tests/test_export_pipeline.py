@@ -833,14 +833,14 @@ def test_ass_frontend_backend_margin_consistency():
 
 def test_filter_chain_no_filters():
     print("\n--- Filter Chain: No aspect ratio, no subtitles ---")
-    vf, is_complex = _build_filter_chain(None, 1920, 1080, None)
+    vf, is_complex, _ = _build_filter_chain(None, 1920, 1080, None)
     check("Returns None", vf is None, f"got {vf}")
     check("Not complex", is_complex is False)
 
 
 def test_filter_chain_16_9_to_9_16():
     print("\n--- Filter Chain: 16:9 → 9:16 crop ---")
-    vf, is_complex = _build_filter_chain("9:16", 1920, 1080, None, subject_x=50)
+    vf, is_complex, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=50)
     check("Not complex", is_complex is False)
     check("Has filter string", vf is not None and len(vf) > 0)
 
@@ -865,7 +865,7 @@ def test_filter_chain_16_9_to_9_16():
 
 def test_filter_chain_16_9_to_1_1():
     print("\n--- Filter Chain: 16:9 → 1:1 crop ---")
-    vf, _ = _build_filter_chain("1:1", 1920, 1080, None, subject_x=50)
+    vf, _, _ = _build_filter_chain("1:1", 1920, 1080, None, subject_x=50)
 
     # target=1.0, source=1.778 → target < source → crop width
     # crop_h = 1080, crop_w = int(1080 * 1.0) = 1080 (already even)
@@ -890,7 +890,7 @@ def test_filter_chain_subject_positioning():
     #   sx=50  → unchanged 50  → pixel=960, offset=960-303=657
     #   sx=100 → clamped to 90 → pixel=1728, offset=1728-303=1425 → clamped to 1314
     for sx, expected_approx in [(0, 0), (50, 657), (100, 1314)]:
-        vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=sx)
+        vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=sx)
         crop_match = re.search(r"crop=\d+:\d+:(\d+):", vf)
         if crop_match:
             cx = int(crop_match.group(1))
@@ -902,7 +902,7 @@ def test_filter_chain_subject_positioning():
 
 def test_filter_chain_with_subtitles():
     print("\n--- Filter Chain: With subtitles ---")
-    vf, is_complex = _build_filter_chain(None, 1920, 1080, "/tmp/test.ass")
+    vf, is_complex, _ = _build_filter_chain(None, 1920, 1080, "/tmp/test.ass")
     check("Has filter", vf is not None)
     check("Not complex", is_complex is False)
     check("Contains subtitles filter", "subtitles=" in vf, f"got {vf}")
@@ -910,7 +910,7 @@ def test_filter_chain_with_subtitles():
 
 def test_filter_chain_crop_plus_subtitles():
     print("\n--- Filter Chain: Crop + subtitles ---")
-    vf, _ = _build_filter_chain("9:16", 1920, 1080, "/tmp/test.ass", subject_x=50)
+    vf, _, _ = _build_filter_chain("9:16", 1920, 1080, "/tmp/test.ass", subject_x=50)
     parts = vf.split(",")
     check("3 filter parts (crop, scale, subtitles)", len(parts) == 3,
           f"got {len(parts)}: {parts}")
@@ -985,7 +985,7 @@ def test_filter_chain_with_force_style():
     """Test that force_style is threaded into the subtitles filter."""
     print("\n--- Filter Chain: With force_style ---")
     fs = "BorderStyle=1,Outline=6,Shadow=4,OutlineColour=&H00000000&,BackColour=&H80000000&"
-    vf, _ = _build_filter_chain(
+    vf, _, _ = _build_filter_chain(
         None, 1920, 1080, "/tmp/test.ass", subtitle_force_style=fs,
     )
     check("Has filter", vf is not None)
@@ -995,7 +995,7 @@ def test_filter_chain_with_force_style():
     check("Contains BorderStyle=1", "BorderStyle=1" in vf, f"got {vf}")
 
     # With crop — make sure the subtitles filter is last and contains force_style
-    vf2, _ = _build_filter_chain(
+    vf2, _, _ = _build_filter_chain(
         "9:16", 1920, 1080, "/tmp/test.ass",
         subject_x=50, subtitle_force_style=fs,
     )
@@ -2786,7 +2786,7 @@ def test_filter_chain_dynamic_subject():
     """Filter chain with dynamic keyframes → expression in crop filter."""
     print("\n--- filter_chain: dynamic subject keyframes ---")
     kf = [(0.0, 20), (5.0, 80)]
-    vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
+    vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
     check("Filter chain exists", vf is not None)
     check("Contains crop filter", "crop=" in vf, f"got '{vf}'")
     check("Contains dynamic expression", "if(lt(t" in vf, f"got '{vf}'")
@@ -2818,7 +2818,7 @@ def test_filter_chain_all_same_keyframes():
     """All keyframes same value → static crop (optimization)."""
     print("\n--- filter_chain: all same keyframes → static ---")
     kf = [(0.0, 40), (5.0, 40), (10.0, 40)]
-    vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
+    vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
     check("No dynamic expression", "if(lt" not in vf, f"got '{vf}'")
     check("Has crop filter", "crop=" in vf, f"got '{vf}'")
 
@@ -2870,7 +2870,7 @@ def test_filter_chain_static_safety_margin():
     """Static crop with extreme subject_x uses safety-clamped value."""
     print("\n--- filter_chain: static crop with safety margin ---")
     # subject_x=0 should be clamped to 10 → offset should not be 0
-    vf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=0)
+    vf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=0)
     check("Has crop filter", "crop=" in vf, f"got '{vf}'")
     # Extract x_offset from crop=W:H:X:Y
     import re
@@ -2893,7 +2893,7 @@ def test_validate_subject_tracking_static_all_ratios():
     print("\n--- Subject tracking QA: static crop at all aspect ratios ---")
     for ratio in ["9:16", "1:1", "4:5"]:
         for sx in [10, 30, 50, 70, 90]:
-            vf, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_x=sx)
+            vf, _, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_x=sx)
             warnings = _validate_subject_tracking(
                 filter_chain=vf,
                 aspect_ratio=ratio,
@@ -2911,7 +2911,7 @@ def test_validate_subject_tracking_dynamic_all_ratios():
     print("\n--- Subject tracking QA: dynamic crop at all aspect ratios ---")
     kf = [(0.0, 20), (5.0, 50), (10.0, 80)]
     for ratio in ["9:16", "1:1", "4:5"]:
-        vf, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_keyframes=kf)
+        vf, _, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_keyframes=kf)
         warnings = _validate_subject_tracking(
             filter_chain=vf,
             aspect_ratio=ratio,
@@ -2930,7 +2930,7 @@ def test_subject_tracking_crop_changes_with_aspect_ratio():
     sx = 30
     results = {}
     for ratio in ["9:16", "1:1", "4:5"]:
-        vf, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_x=sx)
+        vf, _, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_x=sx)
         m = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", vf)
         check(f"Crop filter found for {ratio}", m is not None, f"got '{vf}'")
         if m:
@@ -2962,7 +2962,7 @@ def test_subject_centered_in_crop_all_ratios():
     print("\n--- Subject tracking: subject centered in crop ---")
     for ratio in ["9:16", "1:1", "4:5"]:
         for sx in [20, 50, 80]:
-            vf, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_x=sx)
+            vf, _, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_x=sx)
             m = re.search(r"crop=(\d+):(\d+):(\d+):(\d+)", vf)
             if not m:
                 continue
@@ -3006,7 +3006,7 @@ def test_dynamic_keyframes_across_aspect_ratios():
     kf = [(0.0, 20), (5.0, 80)]
     expressions = {}
     for ratio in ["9:16", "1:1", "4:5"]:
-        vf, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_keyframes=kf)
+        vf, _, _ = _build_filter_chain(ratio, 1920, 1080, None, subject_keyframes=kf)
         check(f"Dynamic expression for {ratio}", "if(lt(t" in vf, f"got '{vf}'")
         expressions[ratio] = vf
 
@@ -3036,7 +3036,7 @@ def test_validate_subject_tracking_same_aspect():
     """Same aspect ratio as source → no crop needed."""
     print("\n--- Subject tracking QA: same aspect ratio as source ---")
     # 16:9 source at 16:9 → no crop
-    vf, _ = _build_filter_chain("16:9", 1920, 1080, None, subject_x=30)
+    vf, _, _ = _build_filter_chain("16:9", 1920, 1080, None, subject_x=30)
     warnings = _validate_subject_tracking(
         filter_chain=vf,
         aspect_ratio="16:9",
@@ -3287,7 +3287,7 @@ def test_quality_applied_all_aspect_ratio_combinations():
         for quality in qualities:
             for ar in aspect_ratios:
                 ar_label = ar or "original"
-                vf, _ = _build_filter_chain(ar, src_w, src_h, None, export_quality=quality)
+                vf, _, _ = _build_filter_chain(ar, src_w, src_h, None, export_quality=quality)
 
                 target_h = QUALITY_MAX_HEIGHT[quality]
                 needs_scale = (src_h != target_h)

@@ -1782,6 +1782,48 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Active speaker detection failed (non-fatal): %s", job_id, e)
 
+    # ── Layout Analysis ──
+    # Determine optimal layout mode for the video based on face data + speaker data
+    layout_timeline = None
+    face_registry_dict = None
+    default_layout_mode = "single"
+    if face_registry:
+        face_registry_dict = face_registry.to_dict()
+        if face_registry.multi_speaker:
+            try:
+                from backend.services.layout_engine import build_layout_timeline
+                layout_timeline = build_layout_timeline(
+                    face_results=face_results,
+                    face_registry=face_registry,
+                    active_speaker_events=active_speaker_events,
+                    scene_descriptions=scenes,
+                    clip_start=0,
+                    clip_end=metadata.get("duration", 0),
+                )
+                default_layout_mode = layout_timeline.default_mode
+                logger.info(
+                    "[%s] [Layout] Video layout analysis: default=%s, %d segments, %d layout changes",
+                    job_id, layout_timeline.default_mode,
+                    len(layout_timeline.segments),
+                    layout_timeline.total_layout_changes,
+                )
+            except Exception as e:
+                logger.warning("[%s] Layout analysis failed (non-fatal): %s", job_id, e)
+        else:
+            logger.info("[%s] [Layout] Single-speaker video — using SINGLE layout", job_id)
+
+    # Save layout data to job
+    try:
+        layout_update = {
+            "face_registry_data": face_registry_dict,
+            "default_layout_mode": default_layout_mode,
+        }
+        if layout_timeline:
+            layout_update["layout_timeline"] = [s.to_dict() for s in layout_timeline.segments]
+        await database.update_job_status(job_id, **layout_update)
+    except Exception as e:
+        logger.warning("[%s] Failed to save layout data (non-fatal): %s", job_id, e)
+
     # ── Pipeline health check: detect total failure ──
     real_scenes = [s for s in scenes
                    if s.description

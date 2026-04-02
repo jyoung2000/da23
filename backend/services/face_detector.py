@@ -23,6 +23,10 @@ class FaceInfo:
     nose_y: float         # Best estimate of face center y, 0-100
     confidence: float     # Detection confidence, 0-1
     lip_aperture: float = 0.0  # Mouth openness ratio (0=closed, 1=wide open)
+    identity_embedding: list = None  # 128-d face embedding for re-identification
+    identity_id: int = -1       # Assigned face slot from registry (-1 = unassigned)
+    is_speaking: bool = False   # Set by active speaker detection
+    y_bottom: float = 0.0      # Bottom of face bbox as % of frame (for vertical positioning)
 
 
 @dataclass
@@ -34,7 +38,74 @@ class FrameFaces:
     primary_face_idx: int = -1  # Index of largest/most-prominent face
 
 
-def _detect_with_opencv_dnn(frame_paths, min_confidence):
+def _extract_face_embeddings(frame_img, faces_info: list, detector) -> list:
+    """Extract 128-d identity embeddings using OpenCV SFace recognizer.
+
+    Runs on CPU. ~5ms per face. No GPU competition with Whisper/Ollama.
+    The embedding enables cross-frame re-identification: same person across
+    different timestamps gets matched even if they move positions.
+    """
+    import cv2
+    import numpy as np
+
+    if not faces_info or detector is None:
+        return faces_info
+
+    recognizer = None
+    sface_paths = [
+        os.path.join(os.path.dirname(cv2.__file__), "data", "face_recognition_sface_2021dec.onnx"),
+        "/usr/local/share/opencv4/face_recognition_sface_2021dec.onnx",
+        os.path.join(os.path.dirname(__file__), "..", "models", "face_recognition_sface_2021dec.onnx"),
+    ]
+    sface_path = next((p for p in sface_paths if os.path.exists(p)), None)
+
+    if sface_path is None:
+        # Download one-time (~2MB)
+        import urllib.request
+        model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+        os.makedirs(model_dir, exist_ok=True)
+        sface_path = os.path.join(model_dir, "face_recognition_sface_2021dec.onnx")
+        if not os.path.exists(sface_path):
+            url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+            logger.info("Downloading SFace recognition model...")
+            try:
+                urllib.request.urlretrieve(url, sface_path)
+            except Exception as e:
+                logger.warning("Failed to download SFace model: %s", e)
+                return faces_info
+
+    try:
+        recognizer = cv2.FaceRecognizerSF.create(sface_path, "")
+    except Exception as e:
+        logger.warning("SFace recognizer unavailable: %s — skipping embeddings", e)
+        return faces_info
+
+    h, w = frame_img.shape[:2]
+    for face in faces_info:
+        try:
+            # Convert percentage coords back to pixels for SFace
+            fx = int((face.x_center - face.width / 2) * w / 100)
+            fy = int((face.y_center - face.height / 2) * h / 100)
+            fw = int(face.width * w / 100)
+            fh = int(face.height * h / 100)
+
+            # Build the aligned face for SFace (it expects the YuNet detection format)
+            face_array = [fx, fy, fw, fh,
+                          face.nose_x * w / 100, face.nose_y * h / 100,
+                          0, 0, 0, 0, 0, 0, 0, 0, face.confidence]
+            det = np.array([face_array], dtype=np.float32)
+
+            aligned = recognizer.alignCrop(frame_img, det[0])
+            embedding = recognizer.feature(aligned)
+            face.identity_embedding = embedding.flatten().tolist()
+            face.y_bottom = round((face.y_center + face.height / 2), 1)
+        except Exception:
+            pass  # Non-critical — face still usable without embedding
+
+    return faces_info
+
+
+def _detect_with_opencv_dnn(frame_paths, min_confidence, extract_embeddings=True):
     """Detect faces using OpenCV's built-in DNN face detector.
 
     Tries YuNet DNN detector first (much more accurate, gives nose/mouth landmarks),
@@ -201,6 +272,10 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence):
                     timestamp, faces[0].width, faces[0].x_center,
                 )
                 faces = []
+
+        # Extract identity embeddings (YuNet only — Haar doesn't provide landmarks)
+        if extract_embeddings and not use_haar and detector is not None and faces and img is not None:
+            faces = _extract_face_embeddings(img, faces, detector)
 
         primary = -1
         if faces:
@@ -528,6 +603,101 @@ def detect_faces_batch(
         FrameFaces(timestamp=ts, frame_path=str(p))
         for ts, p in frame_paths
     ]
+
+
+def detect_faces_dense(
+    video_path: str,
+    start: float,
+    end: float,
+    sample_rate: float = 0.5,
+    min_confidence: float = 0.5,
+    extract_embeddings: bool = True,
+) -> list:
+    """Dense face detection for a clip's time range.
+
+    Unlike the pipeline's sparse detection (1 frame every ~5s), this extracts
+    frames at 2 FPS and runs full face detection + embedding on each.
+    Used at export time to build accurate per-frame face position data
+    for layout decisions and smooth tracking.
+
+    For a 30-second clip at 0.5s intervals = 60 frames.
+    At ~10ms per frame (YuNet + SFace) = ~600ms total. Fast enough for export.
+    """
+    import subprocess
+    import tempfile
+
+    duration = end - start
+    if duration <= 0:
+        return []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = [
+            "ffmpeg", "-y", "-threads", "2",
+            "-ss", str(start),
+            "-t", str(duration),
+            "-i", video_path,
+            "-vf", (
+                f"fps=1/{sample_rate},"
+                "scale='min(640,iw)':'min(360,ih)'"
+                ":force_original_aspect_ratio=decrease"
+            ),
+            "-vsync", "vfr", "-q:v", "15",
+            os.path.join(tmpdir, "dense_%04d.jpg"),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
+
+        frame_files = sorted(
+            f for f in os.listdir(tmpdir) if f.startswith("dense_")
+        )
+        if not frame_files:
+            return []
+
+        frame_paths = []
+        for i, fname in enumerate(frame_files):
+            ts = start + i * sample_rate
+            frame_paths.append((ts, os.path.join(tmpdir, fname)))
+
+        # Run face detection with embeddings
+        results = detect_faces_batch(frame_paths, min_confidence=min_confidence)
+
+        # If batch detection didn't produce embeddings (e.g. FaceMesh path),
+        # supplement with YuNet+SFace for embeddings
+        has_embeddings = any(
+            f.identity_embedding is not None
+            for fr in results for f in fr.faces
+        )
+        if not has_embeddings and extract_embeddings:
+            yunet_results = _detect_with_opencv_dnn(
+                frame_paths, min_confidence, extract_embeddings=True
+            )
+            if yunet_results:
+                # Merge embeddings from YuNet into the main results
+                for main_fr, yunet_fr in zip(results, yunet_results):
+                    for mf in main_fr.faces:
+                        if mf.identity_embedding is not None:
+                            continue
+                        # Find closest YuNet face by position
+                        best_yf = None
+                        best_dist = float('inf')
+                        for yf in yunet_fr.faces:
+                            dist = abs(mf.nose_x - yf.nose_x)
+                            if dist < best_dist and yf.identity_embedding is not None:
+                                best_dist = dist
+                                best_yf = yf
+                        if best_yf and best_dist < 10:
+                            mf.identity_embedding = best_yf.identity_embedding
+
+        logger.info(
+            "[DenseFaces] %d frames, %d with faces, %d with embeddings (%.1fs clip, %.1fs rate)",
+            len(results),
+            sum(1 for r in results if r.faces),
+            sum(1 for r in results for f in r.faces if f.identity_embedding is not None),
+            duration, sample_rate,
+        )
+        return results
 
 
 def _log_summary(results: list[FrameFaces]):

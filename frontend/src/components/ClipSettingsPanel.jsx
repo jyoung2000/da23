@@ -566,6 +566,34 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                 </div>
               </div>
 
+              {/* Layout Mode */}
+              <div style={sectionStyle}>
+                <span style={labelStyle}>Layout Mode</span>
+                <div style={radioGroupStyle}>
+                  {[
+                    { value: 'auto', label: 'Auto', desc: 'Automatically detect optimal layout' },
+                    { value: 'single', label: 'Single', desc: 'One speaker centered (default)' },
+                    { value: 'split', label: 'Split', desc: 'Two speakers side-by-side' },
+                    { value: 'pip', label: 'PiP', desc: 'Picture-in-picture overlay' },
+                  ].map((lm) => (
+                    <button
+                      key={lm.value}
+                      onClick={() => update('layoutMode', lm.value)}
+                      style={radioBtnStyle(
+                        (settings.layoutMode || 'auto') === lm.value
+                      )}
+                      title={lm.desc}
+                      disabled={
+                        (lm.value === 'split' || lm.value === 'pip') &&
+                        !(settings.faceRegistry?.slots?.length >= 2)
+                      }
+                    >
+                      {lm.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* Export Quality */}
               <div style={sectionStyle}>
                 <span style={labelStyle}>Default Export Quality</span>

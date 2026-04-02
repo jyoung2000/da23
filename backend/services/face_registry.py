@@ -231,3 +231,141 @@ def build_face_registry(
         )
 
     return registry
+
+
+def build_face_registry_with_embeddings(
+    face_results: list,
+    min_appearances: int = 3,
+    cosine_threshold: float = 0.35,
+) -> "FaceRegistry":
+    """Build face registry using identity embeddings for cross-frame matching.
+
+    Instead of clustering by x-position (brittle when speakers move),
+    this uses cosine similarity of face embeddings to group faces across
+    frames. Two faces with cosine distance < threshold are the same person,
+    regardless of where they appear in the frame.
+
+    Falls back to position-based clustering if embeddings are unavailable.
+    """
+    import numpy as np
+
+    # Collect all faces with embeddings
+    all_faces = []  # [(embedding, nose_x, width, height, frame_idx)]
+    total_faces = 0
+    for fi, fr in enumerate(face_results):
+        for face in fr.faces:
+            total_faces += 1
+            if face.identity_embedding is not None:
+                all_faces.append((
+                    np.array(face.identity_embedding, dtype=np.float32),
+                    face.nose_x, face.width, face.height, fi,
+                ))
+
+    # Fall back to position-based clustering if <50% of faces have embeddings
+    if len(all_faces) < total_faces * 0.5 or len(all_faces) < 3:
+        logger.info(
+            "Embedding coverage too low (%d/%d faces) — falling back to position-based registry",
+            len(all_faces), total_faces,
+        )
+        return build_face_registry(face_results, min_appearances)
+
+    # Build adjacency via cosine similarity
+    n = len(all_faces)
+    embeddings = np.stack([f[0] for f in all_faces])
+    # Normalize for cosine similarity
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    embeddings_norm = embeddings / norms
+
+    # Union-Find for connected components
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Compare all pairs — for typical video (< 500 faces), this is fast
+    sim_matrix = embeddings_norm @ embeddings_norm.T
+    for i in range(n):
+        for j in range(i + 1, n):
+            # SFace uses cosine distance; lower = more similar
+            cosine_dist = 1.0 - sim_matrix[i, j]
+            if cosine_dist < cosine_threshold:
+                union(i, j)
+
+    # Group by connected component
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(i)
+
+    # Build slots from groups
+    slots = []
+    for group_indices in groups.values():
+        unique_frames = len(set(all_faces[i][4] for i in group_indices))
+        if unique_frames < min_appearances:
+            continue
+
+        x_positions = sorted([all_faces[i][1] for i in group_indices])
+        widths = [all_faces[i][2] for i in group_indices]
+        heights = [all_faces[i][3] for i in group_indices]
+
+        # Median x for robustness
+        mid = len(x_positions) // 2
+        if len(x_positions) % 2 == 0 and len(x_positions) >= 2:
+            median_x = (x_positions[mid - 1] + x_positions[mid]) / 2
+        else:
+            median_x = x_positions[mid]
+
+        slots.append(FaceSlot(
+            slot_id=len(slots),
+            x_center=round(median_x, 1),
+            x_min=round(min(x_positions), 1),
+            x_max=round(max(x_positions), 1),
+            frame_count=unique_frames,
+            avg_width=round(sum(widths) / len(widths), 1),
+            avg_height=round(sum(heights) / len(heights), 1),
+        ))
+
+    # Sort left to right
+    slots.sort(key=lambda s: s.x_center)
+    for i, s in enumerate(slots):
+        s.slot_id = i
+
+    registry = FaceRegistry(
+        slots=slots,
+        total_frames=len(face_results),
+        frames_with_faces=sum(1 for fr in face_results if fr.faces),
+    )
+
+    logger.info(
+        "Face registry (embeddings): %d slots from %d faces (%d with embeddings)",
+        len(slots), total_faces, len(all_faces),
+    )
+    for s in slots:
+        logger.info(
+            "  Slot %d: x=%.0f%% [%.0f-%.0f], %d frames, avg_size=%.0f%%x%.0f%%",
+            s.slot_id, s.x_center, s.x_min, s.x_max,
+            s.frame_count, s.avg_width, s.avg_height,
+        )
+
+    # Assign identity_id back to each face in the original results
+    assign_identities(face_results, registry)
+
+    return registry
+
+
+def assign_identities(face_results: list, registry: "FaceRegistry") -> None:
+    """Assign identity_id to each face based on nearest registry slot."""
+    for fr in face_results:
+        for face in fr.faces:
+            slot = registry.nearest_slot(face.nose_x)
+            if slot:
+                face.identity_id = slot.slot_id

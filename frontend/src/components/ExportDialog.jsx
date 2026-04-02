@@ -198,6 +198,13 @@ export default function ExportDialog({
         setError(`Warning: ${overlays.warnings.length} overlay(s) skipped from export — media files not yet uploaded. The export will proceed without them.`);
       }
 
+      // Layout mode for multi-speaker reframing
+      if (settings?.layoutMode && settings.layoutMode !== 'auto') {
+        exportPayload.layout_mode = settings.layoutMode;
+      } else {
+        exportPayload.layout_mode = 'auto';
+      }
+
       // Diagnostic logging: full export payload for debugging overlay/settings issues
       console.log('[ExportDialog] Export payload:', JSON.stringify({
         clip_id: exportPayload.clip_id,
