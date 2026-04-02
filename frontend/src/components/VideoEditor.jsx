@@ -876,7 +876,15 @@ export default function VideoEditor({
 
   const subjectKeyframes = useMemo(() => {
     if (!scenes?.length || clipStart == null || clipEnd == null) return null;
-    return processKeyframes(scenes, clipStart, clipEnd, isCrop ? srcRatio : null, isCrop ? targetRatio : null, transcript || null, sceneCuts || null);
+    const result = processKeyframes(scenes, clipStart, clipEnd, isCrop ? srcRatio : null, isCrop ? targetRatio : null, transcript || null, sceneCuts || null);
+    const dynamic = result && isDynamic(result);
+    console.log(
+      `[SubjectTracking] VideoEditor: ${result?.length || 0} keyframes, ` +
+      `isCrop=${isCrop}, dynamic=${dynamic}, ` +
+      `unique_x=[${result ? [...new Set(result.map(k=>k.x))].sort((a,b)=>a-b).join(',') : ''}], ` +
+      `scenes=${scenes.length}, aspect=${aspectRatio}`
+    );
+    return result;
   }, [scenes, clipStart, clipEnd, isCrop, srcRatio, targetRatio, transcript, sceneCuts]);
 
   const hasDynamicSubject = useMemo(

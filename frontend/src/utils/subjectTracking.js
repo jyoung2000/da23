@@ -792,6 +792,12 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   // in the scene analysis subject_x values.
   const clusters = detectPositionClusters(raw);
 
+  console.log(
+    `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}`,
+    clusters ? clusters.map(c => `center=${c.center} count=${c.count}`).join(', ') : 'none',
+    `raw_x_unique=[${[...new Set(raw.map(k=>k.x))].sort((a,b)=>a-b).join(',')}]`
+  );
+
   if (clusters && clusters.length >= 2) {
     // Multi-position mode: snap to cluster centers, then use scene cuts for instant jumps.
     // NO smoothing — speaker/position changes must be instant snaps, not pans.
