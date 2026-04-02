@@ -1411,17 +1411,20 @@ async def _run_analysis_inner(job_id: str):
         # ── Face registry consistency check ──
         # After AI + face fusion produces subject_x values, validate every
         # value against the face registry and snap outliers to the nearest
-        # known face position. This eliminates dead-zone values.
-        if face_registry and face_registry.multi_speaker and scenes_result:
+        # known face position. For multi-speaker, this eliminates dead-zone
+        # values between speakers. For single-speaker, this corrects AI
+        # estimates on frames where face detection found no face data (the
+        # AI's spatial reasoning is unreliable, returning 50 or random values).
+        if face_registry and face_registry.slots and scenes_result:
             slot_centers = [s.x_center for s in face_registry.slots]
             corrected = 0
+            # For single-speaker, use a tighter threshold — any value far from
+            # the one detected face is likely an AI error.
+            snap_threshold = 15 if face_registry.multi_speaker else 10
             for scene in scenes_result:
                 sx = scene.subject_x
                 min_dist_to_slot = min(abs(sx - sc) for sc in slot_centers)
-                # Only snap truly outlier values — those in the dead zone
-                # between speakers. A larger threshold preserves the AI's
-                # more accurate position estimates near each speaker.
-                if min_dist_to_slot > 15:
+                if min_dist_to_slot > snap_threshold:
                     nearest = round(min(slot_centers, key=lambda sc: abs(sc - sx)))
                     scene.subject_x = nearest
                     corrected += 1
