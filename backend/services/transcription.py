@@ -379,19 +379,20 @@ async def transcribe_audio_subprocess(
             "--task", task,
             # Quality parameters (match in-process path exactly)
             # Translate: lower threshold to capture quiet backchannel/whispered speech
-            "--no-speech-threshold", "0.6" if task == "translate" else "0.8",
+            # CJK translate: even lower to catch soft-spoken moments, eating speech, ecstatic speech
+            "--no-speech-threshold", ("0.45" if _is_cjk else "0.6") if task == "translate" else "0.8",
             "--log-prob-threshold", "-1.5",
-            "--compression-ratio-threshold", "2.4",
+            "--compression-ratio-threshold", "3.0" if _is_cjk else "2.4",
             "--repetition-penalty", "1.1",
             "--no-repeat-ngram-size", "3",
             "--prompt-reset-on-temperature", "0.5",
-            # VAD fine-tuning — same parameters for both transcribe and translate.
-            # Translate-specific overrides were removed: they caused more harm
-            # (capturing noise artifacts) than benefit.
-            "--vad-min-silence-ms", "250" if task == "translate" else "300",
-            "--vad-speech-pad-ms", "600",
-            "--vad-onset", "0.15",
-            "--vad-min-speech-ms", "100",
+            # VAD fine-tuning — CJK translate gets more sensitive settings to catch
+            # soft-spoken moments, speech while eating, whispered speech, and
+            # ecstatic/emotional outbursts that standard thresholds miss.
+            "--vad-min-silence-ms", ("200" if _is_cjk else "250") if task == "translate" else "300",
+            "--vad-speech-pad-ms", "800" if (task == "translate" and _is_cjk) else "600",
+            "--vad-onset", "0.08" if (task == "translate" and _is_cjk) else "0.15",
+            "--vad-min-speech-ms", "50" if (task == "translate" and _is_cjk) else "100",
         ]
         if vad_filter:
             cmd.append("--vad-filter")
@@ -1347,7 +1348,9 @@ def _transcribe_sync(
     # Translate tasks (e.g. Japanese→English) need lower no_speech_threshold
     # because quiet backchannel responses, whispered asides, and expressive
     # speech get high no_speech_prob from Whisper's English acoustic model.
-    _no_speech_thresh = 0.6 if task == "translate" else 0.8
+    _is_cjk_inproc = language.lower() in ("ja", "ko", "zh", "zh-cn", "zh-tw") if language else False
+    # CJK translate: even lower threshold to catch soft-spoken moments
+    _no_speech_thresh = (0.45 if _is_cjk_inproc else 0.6) if task == "translate" else 0.8
     transcribe_kwargs = {
         "task": task,
         "beam_size": effective_beam,
@@ -1368,12 +1371,22 @@ def _transcribe_sync(
         "prompt_reset_on_temperature": 0.5,
     }
     if settings.WHISPER_VAD_FILTER:
-        transcribe_kwargs["vad_parameters"] = {
-            "min_silence_duration_ms": 300,   # Was 500 — shorter threshold preserves natural pauses
-            "speech_pad_ms": 600,              # Wide padding captures trailing quiet words
-            "onset": 0.2,                      # Low threshold captures whispers and soft speech
-            "min_speech_duration_ms": 100,     # Don't discard very short utterances
-        }
+        if task == "translate" and _is_cjk_inproc:
+            # CJK translate: very sensitive VAD to catch soft-spoken moments,
+            # speech while eating, whispers, and ecstatic outbursts
+            transcribe_kwargs["vad_parameters"] = {
+                "min_silence_duration_ms": 200,
+                "speech_pad_ms": 800,
+                "onset": 0.08,
+                "min_speech_duration_ms": 50,
+            }
+        else:
+            transcribe_kwargs["vad_parameters"] = {
+                "min_silence_duration_ms": 300,   # Was 500 — shorter threshold preserves natural pauses
+                "speech_pad_ms": 600,              # Wide padding captures trailing quiet words
+                "onset": 0.2,                      # Low threshold captures whispers and soft speech
+                "min_speech_duration_ms": 100,     # Don't discard very short utterances
+            }
     # CJK languages have higher natural compression ratios — relax threshold.
     # Also applies to translate tasks where the source is CJK (Whisper still
     # processes the CJK audio internally before translating to English).
@@ -1411,11 +1424,20 @@ def _transcribe_sync(
     # For translate tasks: gentler noise gate and compression to preserve
     # quiet backchannel responses and expressive speech.
     if task == "translate":
-        _af_base = (
-            "highpass=f=50,"
-            "acompressor=threshold=-35dB:ratio=2:attack=10:release=200:makeup=8dB,"
-            "agate=threshold=-55dB:attack=10:release=100"
-        )
+        # CJK translate: disable noise gate entirely and use gentler compression
+        # to preserve soft-spoken moments, speech while eating, whispers, and
+        # ecstatic outbursts. Standard gates cut these as "silence".
+        if _is_cjk_inproc:
+            _af_base = (
+                "highpass=f=30,"
+                "acompressor=threshold=-40dB:ratio=1.5:attack=15:release=300:makeup=10dB"
+            )
+        else:
+            _af_base = (
+                "highpass=f=50,"
+                "acompressor=threshold=-35dB:ratio=2:attack=10:release=200:makeup=8dB,"
+                "agate=threshold=-55dB:attack=10:release=100"
+            )
     else:
         _af_base = (
             "highpass=f=50,"

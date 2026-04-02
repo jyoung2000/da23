@@ -379,8 +379,13 @@ def main():
             }
             # For translation tasks, ensure minimum speech padding
             # (parent process already sets good defaults — only enforce floor)
+            # CJK translate gets wider padding and lower onset for soft speech
             if args.task == "translate":
-                vad_params["speech_pad_ms"] = max(vad_params["speech_pad_ms"], 700)
+                if args.cjk:
+                    vad_params["speech_pad_ms"] = max(vad_params["speech_pad_ms"], 800)
+                    vad_params["onset"] = min(vad_params["onset"], 0.08)
+                else:
+                    vad_params["speech_pad_ms"] = max(vad_params["speech_pad_ms"], 700)
             transcribe_kwargs["vad_parameters"] = vad_params
 
         if args.language:
