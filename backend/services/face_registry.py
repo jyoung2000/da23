@@ -102,10 +102,42 @@ def build_face_registry(
     outer_faces = [f for f in all_faces if f[0] < MIDZONE_LO or f[0] > MIDZONE_HI]
     midzone_faces = [f for f in all_faces if MIDZONE_LO <= f[0] <= MIDZONE_HI]
 
-    # If no outer faces, fall back to using all faces
+    # If no outer faces, fall back to using all faces — but check for bimodal
+    # distribution within the midzone (two speakers both near center).
     if not outer_faces:
-        outer_faces = all_faces
-        midzone_faces = []
+        # Check if midzone faces form two distinct groups (bimodal)
+        if len(all_faces) >= 6:
+            sorted_x = sorted(f[0] for f in all_faces)
+            # Find the largest gap between consecutive face positions
+            max_gap = 0
+            max_gap_idx = 0
+            for i in range(1, len(sorted_x)):
+                gap = sorted_x[i] - sorted_x[i - 1]
+                if gap > max_gap:
+                    max_gap = gap
+                    max_gap_idx = i
+            # If there's a clear gap (>= 8%), split into two groups
+            if max_gap >= 8:
+                group_a = [f for f in all_faces if f[0] <= sorted_x[max_gap_idx - 1]]
+                group_b = [f for f in all_faces if f[0] >= sorted_x[max_gap_idx]]
+                if len(set(f[3] for f in group_a)) >= min_appearances and \
+                   len(set(f[3] for f in group_b)) >= min_appearances:
+                    logger.info(
+                        "Bimodal midzone split: gap=%.1f%% at x=%.1f%%, "
+                        "group_a=%d faces (mean=%.1f%%), group_b=%d faces (mean=%.1f%%)",
+                        max_gap,
+                        (sorted_x[max_gap_idx - 1] + sorted_x[max_gap_idx]) / 2,
+                        len(group_a), sum(f[0] for f in group_a) / len(group_a),
+                        len(group_b), sum(f[0] for f in group_b) / len(group_b),
+                    )
+                    outer_faces = all_faces
+                    midzone_faces = []
+                    # Use the detected gap as cluster_gap for this run
+                    cluster_gap = max_gap * 0.8
+
+        if not outer_faces:
+            outer_faces = all_faces
+            midzone_faces = []
 
     # Sort by x position and cluster by gap
     outer_faces.sort(key=lambda f: f[0])

@@ -410,6 +410,42 @@ def _detect_with_mediapipe(frame_paths, min_confidence):
     return results
 
 
+def _merge_detections(
+    primary: list,  # list[FrameFaces] — FaceMesh results (have lip landmarks)
+    secondary: list,  # list[FrameFaces] — YuNet results (may have more faces)
+) -> list:
+    """Merge face detections from two detectors.
+
+    Keeps all primary (FaceMesh) faces — they have lip landmarks for active
+    speaker detection. Adds secondary (YuNet) faces that don't overlap with
+    any primary face (IoU by x_center distance > 10% of frame width).
+    """
+    merged = []
+    for pri, sec in zip(primary, secondary):
+        faces = list(pri.faces)  # Start with FaceMesh faces
+        primary_xs = [f.x_center for f in faces]
+
+        # Add non-overlapping secondary faces
+        for sf in sec.faces:
+            overlaps = any(abs(sf.x_center - px) < 10 for px in primary_xs)
+            if not overlaps:
+                faces.append(sf)
+                primary_xs.append(sf.x_center)
+
+        # Recompute primary face index
+        primary_idx = -1
+        if faces:
+            primary_idx = max(range(len(faces)), key=lambda i: faces[i].width * faces[i].height)
+
+        merged.append(FrameFaces(
+            timestamp=pri.timestamp,
+            frame_path=pri.frame_path,
+            faces=faces,
+            primary_face_idx=primary_idx,
+        ))
+    return merged
+
+
 def detect_faces_batch(
     frame_paths: list[tuple[float, str]],
     min_confidence: float = 0.5,
@@ -417,19 +453,49 @@ def detect_faces_batch(
     """Detect faces in extracted frames.
 
     Tries MediaPipe first (more accurate), falls back to OpenCV Haar cascade.
+    When FaceMesh finds very few multi-face frames, supplements with YuNet
+    to catch additional speakers that FaceMesh missed.
     Returns list of FrameFaces, one per input frame.
     """
     import time as _t
     t0 = _t.monotonic()
 
     # Try FaceMesh first (gives lip landmarks for active speaker detection)
+    facemesh_results = None
     try:
-        results = _detect_with_facemesh(frame_paths, min_confidence)
-        if results is not None:
+        facemesh_results = _detect_with_facemesh(frame_paths, min_confidence)
+        if facemesh_results is not None:
             elapsed = _t.monotonic() - t0
             logger.info("Face detection using MediaPipe FaceMesh (%.1fs for %d frames)", elapsed, len(frame_paths))
-            _log_summary(results)
-            return results
+            _log_summary(facemesh_results)
+
+            # Check if FaceMesh is missing a second speaker: low multi-face rate
+            # but many single-face frames suggests alternating detection between
+            # two speakers. Supplement with YuNet to find the second face.
+            with_faces = sum(1 for r in facemesh_results if r.faces)
+            multi = sum(1 for r in facemesh_results if len(r.faces) >= 2)
+            multi_rate = multi / max(with_faces, 1)
+
+            if with_faces >= 10 and multi_rate < 0.1:
+                # Low multi-face rate — try YuNet supplement
+                try:
+                    yunet_results = _detect_with_opencv_dnn(frame_paths, min_confidence)
+                    if yunet_results is not None:
+                        yunet_multi = sum(1 for r in yunet_results if len(r.faces) >= 2)
+                        if yunet_multi > multi:
+                            # YuNet found more multi-face frames — merge its extra faces
+                            merged = _merge_detections(facemesh_results, yunet_results)
+                            new_multi = sum(1 for r in merged if len(r.faces) >= 2)
+                            logger.info(
+                                "FaceMesh+YuNet merge: multi-face frames %d→%d (YuNet found %d)",
+                                multi, new_multi, yunet_multi,
+                            )
+                            _log_summary(merged)
+                            return merged
+                except Exception as e:
+                    logger.debug("YuNet supplement failed: %s", e)
+
+            return facemesh_results
     except Exception as e:
         logger.info("FaceMesh unavailable (%s), trying FaceDetection", e)
 
