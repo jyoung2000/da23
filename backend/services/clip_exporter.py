@@ -3869,7 +3869,19 @@ def _build_layout_filter_chain(
         return None, False, ""
 
     # The layout filters produce [v] output — it's a complex filtergraph
-    sub = _subtitle_filter(ass_path, force_style=subtitle_force_style) if ass_path else ""
+    # For SPLIT mode, position subtitles in the bottom panel
+    sub = ""
+    if ass_path:
+        if mode == LayoutMode.SPLIT:
+            # Push subtitles to bottom panel: offset MarginV by half the frame height
+            half_h = out_h // 2
+            split_margin_v = max(10, out_h - half_h - 40)
+            extra_style = f"MarginV={split_margin_v}"
+            if subtitle_force_style:
+                extra_style = f"{subtitle_force_style},{extra_style}"
+            sub = _subtitle_filter(ass_path, force_style=extra_style)
+        else:
+            sub = _subtitle_filter(ass_path, force_style=subtitle_force_style)
 
     return filter_chain, True, sub
 

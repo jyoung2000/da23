@@ -1941,6 +1941,13 @@ export default function ViralClips() {
             transcript={previewTranscript}
             initialVolume={previewClipSettings.playbackVolume}
             initialSpeed={previewClipSettings.playbackSpeed}
+            layoutTimeline={jobs.find(j => j.job_id === previewClip?.jobId)?.layout_timeline || null}
+            faceRegistry={jobs.find(j => j.job_id === previewClip?.jobId)?.face_registry_data || null}
+            defaultLayoutMode={
+              previewClipSettings.layoutMode ||
+              jobs.find(j => j.job_id === previewClip?.jobId)?.default_layout_mode ||
+              'single'
+            }
             onClose={() => { setPreviewClip(null); setCenterSubjectState('idle'); setTrackingApplied(false); }}
           />
           {/* Tracking-applied indicator — flashes when subject tracking updates */}

@@ -276,6 +276,7 @@ export default function ClipPreview({
 }) {
   const { isMobile } = useResponsive();
   const fgVideoRef = useRef(null);
+  const splitBottomVideoRef = useRef(null);
   const containerRef = useRef(null);
   const fullscreenRef = useRef(null);
 
@@ -988,6 +989,38 @@ export default function ClipPreview({
     return defaultLayoutMode;
   }, [layoutTimeline, defaultLayoutMode]);
 
+  // Sync split-mode bottom video with top video
+  useEffect(() => {
+    if (activeLayoutMode !== 'split') return;
+    const topVideo = fgVideoRef.current;
+    const bottomVideo = splitBottomVideoRef.current;
+    if (!topVideo || !bottomVideo) return;
+
+    const syncTime = () => {
+      if (Math.abs(bottomVideo.currentTime - topVideo.currentTime) > 0.1) {
+        bottomVideo.currentTime = topVideo.currentTime;
+      }
+    };
+    const syncPlay = () => { bottomVideo.play().catch(() => {}); syncTime(); };
+    const syncPause = () => { bottomVideo.pause(); syncTime(); };
+
+    topVideo.addEventListener('play', syncPlay);
+    topVideo.addEventListener('pause', syncPause);
+    topVideo.addEventListener('seeked', syncTime);
+    topVideo.addEventListener('timeupdate', syncTime);
+
+    // Initial sync
+    bottomVideo.currentTime = topVideo.currentTime;
+    if (!topVideo.paused) bottomVideo.play().catch(() => {});
+
+    return () => {
+      topVideo.removeEventListener('play', syncPlay);
+      topVideo.removeEventListener('pause', syncPause);
+      topVideo.removeEventListener('seeked', syncTime);
+      topVideo.removeEventListener('timeupdate', syncTime);
+    };
+  }, [activeLayoutMode]);
+
   // --- Video area ---
   // Single wrapper div (no key="crop"/"original") to preserve the <video> element
   // across crop/non-crop transitions. Different keys would destroy and recreate
@@ -1040,9 +1073,11 @@ export default function ClipPreview({
             <div style={{ height: '3px', background: 'rgba(0,0,0,0.3)', flexShrink: 0 }} />
             <div style={{ flex: 1, overflow: 'hidden', position: 'relative' }}>
               <video
+                ref={splitBottomVideoRef}
                 src={src}
                 preload="auto"
                 playsInline
+                muted
                 style={{
                   width: '100%',
                   height: '100%',
@@ -1050,6 +1085,7 @@ export default function ClipPreview({
                   objectFit: 'cover',
                   objectPosition: `${bottomPct}% 50%`,
                 }}
+                onClick={togglePlay}
               />
             </div>
           </div>

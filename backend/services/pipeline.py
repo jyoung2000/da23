@@ -1365,7 +1365,63 @@ async def _run_analysis_inner(job_id: str):
 
         await database.update_job_status(job_id, transcript=list(result))
 
-        # If language was auto-detected, store the detected language on the job
+        # ── Inline heuristic diarization ──
+        # Subprocess Whisper defers speaker assignment (all = "Speaker 1").
+        # Run face-aware or heuristic diarization so active speaker detection
+        # has real speaker labels. Instant, no GPU needed.
+        if result and len(set(s.speaker for s in result)) <= 1:
+            try:
+                speaker_count_before = len(set(s.speaker for s in result))
+                _face_data_for_diar = dense_face_results if dense_face_results else face_results
+
+                # Try face-aware diarization first (uses face positions for speaker changes)
+                if _face_data_for_diar and face_registry and face_registry.multi_speaker:
+                    from backend.services.transcription import assign_speakers_with_face_data
+                    raw_segs = [
+                        {
+                            "start": s.start, "end": s.end, "text": s.text,
+                            "words": [{"start": w.start, "end": w.end, "word": w.word} for w in s.words] if s.words else None,
+                            "confidence": s.confidence,
+                            "avg_logprob": s.avg_logprob,
+                            "no_speech_prob": s.no_speech_prob,
+                        }
+                        for s in result
+                    ]
+                    result = assign_speakers_with_face_data(raw_segs, _face_data_for_diar, face_registry)
+                    logger.info(
+                        "[%s] Face-aware diarization: %d -> %d speakers",
+                        job_id, speaker_count_before, len(set(s.speaker for s in result)),
+                    )
+
+                # Fallback: pure heuristic diarization
+                if len(set(s.speaker for s in result)) <= 1:
+                    from backend.services.transcription import assign_speakers_heuristic
+                    raw_segs = [
+                        {
+                            "start": s.start, "end": s.end, "text": s.text,
+                            "words": [{"start": w.start, "end": w.end, "word": w.word} for w in s.words] if s.words else None,
+                            "confidence": s.confidence,
+                            "avg_logprob": s.avg_logprob,
+                            "no_speech_prob": s.no_speech_prob,
+                        }
+                        for s in result
+                    ]
+                    result = assign_speakers_heuristic(raw_segs)
+                    logger.info(
+                        "[%s] Heuristic diarization: %d -> %d speakers",
+                        job_id, speaker_count_before, len(set(s.speaker for s in result)),
+                    )
+
+                # Update stored transcript with speaker labels
+                await database.update_job_status(job_id, transcript=list(result))
+
+                # Store speaker names for frontend
+                speaker_set = set(s.speaker for s in result)
+                if len(speaker_set) >= 2:
+                    speaker_names = {speaker: speaker for speaker in sorted(speaker_set)}
+                    await database.update_job_status(job_id, speaker_names=speaker_names)
+            except Exception as e:
+                logger.warning("[%s] Inline diarization failed (non-fatal): %s", job_id, e)
         # so the translator knows the source language
         if not job.language and result:
             from backend.services.transcription import _last_detected_language
@@ -2076,6 +2132,19 @@ async def _run_analysis_inner(job_id: str):
                     )
         except Exception as e:
             logger.warning("[%s] Lip-only speaker fallback failed (non-fatal): %s", job_id, e)
+
+    # ── Speaker → Face Slot Mapping ──
+    if face_registry and face_registry.multi_speaker and transcript:
+        try:
+            from backend.services.active_speaker import map_speakers_to_face_slots
+            _mapping_face_data = dense_face_results if dense_face_results else face_results
+            speaker_slot_map = map_speakers_to_face_slots(
+                transcript, face_registry, _mapping_face_data,
+            )
+            if speaker_slot_map:
+                logger.info("[%s] Speaker→slot mapping: %s", job_id, speaker_slot_map)
+        except Exception as e:
+            logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
 
     # ── Layout Analysis ──
     # Determine optimal layout mode for the video based on face data + speaker data

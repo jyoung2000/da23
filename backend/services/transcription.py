@@ -2652,3 +2652,70 @@ def _assign_speakers_from_diarization(
         ))
 
     return transcript_segments
+
+
+def assign_speakers_heuristic(raw_segments: list[dict]) -> list:
+    """Public wrapper for heuristic speaker assignment.
+
+    Assigns speaker labels using pause-based turn detection and speech
+    rate analysis. No model or GPU required — instant computation.
+    """
+    return _assign_speakers(raw_segments)
+
+
+def assign_speakers_with_face_data(
+    raw_segments: list[dict],
+    face_results: list = None,
+    face_registry=None,
+) -> list:
+    """Assign speaker labels using face position changes + pause analysis.
+
+    For each transcript segment, finds the nearest face detection frame
+    and checks which face slot is closest. Falls back to heuristic.
+    """
+    if not face_results or not face_registry or not getattr(face_registry, 'multi_speaker', False):
+        return _assign_speakers(raw_segments)
+
+    frame_map = {}
+    for fr in face_results:
+        if fr.faces and fr.primary_face_idx >= 0:
+            primary = fr.faces[fr.primary_face_idx]
+            slot = face_registry.nearest_slot(primary.nose_x)
+            if slot:
+                frame_map[fr.timestamp] = slot.slot_id
+
+    if len(frame_map) < 5:
+        return _assign_speakers(raw_segments)
+
+    frame_times = sorted(frame_map.keys())
+
+    def _nearest_slot(t):
+        closest = min(frame_times, key=lambda ft: abs(ft - t))
+        return frame_map.get(closest, -1) if abs(closest - t) <= 5.0 else -1
+
+    slot_to_speaker = {}
+    next_spk = 1
+    segments = []
+    for seg in raw_segments:
+        slot_id = _nearest_slot((seg["start"] + seg["end"]) / 2)
+        if slot_id >= 0:
+            if slot_id not in slot_to_speaker:
+                slot_to_speaker[slot_id] = next_spk
+                next_spk += 1
+            spk = slot_to_speaker[slot_id]
+        else:
+            spk = int(segments[-1].speaker.split()[-1]) if segments else 1
+
+        words = [WordTimestamp(**w) for w in seg["words"]] if seg.get("words") else None
+        segments.append(TranscriptSegment(
+            start=round(seg["start"], 2), end=round(seg["end"], 2),
+            text=seg["text"], speaker=f"Speaker {spk}", words=words,
+            confidence=seg.get("confidence"), avg_logprob=seg.get("avg_logprob"),
+            no_speech_prob=seg.get("no_speech_prob"),
+        ))
+
+    logger.info(
+        "Face-aware diarization: %d speakers from %d slots, %d segments with face data",
+        len(set(s.speaker for s in segments)), len(slot_to_speaker), len(frame_map),
+    )
+    return segments

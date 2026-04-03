@@ -1989,6 +1989,9 @@ export default function Analysis() {
               subjectX={clipSubjectX}
               scenes={job.scenes || []}
               sceneCuts={job.scene_cut_timestamps || null}
+              layoutTimeline={job.layout_timeline || null}
+              faceRegistry={job.face_registry_data || null}
+              defaultLayoutMode={clipSettings.layoutMode || job.default_layout_mode || 'single'}
               initialVolume={clipSettings.playbackVolume}
               initialSpeed={clipSettings.playbackSpeed}
               onTimeUpdate={setVideoCurrentTime}
@@ -2093,6 +2096,9 @@ export default function Analysis() {
               subjectX={50}
               scenes={job.scenes || []}
               sceneCuts={job.scene_cut_timestamps || null}
+              layoutTimeline={job.layout_timeline || null}
+              faceRegistry={job.face_registry_data || null}
+              defaultLayoutMode={clipSettings.layoutMode || job.default_layout_mode || 'single'}
               initialVolume={clipSettings.playbackVolume}
               initialSpeed={clipSettings.playbackSpeed}
               onTimeUpdate={setVideoCurrentTime}
