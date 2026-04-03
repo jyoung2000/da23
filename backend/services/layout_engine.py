@@ -163,16 +163,30 @@ def _smooth_layout_votes(
     if not raw_segments:
         return []
 
-    # Absorb short segments into neighbors
-    stabilized = list(raw_segments)
-    changed = True
-    while changed:
+    # Helper: merge consecutive same-mode segments
+    def _merge_consecutive(segments):
+        if not segments:
+            return []
+        merged = [segments[0]]
+        for start, end, mode in segments[1:]:
+            if mode == merged[-1][2]:
+                merged[-1] = (merged[-1][0], end, mode)
+            else:
+                merged.append((start, end, mode))
+        return merged
+
+    # Absorb short segments into neighbors.
+    # Merge after each pass so same-mode segments combine and grow beyond min_duration.
+    # Max iterations prevents infinite loops on pathological input.
+    stabilized = _merge_consecutive(raw_segments)
+    max_passes = 50
+
+    for _pass in range(max_passes):
         changed = False
         new_segments = []
         for i, (start, end, mode) in enumerate(stabilized):
             duration = end - start
             if duration < min_duration and len(stabilized) > 1:
-                # Absorb into the longer neighbor
                 if i > 0 and (i == len(stabilized) - 1 or
                               (new_segments and (new_segments[-1][1] - new_segments[-1][0]) >=
                                (stabilized[i + 1][1] - stabilized[i + 1][0] if i + 1 < len(stabilized) else 0))):
@@ -182,23 +196,30 @@ def _smooth_layout_votes(
                     changed = True
                 elif i + 1 < len(stabilized):
                     # Absorb into next segment by changing this mode
-                    new_segments.append((start, end, stabilized[i + 1][2]))
-                    changed = True
+                    next_mode = stabilized[i + 1][2]
+                    if next_mode != mode:  # Only flag changed if mode actually changes
+                        new_segments.append((start, end, next_mode))
+                        changed = True
+                    else:
+                        new_segments.append((start, end, mode))
                 else:
                     new_segments.append((start, end, mode))
             else:
                 new_segments.append((start, end, mode))
-        stabilized = new_segments
 
-    # Merge consecutive same-mode segments
-    merged = [stabilized[0]]
-    for start, end, mode in stabilized[1:]:
-        if mode == merged[-1][2]:
-            merged[-1] = (merged[-1][0], end, mode)
-        else:
-            merged.append((start, end, mode))
+        # CRITICAL: merge consecutive same-mode segments INSIDE the loop
+        # so absorbed segments combine and grow beyond min_duration
+        stabilized = _merge_consecutive(new_segments)
 
-    return merged
+        if not changed:
+            break
+    else:
+        logger.warning(
+            "[Layout] Smoothing did not converge after %d passes (%d segments remaining)",
+            max_passes, len(stabilized),
+        )
+
+    return stabilized
 
 
 def build_layout_timeline(
