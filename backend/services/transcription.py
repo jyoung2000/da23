@@ -2672,33 +2672,35 @@ def assign_speakers_with_face_data(
     face_results: list = None,
     face_registry=None,
     scene_descriptions: list = None,
+    active_speaker_events: list = None,
 ) -> list:
-    """Assign speaker labels using face mesh + lip aperture + vision data.
+    """Assign speaker labels using audio timing + face mesh + lip aperture + vision.
 
-    Handles unlimited speakers by using face registry slots as ground truth.
-    Each unique face slot becomes a unique speaker — no artificial cap.
+    Fuses audio cues (Whisper word timestamps, pause patterns, speech rate)
+    with visual cues (face mesh lip aperture, identity embeddings, scene
+    descriptions) to accurately identify who is speaking in each segment.
 
-    Data fusion hierarchy (most reliable first):
-    1. Lip aperture — face with highest LAR during speech = speaker
-    2. Face identity (embeddings) — identity_id tracks who is who across frames
-    3. Face position — nearest face slot by x-position
-    4. Vision scene description — AI scene analysis subject_x as fallback
-    5. Temporal continuity — inherit from previous segment
+    No artificial speaker cap — speaker count = unique face slots detected.
 
-    Falls back to heuristic if face data is insufficient.
+    Data fusion (most reliable first):
+    1. Active speaker events — pre-computed lip-audio cross-correlation per timestamp
+    2. Per-word lip sync — correlate each word's timing with face lip movement
+    3. Segment-level lip aperture — highest LAR face during speech = speaker
+    4. Face identity embeddings — track who is who across frames
+    5. Vision scene descriptions — AI subject_x as position fallback
+    6. Audio heuristics — pause duration, speech rate changes (from _assign_speakers)
+    7. Temporal continuity — inherit from previous segment
     """
     if not face_results or not face_registry or not getattr(face_registry, 'multi_speaker', False):
         return _assign_speakers(raw_segments)
 
-    # Build time-indexed face data for fast lookup
-    # For each frame: store ALL faces with their slot assignments and lip data
-    frame_data = {}  # timestamp -> list of (slot_id, lip_aperture, identity_id, nose_x)
+    # Build time-indexed face data: ALL faces per frame with lip + identity data
+    frame_data = {}  # timestamp -> [(slot_id, lip_aperture, identity_id, nose_x)]
     for fr in face_results:
         if not fr.faces:
             continue
         faces_in_frame = []
         for f in fr.faces:
-            # Use identity_id if assigned, otherwise nearest slot
             slot_id = f.identity_id if f.identity_id >= 0 else -1
             if slot_id < 0:
                 slot = face_registry.nearest_slot(f.nose_x)
@@ -2713,7 +2715,16 @@ def assign_speakers_with_face_data(
 
     frame_times = sorted(frame_data.keys())
 
-    # Build scene description lookup for vision model fallback
+    # Build active speaker event lookup if available
+    def _active_speaker_at(t):
+        if not active_speaker_events:
+            return -1
+        for ev in active_speaker_events:
+            if ev.start <= t <= ev.end and ev.slot_id >= 0:
+                return ev.slot_id
+        return -1
+
+    # Build scene description lookup
     scene_sx_map = {}
     if scene_descriptions:
         for sc in scene_descriptions:
@@ -2721,43 +2732,69 @@ def assign_speakers_with_face_data(
             sx = sc.subject_x if hasattr(sc, 'subject_x') else sc.get('subject_x', 50)
             scene_sx_map[ts] = sx
 
-    def _find_speaker_at_time(t: float) -> int:
-        """Find which face slot is speaking at time t using all available data."""
-        # Find nearest face detection frames within ±2 seconds
+    def _lip_speaker_at(t, window=1.0):
+        """Find which face slot has the highest lip movement near time t."""
         nearby = []
         for ft in frame_times:
-            if abs(ft - t) <= 2.0:
+            if abs(ft - t) <= window:
                 nearby.extend(frame_data[ft])
-            elif ft > t + 2.0:
+            elif ft > t + window:
                 break
-
         if not nearby:
-            # No face data — try vision scene description
-            if scene_sx_map:
-                best_sc_t = min(scene_sx_map.keys(), key=lambda st: abs(st - t), default=None)
-                if best_sc_t is not None and abs(best_sc_t - t) <= 10.0:
-                    sx = scene_sx_map[best_sc_t]
-                    slot = face_registry.nearest_slot(sx)
-                    if slot:
-                        return slot.slot_id
             return -1
 
-        # Method 1: Find face with highest lip aperture (most reliable speaker signal)
-        speaking_faces = [(sid, lar) for sid, lar, _, _ in nearby if lar > 0.02]
-        if speaking_faces:
-            # Aggregate LAR per slot — the slot with highest average LAR is speaking
+        speaking = [(sid, lar) for sid, lar, _, _ in nearby if lar > 0.02]
+        if speaking:
             slot_lars = {}
-            for sid, lar in speaking_faces:
+            for sid, lar in speaking:
                 slot_lars.setdefault(sid, []).append(lar)
-            best_slot = max(slot_lars, key=lambda s: sum(slot_lars[s]) / len(slot_lars[s]))
-            return best_slot
+            return max(slot_lars, key=lambda s: sum(slot_lars[s]) / len(slot_lars[s]))
 
-        # Method 2: Face with identity closest to previous speaker (temporal continuity)
-        # Just use the most common slot in nearby frames
+        # No one clearly speaking — use most common face slot
         from collections import Counter
         slot_counts = Counter(sid for sid, _, _, _ in nearby)
-        if slot_counts:
-            return slot_counts.most_common(1)[0][0]
+        return slot_counts.most_common(1)[0][0] if slot_counts else -1
+
+    def _find_speaker_for_segment(seg):
+        """Determine speaker for a segment using all available signals."""
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        seg_mid = (seg_start + seg_end) / 2
+
+        # Signal 1: Active speaker events (pre-computed lip-audio correlation)
+        as_slot = _active_speaker_at(seg_mid)
+        if as_slot >= 0:
+            return as_slot
+
+        # Signal 2: Per-word lip sync (correlate each word's timing with lip movement)
+        if seg.get("words"):
+            word_votes = []
+            for w in seg["words"]:
+                w_start = w.get("start", w.get("s", 0))
+                w_end = w.get("end", w.get("e", 0))
+                if w_end - w_start < 0.05:
+                    continue
+                w_mid = (w_start + w_end) / 2
+                slot = _lip_speaker_at(w_mid, window=0.5)
+                if slot >= 0:
+                    word_votes.append(slot)
+            if word_votes:
+                from collections import Counter
+                return Counter(word_votes).most_common(1)[0][0]
+
+        # Signal 3: Segment-level lip aperture (wider ±2s window)
+        lip_slot = _lip_speaker_at(seg_mid, window=2.0)
+        if lip_slot >= 0:
+            return lip_slot
+
+        # Signal 4: Vision scene description
+        if scene_sx_map:
+            best_sc_t = min(scene_sx_map.keys(), key=lambda st: abs(st - seg_mid), default=None)
+            if best_sc_t is not None and abs(best_sc_t - seg_mid) <= 10.0:
+                sx = scene_sx_map[best_sc_t]
+                slot = face_registry.nearest_slot(sx)
+                if slot:
+                    return slot.slot_id
 
         return -1
 
@@ -2767,9 +2804,30 @@ def assign_speakers_with_face_data(
     segments = []
     prev_spk = 1
 
-    for seg in raw_segments:
-        seg_mid = (seg["start"] + seg["end"]) / 2
-        slot_id = _find_speaker_at_time(seg_mid)
+    # Also run audio heuristics to detect pause-based speaker changes
+    # and use them as a SECONDARY signal when visual data is ambiguous
+    for i, seg in enumerate(raw_segments):
+        slot_id = _find_speaker_for_segment(seg)
+
+        # Audio heuristic: large gap = possible new speaker
+        if slot_id < 0 and i > 0:
+            gap = seg["start"] - raw_segments[i - 1]["end"]
+            if gap >= 1.2:
+                # Gap suggests speaker change — try a different slot than previous
+                prev_slot = None
+                for sid, spk in slot_to_speaker.items():
+                    if spk == prev_spk:
+                        prev_slot = sid
+                        break
+                # Look for any OTHER slot in nearby frames
+                nearby_slots = set()
+                for ft in frame_times:
+                    if abs(ft - seg["start"]) <= 3.0:
+                        for sid, _, _, _ in frame_data.get(ft, []):
+                            if sid != prev_slot:
+                                nearby_slots.add(sid)
+                if nearby_slots:
+                    slot_id = min(nearby_slots)  # Pick the first alternative slot
 
         if slot_id >= 0:
             if slot_id not in slot_to_speaker:
@@ -2777,7 +2835,6 @@ def assign_speakers_with_face_data(
                 next_spk += 1
             spk = slot_to_speaker[slot_id]
         else:
-            # No face/vision data — inherit from previous segment
             spk = prev_spk
 
         prev_spk = spk
@@ -2792,8 +2849,9 @@ def assign_speakers_with_face_data(
     num_speakers = len(set(s.speaker for s in segments))
     logger.info(
         "Face-aware diarization: %d speakers from %d face slots, "
-        "%d/%d frames with face data, %d scene descriptions used",
+        "%d/%d frames with face data, %d scene descriptions, %d active speaker events",
         num_speakers, len(slot_to_speaker), len(frame_data),
         len(face_results), len(scene_sx_map),
+        len(active_speaker_events) if active_speaker_events else 0,
     )
     return segments

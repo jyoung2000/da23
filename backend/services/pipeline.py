@@ -2149,6 +2149,56 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
 
+    # ── Post-scene speaker refinement ──
+    # Now that we have active speaker events (the best lip-audio correlation),
+    # scene descriptions (vision model data), and dense face data — re-run
+    # diarization to refine speaker labels. The initial diarization ran BEFORE
+    # scenes and active speaker detection, so it had incomplete data.
+    if (face_registry and face_registry.multi_speaker and transcript
+            and (active_speaker_events or dense_face_results)):
+        try:
+            from backend.services.transcription import assign_speakers_with_face_data
+            _refine_face_data = dense_face_results if dense_face_results else face_results
+            raw_segs = [
+                {
+                    "start": s.start, "end": s.end, "text": s.text,
+                    "words": [{"start": w.start, "end": w.end, "word": w.word} for w in s.words] if s.words else None,
+                    "confidence": s.confidence,
+                    "avg_logprob": s.avg_logprob,
+                    "no_speech_prob": s.no_speech_prob,
+                }
+                for s in transcript
+            ]
+            speakers_before = len(set(s.speaker for s in transcript))
+            refined = assign_speakers_with_face_data(
+                raw_segs, _refine_face_data, face_registry,
+                scene_descriptions=scenes,
+                active_speaker_events=active_speaker_events,
+            )
+            speakers_after = len(set(s.speaker for s in refined))
+
+            # Only accept the refined result if it found meaningful speaker diversity
+            if speakers_after >= 2:
+                transcript = refined
+                await database.update_job_status(job_id, transcript=list(transcript))
+                speaker_names = {spk: spk for spk in sorted(set(s.speaker for s in transcript))}
+                await database.update_job_status(job_id, speaker_names=speaker_names)
+                logger.info(
+                    "[%s] Post-scene speaker refinement: %d → %d speakers "
+                    "(using active_speaker=%d events, scenes=%d, dense_faces=%d)",
+                    job_id, speakers_before, speakers_after,
+                    len(active_speaker_events),
+                    len(scenes) if scenes else 0,
+                    len(dense_face_results),
+                )
+            else:
+                logger.info(
+                    "[%s] Post-scene speaker refinement: no improvement (%d speakers, keeping original %d)",
+                    job_id, speakers_after, speakers_before,
+                )
+        except Exception as e:
+            logger.warning("[%s] Post-scene speaker refinement failed (non-fatal): %s", job_id, e)
+
     # ── Layout Analysis ──
     # Determine optimal layout mode for the video based on face data + speaker data
     layout_timeline = None
