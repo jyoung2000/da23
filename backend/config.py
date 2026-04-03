@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     CONCURRENT_ANALYSES: int = 2
     AUTO_ANALYZE: bool = True
     SUBJECT_TRACKING_ENABLED: bool = True
+    DENSE_FACE_SAMPLE_RATE: float = 1.0  # seconds between dense face detection frames (1.0 = 1fps)
 
     # FFmpeg encoding settings
     FFMPEG_PRESET: str = "fast"       # ultrafast|superfast|veryfast|faster|fast|medium|slow

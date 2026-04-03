@@ -5849,7 +5849,31 @@ async def export_clip(
                 # Full-video analysis gives ~3 face samples per 30s clip.
                 # Dense detection extracts frames at 2s intervals for the clip
                 # and runs face detection, giving 15+ accurate face positions.
-                dense_kf = _dense_face_detection_for_clip(video_path, start, end, sample_rate=2.0)
+                # Use improved dense detector (0.5s intervals) with fallback
+                try:
+                    from backend.services.face_detector import detect_faces_dense as _dense_detect
+                    _dense_results = _dense_detect(
+                        video_path, start, end,
+                        sample_rate=0.5,
+                        min_confidence=0.4,
+                        extract_embeddings=False,
+                    )
+                    dense_kf = []
+                    for _dfr in _dense_results:
+                        if _dfr.faces and _dfr.primary_face_idx >= 0:
+                            _pf = _dfr.faces[_dfr.primary_face_idx]
+                            _rel_t = _dfr.timestamp - start
+                            dense_kf.append((_rel_t, round(_pf.nose_x)))
+                    logger.info(
+                        "[SubjectTracking] clip %s: dense detection (0.5s) produced %d keyframes",
+                        clip_id, len(dense_kf),
+                    )
+                except Exception as _dense_err:
+                    logger.warning(
+                        "[SubjectTracking] clip %s: improved dense detection failed (%s), falling back",
+                        clip_id, _dense_err,
+                    )
+                    dense_kf = _dense_face_detection_for_clip(video_path, start, end, sample_rate=2.0)
                 if dense_kf:
                     # Merge dense face keyframes with AI-derived keyframes.
                     # Face positions are pixel-accurate; prefer them over AI estimates.

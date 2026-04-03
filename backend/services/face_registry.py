@@ -363,9 +363,61 @@ def build_face_registry_with_embeddings(
 
 
 def assign_identities(face_results: list, registry: "FaceRegistry") -> None:
-    """Assign identity_id to each face based on nearest registry slot."""
+    """Assign identity_id to each face.
+
+    Uses embedding cosine similarity when available (matches even when
+    speakers move positions). Falls back to nearest-slot-by-position
+    for faces without embeddings.
+    """
+    if not registry.slots:
+        return
+
+    # Build reference embeddings per slot from faces already assigned
+    slot_embeddings = {}
     for fr in face_results:
         for face in fr.faces:
+            if face.identity_embedding is not None and face.identity_id >= 0:
+                slot_embeddings.setdefault(face.identity_id, []).append(face.identity_embedding)
+
+    # Compute centroid per slot
+    slot_centroids = {}
+    if slot_embeddings:
+        try:
+            import numpy as np
+            for sid, embs in slot_embeddings.items():
+                arr = np.array(embs, dtype=np.float32)
+                centroid = arr.mean(axis=0)
+                norm = np.linalg.norm(centroid)
+                if norm > 1e-8:
+                    centroid = centroid / norm
+                slot_centroids[sid] = centroid
+        except ImportError:
+            pass
+
+    for fr in face_results:
+        for face in fr.faces:
+            # Try embedding match first
+            if face.identity_embedding is not None and slot_centroids:
+                try:
+                    import numpy as np
+                    emb = np.array(face.identity_embedding, dtype=np.float32)
+                    emb_norm = np.linalg.norm(emb)
+                    if emb_norm > 1e-8:
+                        emb = emb / emb_norm
+                    best_sid = -1
+                    best_sim = -1.0
+                    for sid, centroid in slot_centroids.items():
+                        sim = float(np.dot(emb, centroid))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_sid = sid
+                    if best_sid >= 0 and best_sim > 0.5:
+                        face.identity_id = best_sid
+                        continue
+                except (ImportError, Exception):
+                    pass
+
+            # Fallback: nearest slot by position
             slot = registry.nearest_slot(face.nose_x)
             if slot:
                 face.identity_id = slot.slot_id

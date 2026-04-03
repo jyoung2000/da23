@@ -133,6 +133,7 @@ class JobResult(BaseModel):
     face_registry_data: Optional[dict] = None   # Serialized FaceRegistry with embeddings
     layout_timeline: list[dict] = []            # [{start, end, layout_mode, face_positions}]
     default_layout_mode: str = "single"         # Overall recommended layout for the video
+    dense_tracking_summary: Optional[dict] = None  # {total_frames, frames_with_faces, sample_rate, ...}
 
 
 class ClipSEO(BaseModel):

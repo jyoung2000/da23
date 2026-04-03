@@ -975,6 +975,8 @@ async def _run_analysis_inner(job_id: str):
     # the AI vision model's subject_x estimates. No GPU needed.
     face_registry = None
     face_results = []  # Will hold FrameFaces for active speaker detection
+    dense_face_results = []  # Will hold dense 1fps FrameFaces
+    _sparse_face_map = {}  # timestamp -> FrameFaces for scene enrichment
     if settings.SUBJECT_TRACKING_ENABLED:
         try:
             from backend.services.face_detector import detect_faces_batch
@@ -987,19 +989,10 @@ async def _run_analysis_inner(job_id: str):
             faces_found = sum(1 for fd in face_results if fd.faces)
             logger.info("[%s] Face detection complete: %d/%d frames have faces", job_id, faces_found, len(frames))
 
-            # Build face registry — stable face slots from detection data
-            from backend.services.face_registry import build_face_registry
-            face_registry = build_face_registry(face_results)
-            for frame in frames:
-                frame.face_registry = face_registry
-
-            if face_registry.multi_speaker:
-                logger.info(
-                    "[%s] Multi-speaker face registry: %d face slots (%s)",
-                    job_id,
-                    len(face_registry.slots),
-                    ", ".join(f"slot{s.slot_id}@{s.x_center:.0f}%" for s in face_registry.slots),
-                )
+            # Pre-populate sparse face map for scene enrichment later
+            for fd in face_results:
+                if fd.faces:
+                    _sparse_face_map[round(fd.timestamp, 1)] = fd
 
             # Face detection is complete — all OpenCV resources released.
             import gc
@@ -1008,6 +1001,85 @@ async def _run_analysis_inner(job_id: str):
             logger.info("[%s] Face detection unavailable (mediapipe not installed) — using AI estimates only", job_id)
         except Exception as e:
             logger.warning("[%s] Face detection failed (non-fatal): %s", job_id, e)
+
+    # ── Dense face detection (1fps, CPU-only) ──
+    # The sparse detection above gives ~3 face samples per 30s clip.
+    # Dense detection at 1fps gives 30 samples — enough for smooth per-second
+    # tracking. Runs on CPU using YuNet+SFace, no GPU conflict.
+    if settings.SUBJECT_TRACKING_ENABLED and face_results:
+        try:
+            from backend.services.face_detector import detect_faces_dense
+            video_duration = metadata.get("duration", 0)
+            dense_sample_rate = settings.DENSE_FACE_SAMPLE_RATE
+
+            # Cap at 1800 dense frames (~30 min at 1fps)
+            max_dense_duration = min(video_duration, 1800)
+            if video_duration > 1800:
+                dense_sample_rate = max(dense_sample_rate, video_duration / 1800)
+                logger.info(
+                    "[%s] Long video (%.0fs) — adjusting dense face rate to %.1fs",
+                    job_id, video_duration, dense_sample_rate,
+                )
+
+            logger.info(
+                "[%s] Running dense face detection (%.1fs intervals, ~%d frames)...",
+                job_id, dense_sample_rate,
+                int(max_dense_duration / dense_sample_rate),
+            )
+            dense_face_results = detect_faces_dense(
+                video_path,
+                start=0,
+                end=video_duration,
+                sample_rate=dense_sample_rate,
+                min_confidence=0.4,
+                extract_embeddings=True,
+            )
+            dense_with_faces = sum(1 for r in dense_face_results if r.faces)
+            logger.info(
+                "[%s] Dense face detection: %d frames, %d with faces",
+                job_id, len(dense_face_results), dense_with_faces,
+            )
+        except Exception as e:
+            logger.warning("[%s] Dense face detection failed (non-fatal): %s", job_id, e)
+
+    # ── Build face registry ──
+    # Prefer dense data with embeddings for identity-based clustering.
+    # Falls back to sparse position-based clustering if dense unavailable.
+    if settings.SUBJECT_TRACKING_ENABLED and (face_results or dense_face_results):
+        try:
+            from backend.services.face_registry import (
+                build_face_registry,
+                build_face_registry_with_embeddings,
+            )
+            if dense_face_results:
+                face_registry = build_face_registry_with_embeddings(
+                    dense_face_results,
+                    min_appearances=3,
+                    cosine_threshold=0.35,
+                )
+                logger.info(
+                    "[%s] Face registry built from %d dense frames (embedding-based)",
+                    job_id, len(dense_face_results),
+                )
+            elif face_results:
+                face_registry = build_face_registry(face_results)
+                logger.info(
+                    "[%s] Face registry built from %d sparse frames (position-based fallback)",
+                    job_id, len(face_results),
+                )
+
+            if face_registry:
+                for frame in frames:
+                    frame.face_registry = face_registry
+                if face_registry.multi_speaker:
+                    logger.info(
+                        "[%s] Multi-speaker face registry: %d face slots (%s)",
+                        job_id,
+                        len(face_registry.slots),
+                        ", ".join(f"slot{s.slot_id}@{s.x_center:.0f}%" for s in face_registry.slots),
+                    )
+        except Exception as e:
+            logger.warning("[%s] Face registry build failed (non-fatal): %s", job_id, e)
 
     _phase_timings["extraction"] = _pipeline_elapsed()
     logger.info("[%s] Extracted %d frames + audio track", job_id, total_frames)
@@ -1747,16 +1819,113 @@ async def _run_analysis_inner(job_id: str):
         job_id, len(transcript), speaker_count, len(scenes), scenes_provider,
     )
 
+    # ── Screen content detection (CPU, ~5ms/frame) ──
+    if settings.SUBJECT_TRACKING_ENABLED and scenes:
+        try:
+            from backend.services.screen_detector import detect_screen_content_batch
+            frame_list = [(f.timestamp, f.path) for f in frames]
+            screen_map = detect_screen_content_batch(frame_list)
+            screen_count = 0
+            for scene in scenes:
+                for screen_ts, is_sc in screen_map.items():
+                    if is_sc and abs(screen_ts - scene.timestamp) < 1.0:
+                        scene.has_screen_content = True
+                        screen_count += 1
+                        break
+            if screen_count > 0:
+                logger.info("[%s] Screen content detected in %d/%d scenes", job_id, screen_count, len(scenes))
+        except Exception as e:
+            logger.warning("[%s] Screen detection failed (non-fatal): %s", job_id, e)
+
+    # ── Object tracking for faceless frames (CPU, ~15ms/frame) ──
+    if settings.SUBJECT_TRACKING_ENABLED and face_results and scenes:
+        try:
+            from backend.services.object_tracker import track_objects_in_frames
+            frame_list = [(f.timestamp, f.path) for f in frames]
+            object_kf = track_objects_in_frames(frame_list, face_results)
+            if object_kf:
+                logger.info("[%s] Object tracker: %d keyframes from faceless frames", job_id, len(object_kf))
+                obj_map = {round(t, 1): sx for t, sx in object_kf}
+                for scene in scenes:
+                    if scene.subject_x == 50 and not scene.face_positions:
+                        for obj_t, obj_sx in obj_map.items():
+                            if abs(obj_t - scene.timestamp) < 2.0:
+                                scene.primary_object_x = obj_sx
+                                scene.primary_object_type = "saliency"
+                                scene.subject_x = obj_sx
+                                break
+        except Exception as e:
+            logger.warning("[%s] Object tracking failed (non-fatal): %s", job_id, e)
+
+    # ── Merge dense face data into scene descriptions ──
+    # Override AI vision model's subject_x with actual face positions from
+    # dense detection. Dense data is pixel-accurate; AI estimates are guesses.
+    if dense_face_results and scenes:
+        dense_map = {}
+        for dfr in dense_face_results:
+            dense_map[round(dfr.timestamp, 2)] = dfr
+        enriched = 0
+        for scene in scenes:
+            best_dfr = None
+            best_dist = float('inf')
+            for dt, dfr in dense_map.items():
+                dist = abs(dt - scene.timestamp)
+                if dist < best_dist and dist < 1.0:
+                    best_dist = dist
+                    best_dfr = dfr
+            if best_dfr and best_dfr.faces:
+                scene.face_count = len(best_dfr.faces)
+                scene.face_positions = [
+                    {
+                        "slot_id": f.identity_id,
+                        "x": round(f.nose_x, 1),
+                        "y": round(f.nose_y, 1),
+                        "w": round(f.width, 1),
+                        "h": round(f.height, 1),
+                        "is_speaking": f.is_speaking,
+                        "identity_id": f.identity_id,
+                    }
+                    for f in best_dfr.faces
+                ]
+                if best_dfr.primary_face_idx >= 0:
+                    primary = best_dfr.faces[best_dfr.primary_face_idx]
+                    old_sx = scene.subject_x
+                    scene.subject_x = round(primary.nose_x)
+                    if abs(old_sx - scene.subject_x) > 5:
+                        enriched += 1
+        if enriched > 0:
+            logger.info("[%s] Dense face data overrode subject_x on %d/%d scenes", job_id, enriched, len(scenes))
+
+    # Backfill scene face data from sparse detection
+    if _sparse_face_map and scenes:
+        for scene in scenes:
+            if scene.face_count > 0:
+                continue
+            ts_key = round(scene.timestamp, 1)
+            if ts_key in _sparse_face_map:
+                sfd = _sparse_face_map[ts_key]
+                scene.face_count = len(sfd.faces)
+
     # ── Active Speaker Detection (lip-audio cross-correlation) ──
     active_speaker_events = []
-    if face_registry and face_registry.multi_speaker and transcript and face_results:
+    if face_registry and face_registry.multi_speaker and transcript and (face_results or dense_face_results):
         try:
             from backend.services.active_speaker import (
-                build_active_speaker_timeline, get_active_slot_at_time,
+                build_active_speaker_timeline,
+                build_active_speaker_timeline_v2,
+                get_active_slot_at_time,
             )
-            active_speaker_events = build_active_speaker_timeline(
-                face_results, transcript, face_registry,
-            )
+            # Use V2 (identity-based) with dense data when available
+            _speaker_face_data = dense_face_results if dense_face_results else face_results
+            if dense_face_results:
+                active_speaker_events = build_active_speaker_timeline_v2(
+                    _speaker_face_data, transcript, face_registry,
+                    window_seconds=0.5,
+                )
+            else:
+                active_speaker_events = build_active_speaker_timeline(
+                    _speaker_face_data, transcript, face_registry,
+                )
             if active_speaker_events:
                 logger.info(
                     "[%s] Active speaker timeline: %d events covering %.1fs",
@@ -1816,8 +1985,9 @@ async def _run_analysis_inner(job_id: str):
         if face_registry.multi_speaker:
             try:
                 from backend.services.layout_engine import build_layout_timeline
+                _layout_face_data = dense_face_results if dense_face_results else face_results
                 layout_timeline = build_layout_timeline(
-                    face_results=face_results,
+                    face_results=_layout_face_data,
                     face_registry=face_registry,
                     active_speaker_events=active_speaker_events,
                     scene_descriptions=scenes,
@@ -1847,6 +2017,23 @@ async def _run_analysis_inner(job_id: str):
         await database.update_job_status(job_id, **layout_update)
     except Exception as e:
         logger.warning("[%s] Failed to save layout data (non-fatal): %s", job_id, e)
+
+    # Store dense tracking summary
+    if dense_face_results:
+        try:
+            dense_summary = {
+                "total_frames": len(dense_face_results),
+                "frames_with_faces": sum(1 for r in dense_face_results if r.faces),
+                "frames_with_embeddings": sum(
+                    1 for r in dense_face_results
+                    for f in r.faces if f.identity_embedding is not None
+                ),
+                "sample_rate": settings.DENSE_FACE_SAMPLE_RATE,
+                "coverage_seconds": len(dense_face_results) * settings.DENSE_FACE_SAMPLE_RATE,
+            }
+            await database.update_job_status(job_id, dense_tracking_summary=dense_summary)
+        except Exception as e:
+            logger.debug("[%s] Failed to store dense tracking summary: %s", job_id, e)
 
     # ── Pipeline health check: detect total failure ──
     real_scenes = [s for s in scenes
