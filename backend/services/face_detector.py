@@ -644,10 +644,10 @@ def detect_faces_dense(
             "-vsync", "vfr", "-q:v", "5",
             os.path.join(tmpdir, "dense_%04d.jpg"),
         ]
-        # Scale timeout with video duration and resolution
-        # VP9 4K is ~3x slower to decode than 1080p H.264
+        # Scale timeout: ~0.5s per expected frame + 30s base for FFmpeg startup.
+        # VP9 4K is ~3x slower to decode than H.264 1080p.
         expected_frames = int(duration / sample_rate)
-        ffmpeg_timeout = max(120, int(20 + expected_frames * 0.5))
+        ffmpeg_timeout = max(120, int(30 + expected_frames * 0.5))
         logger.info(
             "[DenseFaces] Starting FFmpeg extraction: %.0fs video, %d expected frames, timeout=%ds",
             duration, expected_frames, ffmpeg_timeout,

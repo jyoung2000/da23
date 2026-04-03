@@ -862,7 +862,8 @@ async def _run_analysis_inner(job_id: str):
     else:
         _SUMMARY_CLIP_TIMEOUT = max(900, int(vid_minutes * 120))
         _B64_ENCODE_TIMEOUT = max(300, int(vid_minutes * 10))
-        _trans_scene_timeout = max(1800, int(vid_minutes * 150))
+        # Scale generously to handle CPU Whisper fallback (0.5-1x real-time)
+        _trans_scene_timeout = max(3600, int(vid_minutes * 300))
     logger.info(
         "[%s] Adaptive timeouts: extraction=%ds, summary_clip=%ds, b64=%ds (%.1f min video)",
         job_id, _EXTRACTION_TIMEOUT, _SUMMARY_CLIP_TIMEOUT, _B64_ENCODE_TIMEOUT, vid_minutes,
@@ -1282,8 +1283,9 @@ async def _run_analysis_inner(job_id: str):
         _subprocess_whisper_used[0] = _use_subprocess_whisper
         if _use_subprocess_whisper:
             logger.info("[%s] Using subprocess Whisper (GPU mode) to release CUDA memory after", job_id)
-            # Timeout: audio_duration * 3 or 30 minutes minimum — prevents infinite hang
-            _whisper_timeout = max(1800, int(audio_duration * 3)) if audio_duration > 0 else 3600
+            # Timeout: audio_duration * 5 — accommodates CPU fallback (0.5-1x real-time)
+            # GPU: ~10-30x real-time, CPU: ~0.5-1x real-time. Use 5x for safety.
+            _whisper_timeout = max(1800, int(audio_duration * 5)) if audio_duration > 0 else 3600
             logger.info("[%s] Whisper subprocess timeout: %ds for %.0fs audio", job_id, _whisper_timeout, audio_duration)
             try:
                 result = await asyncio.wait_for(
@@ -1711,7 +1713,10 @@ async def _run_analysis_inner(job_id: str):
     # FIRST so Whisper gets exclusive GPU access, then run scene analysis.
     # On a 4GB GPU, concurrent execution pushes both to CPU (~3x slower).
     # With cloud providers, run concurrently since there's no VRAM contention.
-    _uses_local_gpu = "ollama" in settings.active_provider_chain
+    # Sequential mode is ONLY needed when Ollama handles vision AND Whisper
+    # both compete for the same local GPU. When cloud providers (OpenRouter,
+    # Gemini, Groq) handle vision, there's no GPU contention — run concurrently.
+    _uses_local_gpu = is_ollama_primary
     # _trans_scene_timeout was already computed in the adaptive timeout block above
 
     if _uses_local_gpu:
