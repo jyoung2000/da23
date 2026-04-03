@@ -74,6 +74,9 @@ def build_face_registry(
     consistently appear near the same x-position are merged into a
     single "slot". Transient detections (< min_appearances) are
     discarded as noise.
+
+    For multi-speaker panels (3+ faces/frame), automatically reduces
+    the gap threshold to detect speakers sitting closer together.
     """
     # Collect all individual face positions — use nose_x (actual face center
     # from landmarks) rather than x_center (bbox center). nose_x is more
@@ -95,19 +98,36 @@ def build_face_registry(
             frames_with_faces=0,
         )
 
-    # ── Two-pass clustering: first without midzone, then assign midzone ──
-    # The mid-zone [40-60%] contains noise from merged detections, AI defaults,
-    # and faces that are slightly off-center. If we cluster with these included,
-    # they chain nearby real positions into one bloated cluster (e.g. [48-86%]).
-    # Exception: if 3+ faces detected per frame, midzone faces are real center speakers.
-
-    # Check if any frame has 3+ faces — indicates a center speaker is real
+    # ── Adaptive gap threshold for multi-speaker panels ──
+    # With 5 speakers across a frame, they're ~20% apart. The default
+    # gap of 15 merges adjacent speakers. Scale down based on how many
+    # faces are typically detected per frame.
     frame_face_counts = {}
     for f in all_faces:
         fi = f[3]  # frame_idx
         frame_face_counts[fi] = frame_face_counts.get(fi, 0) + 1
     max_faces_per_frame = max(frame_face_counts.values(), default=0)
+    # Frames with 3+ faces frequently = multi-speaker panel
+    frames_with_3plus = sum(1 for c in frame_face_counts.values() if c >= 3)
+    multi_speaker_ratio = frames_with_3plus / max(len(frame_face_counts), 1)
 
+    if max_faces_per_frame >= 4 or multi_speaker_ratio > 0.1:
+        # 4+ speakers: faces are ~15-25% apart, need gap of ~10
+        adaptive_gap = max(8.0, 100.0 / (max_faces_per_frame + 1))
+        if adaptive_gap < cluster_gap:
+            logger.info(
+                "Multi-speaker panel detected (max %d faces/frame, %.0f%% frames with 3+) — "
+                "reducing cluster gap %.0f → %.0f",
+                max_faces_per_frame, multi_speaker_ratio * 100,
+                cluster_gap, adaptive_gap,
+            )
+            cluster_gap = adaptive_gap
+
+    # ── Two-pass clustering: first without midzone, then assign midzone ──
+    # The mid-zone [40-60%] contains noise from merged detections, AI defaults,
+    # and faces that are slightly off-center. If we cluster with these included,
+    # they chain nearby real positions into one bloated cluster (e.g. [48-86%]).
+    # Exception: if 3+ faces detected per frame, midzone faces are real center speakers.
     MIDZONE_LO, MIDZONE_HI = 40, 60
     if max_faces_per_frame >= 3:
         # 3+ faces in some frames — don't exclude midzone, center speaker is real

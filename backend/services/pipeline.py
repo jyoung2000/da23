@@ -2150,6 +2150,72 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Lip-only speaker fallback failed (non-fatal): %s", job_id, e)
 
+    # ── Per-second scene synthesis from dense face + active speaker data ──
+    # The AI vision model produces ~59 scenes (1 per 10s). Dense face detection
+    # has 606 data points (1 per second). Create synthetic scene descriptions at
+    # 1-second intervals using the ACTIVE SPEAKER's face position, so the
+    # tracking pipeline gets 600+ keyframes instead of 59.
+    if dense_face_results and active_speaker_events and face_registry and scenes:
+        try:
+            from backend.services.active_speaker import get_active_slot_at_time
+            from backend.models import SceneDescription
+
+            synthetic_count = 0
+            for dfr in dense_face_results:
+                # Skip timestamps that already have a real scene
+                has_real_scene = any(abs(s.timestamp - dfr.timestamp) < 0.5 for s in scenes)
+                if has_real_scene:
+                    continue
+                if not dfr.faces:
+                    continue
+
+                # Find which face slot is the active speaker at this timestamp
+                slot_id = get_active_slot_at_time(active_speaker_events, dfr.timestamp)
+                chosen_face = None
+
+                if slot_id >= 0:
+                    # Find face matching the active speaker's slot
+                    for f in dfr.faces:
+                        if f.identity_id == slot_id:
+                            chosen_face = f
+                            break
+                    if not chosen_face and face_registry:
+                        slot = face_registry.slot_by_id(slot_id)
+                        if slot:
+                            chosen_face = min(dfr.faces,
+                                key=lambda f: abs(f.nose_x - slot.x_center))
+
+                # Fallback: highest lip aperture
+                if not chosen_face:
+                    speaking = [f for f in dfr.faces if f.lip_aperture > 0.02]
+                    if speaking:
+                        chosen_face = max(speaking, key=lambda f: f.lip_aperture)
+
+                # Last fallback: largest face
+                if not chosen_face and dfr.primary_face_idx >= 0:
+                    chosen_face = dfr.faces[dfr.primary_face_idx]
+
+                if chosen_face:
+                    scenes.append(SceneDescription(
+                        timestamp=dfr.timestamp,
+                        description="[dense face tracking]",
+                        importance_score=5,
+                        thumbnail_path="",
+                        subject_x=round(chosen_face.nose_x),
+                        face_count=len(dfr.faces),
+                    ))
+                    synthetic_count += 1
+
+            if synthetic_count > 0:
+                scenes.sort(key=lambda s: s.timestamp)
+                logger.info(
+                    "[%s] Created %d synthetic per-second scenes from dense face + active speaker data "
+                    "(total scenes: %d)",
+                    job_id, synthetic_count, len(scenes),
+                )
+        except Exception as e:
+            logger.warning("[%s] Per-second scene synthesis failed (non-fatal): %s", job_id, e)
+
     # ── Speaker → Face Slot Mapping ──
     if face_registry and face_registry.multi_speaker and transcript:
         try:
