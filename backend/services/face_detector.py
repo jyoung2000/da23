@@ -523,7 +523,7 @@ def _merge_detections(
 
 def detect_faces_batch(
     frame_paths: list[tuple[float, str]],
-    min_confidence: float = 0.5,
+    min_confidence: float = 0.3,
 ) -> list[FrameFaces]:
     """Detect faces in extracted frames.
 
@@ -544,29 +544,37 @@ def detect_faces_batch(
             logger.info("Face detection using MediaPipe FaceMesh (%.1fs for %d frames)", elapsed, len(frame_paths))
             _log_summary(facemesh_results)
 
-            # Check if FaceMesh is missing a second speaker: low multi-face rate
-            # but many single-face frames suggests alternating detection between
-            # two speakers. Supplement with YuNet to find the second face.
+            # Always supplement FaceMesh with YuNet to catch faces that FaceMesh missed.
+            # FaceMesh has a max_num_faces limit and struggles with small/angled faces.
+            # YuNet is more aggressive and catches faces FaceMesh misses in group shots.
+            # The merge is additive — only adds non-overlapping faces (IoU > 10% threshold).
             with_faces = sum(1 for r in facemesh_results if r.faces)
             multi = sum(1 for r in facemesh_results if len(r.faces) >= 2)
-            multi_rate = multi / max(with_faces, 1)
+            max_faces_per_frame = max((len(r.faces) for r in facemesh_results), default=0)
 
-            if with_faces >= 10 and multi_rate < 0.1:
-                # Low multi-face rate — try YuNet supplement
+            if with_faces >= 5:
                 try:
                     yunet_results = _detect_with_opencv_dnn(frame_paths, min_confidence)
                     if yunet_results is not None:
-                        yunet_multi = sum(1 for r in yunet_results if len(r.faces) >= 2)
-                        if yunet_multi > multi:
-                            # YuNet found more multi-face frames — merge its extra faces
+                        yunet_total = sum(len(r.faces) for r in yunet_results)
+                        fm_total = sum(len(r.faces) for r in facemesh_results)
+                        if yunet_total > fm_total:
                             merged = _merge_detections(facemesh_results, yunet_results)
+                            new_total = sum(len(r.faces) for r in merged)
                             new_multi = sum(1 for r in merged if len(r.faces) >= 2)
                             logger.info(
-                                "FaceMesh+YuNet merge: multi-face frames %d→%d (YuNet found %d)",
-                                multi, new_multi, yunet_multi,
+                                "FaceMesh+YuNet merge: %d→%d total faces, multi-face frames %d→%d "
+                                "(FaceMesh max %d/frame, YuNet found %d extra)",
+                                fm_total, new_total, multi, new_multi,
+                                max_faces_per_frame, new_total - fm_total,
                             )
                             _log_summary(merged)
                             return merged
+                        else:
+                            logger.info(
+                                "YuNet supplement: no extra faces (FaceMesh=%d, YuNet=%d)",
+                                fm_total, yunet_total,
+                            )
                 except Exception as e:
                     logger.debug("YuNet supplement failed: %s", e)
 
@@ -638,7 +646,7 @@ def detect_faces_dense(
             "-i", video_path,
             "-vf", (
                 f"fps=1/{sample_rate},"
-                "scale='min(640,iw)':'min(360,ih)'"
+                "scale='min(1280,iw)':'min(720,ih)'"
                 ":force_original_aspect_ratio=decrease"
             ),
             "-vsync", "vfr", "-q:v", "5",
