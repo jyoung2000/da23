@@ -1027,7 +1027,6 @@ async def _run_analysis_inner(job_id: str):
             )
 
             # Run in executor to avoid blocking the async event loop
-            import asyncio
             loop = asyncio.get_event_loop()
             dense_face_results = await loop.run_in_executor(
                 None,
