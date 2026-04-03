@@ -622,11 +622,40 @@ export function applyDeadZone(keyframes, threshold = 5, srcRatio = null, targetR
 }
 
 /**
+ * Insert synthetic keyframes to convert long interpolations into hold-then-snap.
+ * Matches backend _insert_snap_transitions() exactly for preview-export parity.
+ *
+ * Without this, two keyframes at t=0,x=30 and t=10,x=70 produce a
+ * 10-second slow pan. With this they become a ~150ms snap at the midpoint.
+ */
+export function insertSnapTransitions(keyframes, jumpThreshold = 15, snapDuration = 0.15) {
+  if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
+
+  const result = [keyframes[0]];
+  for (let i = 1; i < keyframes.length; i++) {
+    const { t: t0, x: x0 } = result[result.length - 1];
+    const { t: t1, x: x1 } = keyframes[i];
+    const dt = t1 - t0;
+    const jump = Math.abs(x1 - x0);
+
+    if (jump >= jumpThreshold && dt > snapDuration * 4) {
+      const midT = (t0 + t1) / 2;
+      const halfSnap = snapDuration / 2;
+      result.push({ t: midT - halfSnap, x: x0 });
+      result.push({ t: midT + halfSnap, x: x1 });
+    }
+    result.push(keyframes[i]);
+  }
+  return result;
+}
+
+
+/**
  * Hold-then-snap smoother for human-edited camera feel.
  *
  * Instead of continuously drifting toward the target (damped-lerp),
  * this holds the camera COMPLETELY STILL until the subject drifts far
- * enough to warrant a reframe, then snaps FAST (200-400ms) to the new
+ * enough to warrant a reframe, then snaps FAST (120-450ms) to the new
  * position with an ease-out curve (fast start, gentle landing).
  *
  * Pattern: HOLD → SNAP → HOLD → SNAP (never continuous drift)
@@ -693,6 +722,9 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio 
       reframeTarget = target;
       reframeStartPos = pos;
       reframeProgress = 0;
+      // Adaptive pan speed: scale duration based on distance
+      const distance = Math.abs(target - pos);
+      reframeDuration = Math.max(0.12, Math.min(0.45, 0.10 + distance * 0.008));
     } else if (reframing) {
       // Already reframing — update target if same direction, else keep current
       if (newDirection !== 0 && lastDirection !== 0 && newDirection !== lastDirection) {
@@ -1000,7 +1032,9 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   const afterDeadZone = applyDeadZone(afterCompress, deadZoneThreshold, srcRatio, targetRatio);
   let afterCuts3 = handleSceneCuts(afterDeadZone);
   afterCuts3 = injectShotBoundaryCuts(afterCuts3, sceneCuts, clipStart, clipEnd);
-  const afterSmooth = smoothKeyframesBidirectional(afterCuts3, smoothMaxSpeed, srcRatio, targetRatio);
+  // Insert hold-then-snap transitions for large jumps before smoothing
+  const afterSnaps = insertSnapTransitions(afterCuts3);
+  const afterSmooth = smoothKeyframesBidirectional(afterSnaps, smoothMaxSpeed, srcRatio, targetRatio);
   const afterHolds = mergeHolds(afterSmooth, holdTolerance);
 
   // Final bounds enforcement — ensure every keyframe x is clamped to [0, 100]

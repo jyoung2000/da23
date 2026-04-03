@@ -2413,6 +2413,141 @@ def _validate_tracking(
     return fixed
 
 
+def _speaker_aware_keyframes(
+    face_results: list,
+    clip_start: float,
+    transcript: list = None,
+    face_registry=None,
+    active_speaker_events: list = None,
+) -> list[tuple[float, int]]:
+    """Build keyframes by tracking the SPEAKING face, not the largest face.
+
+    For each dense frame:
+    1. If active_speaker_events exist -> use the face matching the active slot
+    2. Elif transcript has speech at this time -> pick face with highest lip aperture
+    3. Else -> fall back to largest face (primary_face_idx)
+    """
+    from backend.services.active_speaker import get_active_slot_at_time
+
+    keyframes = []
+    face_ys = []
+    face_widths = []
+
+    for fd in face_results:
+        if not fd.faces:
+            continue
+        rel_t = fd.timestamp - clip_start
+        abs_t = fd.timestamp
+        chosen_face = None
+
+        # Method 1: Active speaker events (most accurate)
+        if active_speaker_events:
+            slot_id = get_active_slot_at_time(active_speaker_events, abs_t)
+            if slot_id >= 0:
+                for f in fd.faces:
+                    if f.identity_id == slot_id:
+                        chosen_face = f
+                        break
+                if not chosen_face and face_registry:
+                    slot = face_registry.slot_by_id(slot_id)
+                    if slot:
+                        chosen_face = min(fd.faces,
+                            key=lambda f: abs(f.nose_x - slot.x_center))
+
+        # Method 2: Highest lip aperture during speech
+        if not chosen_face and transcript:
+            is_speech = any(
+                (seg.start if hasattr(seg, 'start') else seg.get('start', 0)) <= abs_t <=
+                (seg.end if hasattr(seg, 'end') else seg.get('end', 0))
+                for seg in transcript
+            )
+            if is_speech:
+                speaking_faces = [f for f in fd.faces if f.lip_aperture > 0.02]
+                if speaking_faces:
+                    chosen_face = max(speaking_faces, key=lambda f: f.lip_aperture)
+
+        # Method 3: Largest face (existing behavior)
+        if not chosen_face and fd.primary_face_idx >= 0:
+            chosen_face = fd.faces[fd.primary_face_idx]
+
+        if chosen_face:
+            keyframes.append((rel_t, round(chosen_face.nose_x)))
+            face_ys.append(chosen_face.nose_y)
+            face_widths.append(chosen_face.width)
+
+    return keyframes, face_ys, face_widths
+
+
+def _insert_snap_transitions(
+    keyframes: list[tuple[float, int]],
+    jump_threshold: int = 15,
+    snap_duration: float = 0.15,
+) -> list[tuple[float, int]]:
+    """Insert synthetic keyframes to convert long interpolations into hold-then-snap.
+
+    Without this, two keyframes at t=0,sx=30 and t=10,sx=70 produce a
+    10-second slow pan. With this, they become:
+        t=0.000, sx=30  (hold)
+        t=4.925, sx=30  (hold ends)
+        t=5.075, sx=70  (snap complete - 150ms transition)
+        t=10.00, sx=70  (hold)
+    """
+    if len(keyframes) <= 1:
+        return keyframes
+
+    result = [keyframes[0]]
+    for i in range(1, len(keyframes)):
+        t0, sx0 = result[-1]
+        t1, sx1 = keyframes[i]
+        dt = t1 - t0
+        jump = abs(sx1 - sx0)
+
+        if jump >= jump_threshold and dt > snap_duration * 4:
+            mid_t = (t0 + t1) / 2
+            half_snap = snap_duration / 2
+            result.append((mid_t - half_snap, sx0))
+            result.append((mid_t + half_snap, sx1))
+        result.append(keyframes[i])
+
+    return result
+
+
+def _compute_face_y_offset(
+    face_y_center_pct: float,
+    face_height_pct: float,
+    src_h: int,
+    crop_h: int,
+    target_face_position: float = 0.38,
+) -> int:
+    """Compute vertical crop offset to position face with proper headroom.
+
+    Places the face center at target_face_position (default 0.38 = upper third)
+    following broadcast framing conventions (rule of thirds).
+    """
+    if crop_h >= src_h:
+        return 0
+    max_y_offset = src_h - crop_h
+    face_center_px = src_h * face_y_center_pct / 100
+    target_face_in_crop = crop_h * target_face_position
+    y_offset = int(face_center_px - target_face_in_crop)
+    return max(0, min(max_y_offset, y_offset))
+
+
+def _compute_zoom_factor(
+    avg_face_width_pct: float,
+    target_face_pct: float = 15.0,
+    min_zoom: float = 0.85,
+    max_zoom: float = 1.15,
+) -> float:
+    """Compute zoom factor to keep face at consistent apparent size.
+
+    Static per-clip, not per-frame (per-frame zoom causes breathing effect).
+    """
+    if avg_face_width_pct <= 0:
+        return 1.0
+    ratio = target_face_pct / max(avg_face_width_pct, 1)
+    return round(max(min_zoom, min(max_zoom, ratio)), 3)
+
 def _dense_face_detection_for_clip(
     video_path: str,
     clip_start: float,
@@ -3445,18 +3580,18 @@ def _build_split_filter(
     left_x_pct: float,
     right_x_pct: float,
     separator_px: int = 3,
+    active_speaker: str = "none",
 ) -> str:
     """Build FFmpeg filtergraph for side-by-side split layout.
 
     Each speaker gets a horizontal strip of the source cropped to their face,
     then scaled to fit half the output height.
+    active_speaker: "left", "right", or "none" — adds subtle 5% zoom to speaker.
     """
     half_h = (out_h - separator_px) // 2
     half_h = half_h - (half_h % 2)
-    # Each half needs aspect ratio out_w/half_h
     half_ratio = out_w / half_h
 
-    # Crop region for each speaker from the source
     crop_h = src_h
     crop_w = min(src_w, int(src_h * half_ratio))
     crop_w = crop_w - (crop_w % 2)
@@ -3469,12 +3604,25 @@ def _build_split_filter(
     x_left = sx_to_offset(left_x_pct)
     x_right = sx_to_offset(right_x_pct)
 
+    # Active speaker highlight: 5% zoom
+    zoom_w = int(out_w * 1.05)
+    zoom_h = int(half_h * 1.05)
+    if active_speaker == "left":
+        top_scale = f"scale={zoom_w}:{zoom_h},crop={out_w}:{half_h}"
+        bot_scale = f"scale={out_w}:{half_h}"
+    elif active_speaker == "right":
+        top_scale = f"scale={out_w}:{half_h}"
+        bot_scale = f"scale={zoom_w}:{zoom_h},crop={out_w}:{half_h}"
+    else:
+        top_scale = f"scale={out_w}:{half_h}"
+        bot_scale = f"scale={out_w}:{half_h}"
+
     # Separator line drawn via pad + overlay isn't needed — just use vstack
     # with a small gap handled by pad filter
     return (
         f"split[s1][s2];"
-        f"[s1]crop={crop_w}:{crop_h}:{x_left}:0,scale={out_w}:{half_h}[top];"
-        f"[s2]crop={crop_w}:{crop_h}:{x_right}:0,scale={out_w}:{half_h}[bot];"
+        f"[s1]crop={crop_w}:{crop_h}:{x_left}:0,{top_scale}[top];"
+        f"[s2]crop={crop_w}:{crop_h}:{x_right}:0,{bot_scale}[bot];"
         f"[top]pad={out_w}:{half_h + separator_px}:0:0:color=black[padtop];"
         f"[padtop][bot]vstack=inputs=2[v]"
     )
@@ -3718,6 +3866,8 @@ def _build_filter_chain(
     start_time: float = 0,
     video_effects: dict | None = None,
     clip_duration: float = 0,
+    face_y_center: float = 50.0,
+    face_width_pct: float = 0.0,
 ) -> tuple[str | None, bool]:
     """Build FFmpeg video filter chain.
 
@@ -3811,15 +3961,39 @@ def _build_filter_chain(
             crop_w = crop_w - (crop_w % 2)
             crop_h = crop_h - (crop_h % 2)
 
+            # Apply dynamic zoom based on face size (static per-clip)
+            if face_width_pct > 0:
+                zoom = _compute_zoom_factor(face_width_pct)
+                if abs(zoom - 1.0) > 0.02:
+                    crop_w = int(crop_w / zoom)
+                    crop_h = int(crop_h / zoom)
+                    crop_w = crop_w - (crop_w % 2)
+                    crop_h = crop_h - (crop_h % 2)
+                    logger.info(
+                        "[SubjectTracking] Zoom factor=%.3f (face_w=%.1f%%), adjusted crop=%dx%d",
+                        zoom, face_width_pct, crop_w, crop_h,
+                    )
+
             # Clamp crop dimensions to never exceed source frame
             crop_w = min(crop_w, src_w)
             crop_h = min(crop_h, src_h)
 
             max_x_offset = max(0, src_w - crop_w)
 
-            # Keep vertical crop centered — clamp to valid range
+            # Vertical offset — face-aware headroom (rule of thirds)
             max_y_offset = max(0, src_h - crop_h)
-            y_offset = (src_h - crop_h) // 2
+            if max_y_offset > 0 and face_y_center != 50.0:
+                y_offset = _compute_face_y_offset(
+                    face_y_center, face_height_pct=10.0,
+                    src_h=src_h, crop_h=crop_h,
+                    target_face_position=0.38,
+                )
+                logger.info(
+                    "[SubjectTracking] Face-aware y_offset=%d (face_y=%.1f%%, headroom at 38%%)",
+                    y_offset, face_y_center,
+                )
+            else:
+                y_offset = (src_h - crop_h) // 2
             y_offset = max(0, min(max_y_offset, y_offset))
 
             logger.info(
@@ -3832,7 +4006,10 @@ def _build_filter_chain(
                 unique_sx = set(kf[1] for kf in subject_keyframes)
                 if len(unique_sx) > 1:
                     # Dynamic crop: time-varying x offset
-                    x_expr = _build_crop_x_expr(subject_keyframes, max_x_offset, src_w, crop_w)
+                    # Insert hold-then-snap transitions for large jumps
+                    # so they don't produce slow 10-second pans
+                    _snapped_kf = _insert_snap_transitions(subject_keyframes)
+                    x_expr = _build_crop_x_expr(_snapped_kf, max_x_offset, src_w, crop_w)
                     filters.append(f"crop={crop_w}:{crop_h}:{x_expr}:{y_offset}")
                     logger.info(
                         "[SubjectTracking] DYNAMIC CROP: %d keyframes, %d unique sx values, "
@@ -5847,9 +6024,10 @@ async def export_clip(
 
                 # ── Dense clip-level face detection ──
                 # Full-video analysis gives ~3 face samples per 30s clip.
-                # Dense detection extracts frames at 2s intervals for the clip
-                # and runs face detection, giving 15+ accurate face positions.
-                # Use improved dense detector (0.5s intervals) with fallback
+                # Dense detection extracts frames at 0.5s intervals for the clip
+                # and runs speaker-aware face detection, giving 60+ accurate positions.
+                _avg_face_y = 50.0
+                _avg_face_w = 0.0
                 try:
                     from backend.services.face_detector import detect_faces_dense as _dense_detect
                     _dense_results = _dense_detect(
@@ -5858,15 +6036,21 @@ async def export_clip(
                         min_confidence=0.4,
                         extract_embeddings=False,
                     )
-                    dense_kf = []
-                    for _dfr in _dense_results:
-                        if _dfr.faces and _dfr.primary_face_idx >= 0:
-                            _pf = _dfr.faces[_dfr.primary_face_idx]
-                            _rel_t = _dfr.timestamp - start
-                            dense_kf.append((_rel_t, round(_pf.nose_x)))
+                    # Use speaker-aware keyframes: track who's SPEAKING, not who's BIGGEST
+                    dense_kf, _face_ys, _face_widths = _speaker_aware_keyframes(
+                        _dense_results, start,
+                        transcript=transcript,
+                    )
+                    # Compute face metadata for vertical tracking and zoom
+                    if _face_ys:
+                        _avg_face_y = sum(_face_ys) / len(_face_ys)
+                    if _face_widths:
+                        _avg_face_w = sum(_face_widths) / len(_face_widths)
                     logger.info(
-                        "[SubjectTracking] clip %s: dense detection (0.5s) produced %d keyframes",
+                        "[SubjectTracking] clip %s: speaker-aware dense detection (0.5s) produced %d keyframes "
+                        "(avg_face_y=%.1f%%, avg_face_w=%.1f%%)",
                         clip_id, len(dense_kf),
+                        _avg_face_y if _face_ys else 50, _avg_face_w if _face_widths else 0,
                     )
                 except Exception as _dense_err:
                     logger.warning(
@@ -6226,6 +6410,8 @@ async def export_clip(
                     start_time=start,
                     video_effects=video_effects if has_video_effects else None,
                     clip_duration=end - start,
+                    face_y_center=_avg_face_y,
+                    face_width_pct=_avg_face_w,
                 )
 
             # Append text overlay drawtext filters.
