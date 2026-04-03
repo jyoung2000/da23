@@ -249,16 +249,14 @@ def build_face_registry(
 def build_face_registry_with_embeddings(
     face_results: list,
     min_appearances: int = 3,
-    cosine_threshold: float = 0.35,
+    cosine_threshold: float = 0.20,
 ) -> "FaceRegistry":
     """Build face registry using identity embeddings for cross-frame matching.
 
-    Instead of clustering by x-position (brittle when speakers move),
-    this uses cosine similarity of face embeddings to group faces across
-    frames. Two faces with cosine distance < threshold are the same person,
-    regardless of where they appear in the frame.
-
-    Falls back to position-based clustering if embeddings are unavailable.
+    Uses cosine similarity of face embeddings to group faces across frames.
+    Tight threshold (0.20) prevents chaining different people together.
+    Falls back to position-based clustering if embeddings produce garbage
+    clusters (span > 40% of frame width = different people merged).
     """
     import numpy as np
 
@@ -357,6 +355,30 @@ def build_face_registry_with_embeddings(
         total_frames=len(face_results),
         frames_with_faces=sum(1 for fr in face_results if fr.faces),
     )
+
+    # Validate: if any cluster spans > 40% of frame width, embeddings are
+    # producing garbage (different people chained together). Fall back to
+    # position-based clustering which is more reliable for this content.
+    garbage_clusters = [s for s in slots if (s.x_max - s.x_min) > 40]
+    if garbage_clusters:
+        logger.warning(
+            "Embedding clustering produced %d garbage cluster(s) (span > 40%% width): %s. "
+            "Falling back to position-based registry.",
+            len(garbage_clusters),
+            [(f"slot{s.slot_id}: [{s.x_min:.0f}-{s.x_max:.0f}]") for s in garbage_clusters],
+        )
+        return build_face_registry(face_results, min_appearances)
+
+    # Also validate: must have 2+ slots for multi-speaker, or same count as position-based
+    if len(slots) < 2:
+        # Try position-based to see if it finds more speakers
+        pos_registry = build_face_registry(face_results, min_appearances)
+        if len(pos_registry.slots) > len(slots):
+            logger.info(
+                "Embedding registry found %d slots but position-based found %d — using position-based",
+                len(slots), len(pos_registry.slots),
+            )
+            return pos_registry
 
     logger.info(
         "Face registry (embeddings): %d slots from %d faces (%d with embeddings)",
