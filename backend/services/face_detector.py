@@ -641,12 +641,29 @@ def detect_faces_dense(
                 "scale='min(640,iw)':'min(360,ih)'"
                 ":force_original_aspect_ratio=decrease"
             ),
-            "-vsync", "vfr", "-q:v", "15",
+            "-vsync", "vfr", "-q:v", "5",
             os.path.join(tmpdir, "dense_%04d.jpg"),
         ]
+        # Scale timeout with video duration — VP9 is slow to decode
+        expected_frames = int(duration / sample_rate)
+        ffmpeg_timeout = max(60, int(10 + expected_frames * 0.3))
         try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=30)
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+            proc = subprocess.run(cmd, capture_output=True, timeout=ffmpeg_timeout)
+            if proc.returncode != 0:
+                logger.warning(
+                    "[DenseFaces] FFmpeg extraction failed (rc=%d): %s",
+                    proc.returncode,
+                    proc.stderr[-500:].decode(errors='replace') if proc.stderr else 'no stderr',
+                )
+                return []
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "[DenseFaces] FFmpeg extraction timed out after %ds for %.0fs video (%d expected frames)",
+                ffmpeg_timeout, duration, expected_frames,
+            )
+            return []
+        except FileNotFoundError:
+            logger.warning("[DenseFaces] FFmpeg not found")
             return []
 
         frame_files = sorted(

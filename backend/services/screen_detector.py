@@ -3,6 +3,11 @@
 Detects if a video frame contains screen share / slides / text-heavy content
 using simple computer vision heuristics (no AI needed, runs in <5ms per frame).
 
+CONSERVATIVE: designed to avoid false positives on videos with text
+overlays (titles, lower thirds, graphics). Only returns True when the
+frame looks like an actual screen recording, presentation slide, or
+code editor — not a video with text on it.
+
 Used by the layout engine to decide between SCREENSHARE layout mode and
 standard speaker layouts.
 """
@@ -14,14 +19,13 @@ logger = logging.getLogger(__name__)
 def detect_screen_content(frame_path: str) -> bool:
     """Detect if a frame contains screen share / slides / text-heavy content.
 
-    Uses heuristics (no AI needed, runs in <5ms per frame):
-    1. Edge density: screenshare has high horizontal/vertical edge density
-       from UI elements, text lines, code
-    2. Color histogram: screenshare typically has flat color regions
-       (white/gray backgrounds, solid UI elements) vs natural video
-    3. Text region detection: high % of frame occupied by text-like regions
+    Uses conservative heuristics to avoid false positives on videos with
+    text overlays (titles, lower thirds like "VERZUZ", "TANK VS TYRESE").
 
-    Returns True if the frame appears to contain screen/slide content.
+    Requires ALL THREE indicators to trigger:
+    1. High edge density (>12%) — UI elements, code lines
+    2. Very low saturation (<40) — screenshare is mostly grayscale
+    3. Large uniform regions (>50%) — flat-color UI panels, not video texture
     """
     import cv2
     import numpy as np
@@ -33,28 +37,35 @@ def detect_screen_content(frame_path: str) -> bool:
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Heuristic 1: Edge density — screenshare has many straight edges
+    # Heuristic 1: Edge density — screenshare has MANY straight edges
     edges = cv2.Canny(gray, 50, 150)
     edge_density = np.count_nonzero(edges) / (h * w)
 
-    # Heuristic 2: Saturation — screenshare/slides are typically low saturation
+    # Heuristic 2: Saturation — screenshare is VERY desaturated
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     avg_saturation = np.mean(hsv[:, :, 1])
 
-    # Heuristic 3: Check for large uniform rectangular regions (UI panels, slides)
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-    white_ratio = np.count_nonzero(thresh) / (h * w)
+    # Heuristic 3: Texture uniformity — screenshare has large FLAT regions
+    # (solid-color UI panels, IDE background). Video with text overlays
+    # has complex natural textures behind the text.
+    # Use local standard deviation to measure texture complexity.
+    gray_f = gray.astype(np.float32)
+    local_mean = cv2.blur(gray_f, (31, 31))
+    local_sq_mean = cv2.blur(gray_f ** 2, (31, 31))
+    local_var = local_sq_mean - local_mean ** 2
+    local_std = np.sqrt(np.maximum(local_var, 0))
+    uniform_ratio = float(np.mean(local_std < 8.0))
 
-    # Score: high edge density + low saturation + high white ratio = screenshare
+    # Require ALL THREE indicators (was >= 2, now >= 3)
     score = 0
-    if edge_density > 0.08:
+    if edge_density > 0.12:    # Was 0.08 — raised to avoid text overlay edges
         score += 1
-    if avg_saturation < 60:
+    if avg_saturation < 40:    # Was 60 — natural video rarely this desaturated
         score += 1
-    if white_ratio > 0.3:
+    if uniform_ratio > 0.50:   # NEW — must have >50% flat regions
         score += 1
 
-    return score >= 2
+    return score >= 3
 
 
 def detect_screen_content_batch(frame_paths: list) -> dict:

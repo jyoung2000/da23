@@ -2747,6 +2747,27 @@ def _build_subject_keyframes(
     # Sort by time (boundary insertions should be in order but ensure it)
     raw.sort(key=lambda k: k[0])
 
+    # ── Wide-shot fallback for distant multi-speaker setups ──
+    # If speakers are too far apart for either to fit in the crop window,
+    # center between them so both are partially visible.
+    if len(raw) >= 4 and src_ratio > 0 and target_ratio > 0:
+        all_sx = [sx for _, sx in raw]
+        sx_min, sx_max = min(all_sx), max(all_sx)
+        sx_range = sx_max - sx_min
+
+        R = src_ratio / target_ratio if target_ratio > 0 else 1
+        crop_coverage = 100.0 / R if R > 1 else 100.0
+
+        if sx_range > crop_coverage * 0.7:
+            midpoint = int((sx_min + sx_max) / 2)
+            safe_mid = _safe_subject_x(midpoint, src_ratio=src_ratio, target_ratio=target_ratio)
+            logger.info(
+                "[SubjectTracking] Wide-shot fallback: speakers at sx=%d and sx=%d "
+                "(range=%d > %.0f%% of crop coverage %.0f%%). Centering at %d",
+                sx_min, sx_max, sx_range, 70, crop_coverage, safe_mid,
+            )
+            raw = [(t, safe_mid) for t, _ in raw]
+
     logger.info(
         "[SubjectTracking] _build_subject_keyframes result: %d keyframes — %s",
         len(raw), [(f"t={t:.2f}s,sx={sx}") for t, sx in raw],

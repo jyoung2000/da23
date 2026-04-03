@@ -99,11 +99,24 @@ def build_face_registry(
     # The mid-zone [40-60%] contains noise from merged detections, AI defaults,
     # and faces that are slightly off-center. If we cluster with these included,
     # they chain nearby real positions into one bloated cluster (e.g. [48-86%]).
-    # Instead: build slots from non-midzone faces, then optionally assign
-    # midzone faces to the nearest established slot.
+    # Exception: if 3+ faces detected per frame, midzone faces are real center speakers.
+
+    # Check if any frame has 3+ faces — indicates a center speaker is real
+    frame_face_counts = {}
+    for f in all_faces:
+        fi = f[3]  # frame_idx
+        frame_face_counts[fi] = frame_face_counts.get(fi, 0) + 1
+    max_faces_per_frame = max(frame_face_counts.values(), default=0)
+
     MIDZONE_LO, MIDZONE_HI = 40, 60
-    outer_faces = [f for f in all_faces if f[0] < MIDZONE_LO or f[0] > MIDZONE_HI]
-    midzone_faces = [f for f in all_faces if MIDZONE_LO <= f[0] <= MIDZONE_HI]
+    if max_faces_per_frame >= 3:
+        # 3+ faces in some frames — don't exclude midzone, center speaker is real
+        outer_faces = all_faces
+        midzone_faces = []
+        logger.info("3+ faces in some frames — keeping midzone faces for clustering")
+    else:
+        outer_faces = [f for f in all_faces if f[0] < MIDZONE_LO or f[0] > MIDZONE_HI]
+        midzone_faces = [f for f in all_faces if MIDZONE_LO <= f[0] <= MIDZONE_HI]
 
     # If no outer faces, fall back to using all faces — but check for bimodal
     # distribution within the midzone (two speakers both near center).

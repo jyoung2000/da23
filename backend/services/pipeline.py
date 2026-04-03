@@ -1514,6 +1514,36 @@ async def _run_analysis_inner(job_id: str):
                 dict(sorted(final_dist.items())),
             )
 
+        # ── Center-default inheritance ──
+        # When AI returned center (45-55) and no face data is available,
+        # inherit subject_x from the nearest temporal neighbor with real data.
+        if face_registry and face_registry.multi_speaker and scenes_result:
+            center_lo, center_hi = 45, 55
+            fixed_center = 0
+            for i, scene in enumerate(scenes_result):
+                if not (center_lo <= scene.subject_x <= center_hi):
+                    continue
+                best_sx = None
+                best_dist = float('inf')
+                for j in range(max(0, i - 5), min(len(scenes_result), i + 6)):
+                    if j == i:
+                        continue
+                    other = scenes_result[j]
+                    if center_lo <= other.subject_x <= center_hi:
+                        continue
+                    dist = abs(scene.timestamp - other.timestamp)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_sx = other.subject_x
+                if best_sx is not None:
+                    scene.subject_x = best_sx
+                    fixed_center += 1
+            if fixed_center > 0:
+                logger.info(
+                    "[%s] Center-default inheritance: fixed %d scenes with temporal neighbors",
+                    job_id, fixed_center,
+                )
+
         await database.update_job_status(
             job_id,
             scenes=list(scenes_result),
@@ -1825,15 +1855,33 @@ async def _run_analysis_inner(job_id: str):
             from backend.services.screen_detector import detect_screen_content_batch
             frame_list = [(f.timestamp, f.path) for f in frames]
             screen_map = detect_screen_content_batch(frame_list)
+
+            # Video-level gate: only apply if a significant portion of frames
+            # are screen content. A single positive frame is noise.
+            total_positive = sum(1 for v in screen_map.values() if v)
+            screen_ratio = total_positive / max(len(screen_map), 1)
+
             screen_count = 0
-            for scene in scenes:
-                for screen_ts, is_sc in screen_map.items():
-                    if is_sc and abs(screen_ts - scene.timestamp) < 1.0:
+            if screen_ratio >= 0.30:  # At least 30% of frames must be screenshare
+                screen_positive_times = {
+                    round(ts, 2) for ts, is_sc in screen_map.items() if is_sc
+                }
+                for scene in scenes:
+                    if round(scene.timestamp, 2) in screen_positive_times:
                         scene.has_screen_content = True
                         screen_count += 1
-                        break
-            if screen_count > 0:
-                logger.info("[%s] Screen content detected in %d/%d scenes", job_id, screen_count, len(scenes))
+                if screen_count > 0:
+                    logger.info(
+                        "[%s] Screen content detected in %d/%d scenes (%.0f%% of frames positive)",
+                        job_id, screen_count, len(scenes), screen_ratio * 100,
+                    )
+            else:
+                if total_positive > 0:
+                    logger.info(
+                        "[%s] Screen detection: %d/%d frames positive (%.0f%%) — "
+                        "below 30%% threshold, ignoring (likely text overlays)",
+                        job_id, total_positive, len(screen_map), screen_ratio * 100,
+                    )
         except Exception as e:
             logger.warning("[%s] Screen detection failed (non-fatal): %s", job_id, e)
 
@@ -1974,6 +2022,60 @@ async def _run_analysis_inner(job_id: str):
                     )
         except Exception as e:
             logger.warning("[%s] Active speaker detection failed (non-fatal): %s", job_id, e)
+
+    # ── Fallback: Lip-only speaker detection when diarization found 1 speaker ──
+    if face_registry and face_registry.multi_speaker:
+        try:
+            unique_speakers_detected = len(set(
+                seg.speaker for seg in transcript
+                if hasattr(seg, 'speaker') and seg.speaker
+            )) if transcript else 0
+            active_with_slot = sum(1 for e in active_speaker_events if e.slot_id >= 0)
+
+            if unique_speakers_detected <= 1 or active_with_slot < 5:
+                logger.info(
+                    "[%s] Diarization found %d speaker(s) but registry has %d slots — "
+                    "building lip-only speaker timeline",
+                    job_id, unique_speakers_detected, len(face_registry.slots),
+                )
+                _lip_events = []
+                _face_data = dense_face_results if dense_face_results else face_results
+                for fr in _face_data:
+                    if len(fr.faces) < 2:
+                        continue
+                    speaking_face = max(fr.faces, key=lambda f: f.lip_aperture)
+                    if speaking_face.lip_aperture < 0.02:
+                        continue
+                    slot = face_registry.nearest_slot(speaking_face.nose_x)
+                    if slot:
+                        from backend.services.active_speaker import SpeakerEvent
+                        _lip_events.append(SpeakerEvent(
+                            start=fr.timestamp - 0.5,
+                            end=fr.timestamp + 0.5,
+                            slot_id=slot.slot_id,
+                            confidence=min(1.0, speaking_face.lip_aperture / 0.05),
+                        ))
+
+                if len(_lip_events) > max(len(active_speaker_events), 1) * 0.5:
+                    _lip_events.sort(key=lambda e: e.start)
+                    merged = [_lip_events[0]]
+                    for ev in _lip_events[1:]:
+                        if ev.slot_id == merged[-1].slot_id and ev.start - merged[-1].end < 2.0:
+                            merged[-1] = SpeakerEvent(
+                                start=merged[-1].start, end=ev.end,
+                                slot_id=ev.slot_id,
+                                confidence=max(merged[-1].confidence, ev.confidence),
+                            )
+                        else:
+                            merged.append(ev)
+                    active_speaker_events = merged
+                    avg_conf = sum(e.confidence for e in merged) / max(len(merged), 1)
+                    logger.info(
+                        "[%s] Lip-only speaker timeline: %d events, avg confidence=%.2f",
+                        job_id, len(merged), avg_conf,
+                    )
+        except Exception as e:
+            logger.warning("[%s] Lip-only speaker fallback failed (non-fatal): %s", job_id, e)
 
     # ── Layout Analysis ──
     # Determine optimal layout mode for the video based on face data + speaker data
