@@ -1387,7 +1387,10 @@ async def _run_analysis_inner(job_id: str):
                         }
                         for s in result
                     ]
-                    result = assign_speakers_with_face_data(raw_segs, _face_data_for_diar, face_registry)
+                    result = assign_speakers_with_face_data(
+                        raw_segs, _face_data_for_diar, face_registry,
+                        scene_descriptions=None,  # Scenes not yet available at this pipeline stage
+                    )
                     logger.info(
                         "[%s] Face-aware diarization: %d -> %d speakers",
                         job_id, speaker_count_before, len(set(s.speaker for s in result)),

@@ -329,7 +329,7 @@ def _detect_with_facemesh(frame_paths, min_confidence):
 
     with face_mesh_module.FaceMesh(
         static_image_mode=True,
-        max_num_faces=4,
+        max_num_faces=10,  # Support up to 10 speakers (was 4)
         refine_landmarks=True,
         min_detection_confidence=min_confidence,
     ) as mesh:
