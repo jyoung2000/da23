@@ -1003,9 +1003,7 @@ async def _run_analysis_inner(job_id: str):
             logger.warning("[%s] Face detection failed (non-fatal): %s", job_id, e)
 
     # ── Dense face detection (1fps, CPU-only) ──
-    # The sparse detection above gives ~3 face samples per 30s clip.
-    # Dense detection at 1fps gives 30 samples — enough for smooth per-second
-    # tracking. Runs on CPU using YuNet+SFace, no GPU conflict.
+    # Runs on CPU, no GPU conflict. For 4K VP9 this can take 3-5 minutes.
     if settings.SUBJECT_TRACKING_ENABLED and face_results:
         try:
             from backend.services.face_detector import detect_faces_dense
@@ -1016,23 +1014,31 @@ async def _run_analysis_inner(job_id: str):
             max_dense_duration = min(video_duration, 1800)
             if video_duration > 1800:
                 dense_sample_rate = max(dense_sample_rate, video_duration / 1800)
-                logger.info(
-                    "[%s] Long video (%.0fs) — adjusting dense face rate to %.1fs",
-                    job_id, video_duration, dense_sample_rate,
-                )
 
+            expected_frames = int(max_dense_duration / dense_sample_rate)
             logger.info(
                 "[%s] Running dense face detection (%.1fs intervals, ~%d frames)...",
-                job_id, dense_sample_rate,
-                int(max_dense_duration / dense_sample_rate),
+                job_id, dense_sample_rate, expected_frames,
             )
-            dense_face_results = detect_faces_dense(
-                video_path,
-                start=0,
-                end=video_duration,
-                sample_rate=dense_sample_rate,
-                min_confidence=0.4,
-                extract_embeddings=True,
+            # Send progress update so frontend doesn't show "stuck"
+            await _update_progress(
+                job_id, JobStatus.EXTRACTING_FRAMES, 15,
+                f"Running dense face detection (~{expected_frames} frames)... this may take a few minutes",
+            )
+
+            # Run in executor to avoid blocking the async event loop
+            import asyncio
+            loop = asyncio.get_event_loop()
+            dense_face_results = await loop.run_in_executor(
+                None,
+                lambda: detect_faces_dense(
+                    video_path,
+                    start=0,
+                    end=video_duration,
+                    sample_rate=dense_sample_rate,
+                    min_confidence=0.4,
+                    extract_embeddings=True,
+                ),
             )
             dense_with_faces = sum(1 for r in dense_face_results if r.faces)
             logger.info(
@@ -2014,6 +2020,10 @@ async def _run_analysis_inner(job_id: str):
                 scene.face_count = len(sfd.faces)
 
     # ── Active Speaker Detection (lip-audio cross-correlation) ──
+    await _update_progress(
+        job_id, JobStatus.DETECTING_CLIPS, 65,
+        "Detecting active speakers and building layout...",
+    )
     active_speaker_events = []
     if face_registry and face_registry.multi_speaker and transcript and (face_results or dense_face_results):
         try:
