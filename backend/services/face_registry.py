@@ -98,6 +98,36 @@ def build_face_registry(
             frames_with_faces=0,
         )
 
+    # ── IQR outlier trimming ──
+    # Remove extreme face positions that are noise (background people at frame
+    # edges, logo detections, partial faces). Without this, a single face at
+    # x=2% chains the entire [2-100] range into one garbage cluster.
+    if len(all_faces) >= 20:
+        x_sorted = sorted(f[0] for f in all_faces)
+        q1_idx = len(x_sorted) // 4
+        q3_idx = 3 * len(x_sorted) // 4
+        q1 = x_sorted[q1_idx]
+        q3 = x_sorted[q3_idx]
+        iqr = q3 - q1
+        # Use generous bounds (2.0 * IQR) to keep real edge speakers
+        # but remove extreme outliers like x=2% or x=95%
+        lower = max(5.0, q1 - 2.0 * iqr)
+        upper = min(95.0, q3 + 2.0 * iqr)
+        before_count = len(all_faces)
+        all_faces = [f for f in all_faces if lower <= f[0] <= upper]
+        trimmed = before_count - len(all_faces)
+        if trimmed > 0:
+            logger.info(
+                "IQR outlier trimming: removed %d/%d faces outside [%.0f, %.0f] "
+                "(Q1=%.0f, Q3=%.0f, IQR=%.0f)",
+                trimmed, before_count, lower, upper, q1, q3, iqr,
+            )
+        if not all_faces:
+            return FaceRegistry(
+                total_frames=len(face_results),
+                frames_with_faces=0,
+            )
+
     # ── Adaptive gap threshold for multi-speaker panels ──
     # With 5 speakers across a frame, they're ~20% apart. The default
     # gap of 15 merges adjacent speakers. Scale down based on how many
@@ -107,19 +137,34 @@ def build_face_registry(
         fi = f[3]  # frame_idx
         frame_face_counts[fi] = frame_face_counts.get(fi, 0) + 1
     max_faces_per_frame = max(frame_face_counts.values(), default=0)
-    # Frames with 3+ faces frequently = multi-speaker panel
     frames_with_3plus = sum(1 for c in frame_face_counts.values() if c >= 3)
     multi_speaker_ratio = frames_with_3plus / max(len(frame_face_counts), 1)
 
-    if max_faces_per_frame >= 4 or multi_speaker_ratio > 0.1:
-        # 4+ speakers: faces are ~15-25% apart, need gap of ~10
-        adaptive_gap = max(8.0, 100.0 / (max_faces_per_frame + 1))
-        if adaptive_gap < cluster_gap:
+    if max_faces_per_frame >= 3 or multi_speaker_ratio > 0.05:
+        # Multi-speaker: use per-frame position analysis to find the gap
+        # that best separates speakers. Group faces within each frame by
+        # x-position, find the median gap between adjacent faces in multi-face
+        # frames, then use half that gap as the cluster threshold.
+        per_frame_gaps = []
+        for fi, count in frame_face_counts.items():
+            if count < 2:
+                continue
+            frame_xs = sorted(f[0] for f in all_faces if f[3] == fi)
+            for i in range(1, len(frame_xs)):
+                per_frame_gaps.append(frame_xs[i] - frame_xs[i - 1])
+
+        if per_frame_gaps:
+            per_frame_gaps.sort()
+            median_gap = per_frame_gaps[len(per_frame_gaps) // 2]
+            # Use 60% of median inter-face gap as cluster threshold
+            # This ensures faces within the same "position" merge but
+            # different speaker positions stay separate
+            adaptive_gap = max(6.0, min(cluster_gap, median_gap * 0.6))
             logger.info(
-                "Multi-speaker panel detected (max %d faces/frame, %.0f%% frames with 3+) — "
-                "reducing cluster gap %.0f → %.0f",
+                "Multi-speaker panel (max %d faces/frame, %.0f%% with 3+): "
+                "median inter-face gap=%.1f, cluster gap %.0f → %.0f",
                 max_faces_per_frame, multi_speaker_ratio * 100,
-                cluster_gap, adaptive_gap,
+                median_gap, cluster_gap, adaptive_gap,
             )
             cluster_gap = adaptive_gap
 
@@ -245,6 +290,77 @@ def build_face_registry(
     slots.sort(key=lambda s: s.x_center)
     for i, s in enumerate(slots):
         s.slot_id = i
+
+    # ── Histogram fallback for multi-speaker panels ──
+    # If gap-based clustering produced only 1 slot from many faces with wide
+    # x-range, the speakers are too close together for gap-based splitting.
+    # Use histogram peak detection: bin positions into 5% buckets, find peaks.
+    if len(slots) <= 1 and len(all_faces) >= 30 and max_faces_per_frame >= 2:
+        x_range = max(f[0] for f in all_faces) - min(f[0] for f in all_faces)
+        if x_range > 25:  # Only if faces span > 25% of frame (not all same speaker)
+            logger.info(
+                "Gap-based clustering found %d slot(s) from %d faces spanning %.0f%%. "
+                "Trying histogram peak detection...",
+                len(slots), len(all_faces), x_range,
+            )
+            # Histogram with 5% bins
+            bin_size = 5.0
+            n_bins = 20
+            bins = [[] for _ in range(n_bins)]
+            for f in all_faces:
+                b = min(n_bins - 1, max(0, int(f[0] / bin_size)))
+                bins[b].append(f)
+
+            # Find peaks: bins with > 5 faces that are local maxima
+            peak_slots = []
+            for i in range(n_bins):
+                count = len(bins[i])
+                if count < max(5, len(all_faces) * 0.02):
+                    continue
+                left = len(bins[i - 1]) if i > 0 else 0
+                right = len(bins[i + 1]) if i < n_bins - 1 else 0
+                if count >= left and count >= right:
+                    # Merge with adjacent bins for better statistics
+                    peak_faces = list(bins[i])
+                    if i > 0:
+                        peak_faces.extend(bins[i - 1])
+                    if i < n_bins - 1:
+                        peak_faces.extend(bins[i + 1])
+
+                    x_positions = sorted([f[0] for f in peak_faces])
+                    unique_frames = len(set(f[3] for f in peak_faces))
+                    if unique_frames < min_appearances:
+                        continue
+
+                    mid = len(x_positions) // 2
+                    median_x = x_positions[mid]
+                    widths = [f[1] for f in peak_faces]
+                    heights = [f[2] for f in peak_faces]
+
+                    # Check it's not too close to an existing peak
+                    too_close = any(abs(median_x - ps.x_center) < 10 for ps in peak_slots)
+                    if too_close:
+                        continue
+
+                    peak_slots.append(FaceSlot(
+                        slot_id=len(peak_slots),
+                        x_center=round(median_x, 1),
+                        x_min=round(min(x_positions), 1),
+                        x_max=round(max(x_positions), 1),
+                        frame_count=unique_frames,
+                        avg_width=round(sum(widths) / len(widths), 1),
+                        avg_height=round(sum(heights) / len(heights), 1),
+                    ))
+
+            if len(peak_slots) >= 2:
+                slots = peak_slots
+                slots.sort(key=lambda s: s.x_center)
+                for i, s in enumerate(slots):
+                    s.slot_id = i
+                logger.info(
+                    "Histogram peak detection found %d speaker positions",
+                    len(slots),
+                )
 
     registry = FaceRegistry(
         slots=slots,
