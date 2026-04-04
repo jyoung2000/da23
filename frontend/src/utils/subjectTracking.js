@@ -15,6 +15,10 @@
  *   7. interpolateSubjectX()          — smoothstep ease-in/ease-out interpolation
  */
 
+/** Build version for debugging — check browser console for this string */
+export const SUBJECT_TRACKING_VERSION = 'v3.1-dense-parity-2026-04-04';
+console.log(`[SubjectTracking] Module loaded: ${SUBJECT_TRACKING_VERSION}`);
+
 /** Legacy safety margin — used when no aspect ratio info is provided. */
 const SAFE_MARGIN = 10;
 

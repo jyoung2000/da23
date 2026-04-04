@@ -13,6 +13,9 @@ services:
       - ./data/logs:/data/logs
       - ./data/fonts:/data/fonts
       - whisper_models:/root/.cache/huggingface
+      # Mount source code for hot-reload without full Docker rebuild
+      - ./frontend/dist:/app/static
+      - ./backend:/app/backend
     environment:
       - PYTHONUNBUFFERED=1
       - NVIDIA_VISIBLE_DEVICES=all
