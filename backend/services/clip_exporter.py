@@ -2747,26 +2747,35 @@ def _build_subject_keyframes(
     # Sort by time (boundary insertions should be in order but ensure it)
     raw.sort(key=lambda k: k[0])
 
-    # ── Wide-shot fallback for distant multi-speaker setups ──
-    # If speakers are too far apart for either to fit in the crop window,
-    # center between them so both are partially visible.
+    # ── Wide-shot fallback for distant 2-speaker setups ──
+    # If exactly 2 speakers are too far apart for either to fit in the crop
+    # window, center between them so both are partially visible.
+    # For 3+ speakers (panel shows), DON'T apply — let the tracking follow
+    # the active speaker and snap between positions.
     if len(raw) >= 4 and src_ratio > 0 and target_ratio > 0:
         all_sx = [sx for _, sx in raw]
         sx_min, sx_max = min(all_sx), max(all_sx)
         sx_range = sx_max - sx_min
+        unique_positions = len(set(round(sx / 10) * 10 for sx in all_sx))  # Count ~10% clusters
 
         R = src_ratio / target_ratio if target_ratio > 0 else 1
         crop_coverage = 100.0 / R if R > 1 else 100.0
 
-        if sx_range > crop_coverage * 0.7:
+        if sx_range > crop_coverage * 0.7 and unique_positions <= 2:
             midpoint = int((sx_min + sx_max) / 2)
             safe_mid = _safe_subject_x(midpoint, src_ratio=src_ratio, target_ratio=target_ratio)
             logger.info(
-                "[SubjectTracking] Wide-shot fallback: speakers at sx=%d and sx=%d "
+                "[SubjectTracking] Wide-shot fallback: 2 speakers at sx=%d and sx=%d "
                 "(range=%d > %.0f%% of crop coverage %.0f%%). Centering at %d",
                 sx_min, sx_max, sx_range, 70, crop_coverage, safe_mid,
             )
             raw = [(t, safe_mid) for t, _ in raw]
+        elif sx_range > crop_coverage * 0.7 and unique_positions > 2:
+            logger.info(
+                "[SubjectTracking] Multi-speaker panel (%d positions, range=%d) — "
+                "tracking active speaker, NOT applying wide-shot fallback",
+                unique_positions, sx_range,
+            )
 
     logger.info(
         "[SubjectTracking] _build_subject_keyframes result: %d keyframes — %s",
