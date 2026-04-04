@@ -824,15 +824,20 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   // in the scene analysis subject_x values.
   const clusters = detectPositionClusters(raw);
 
+  const isDenseData = raw.length >= 100;  // Per-second dense face detection
+
   console.log(
-    `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}`,
+    `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}, isDense=${isDenseData}`,
     clusters ? clusters.map(c => `center=${c.center} count=${c.count}`).join(', ') : 'none',
-    `raw_x_unique=[${[...new Set(raw.map(k=>k.x))].sort((a,b)=>a-b).join(',')}]`
+    isDenseData ? '(skipping cluster snap for dense face data)' : `raw_x_unique=[${[...new Set(raw.map(k=>k.x))].sort((a,b)=>a-b).join(',')}]`
   );
 
-  if (clusters && clusters.length >= 2) {
+  if (clusters && clusters.length >= 2 && !isDenseData) {
     // Multi-position mode: snap to cluster centers, then use scene cuts for instant jumps.
     // NO smoothing — speaker/position changes must be instant snaps, not pans.
+    // NOTE: Skip for dense data — the raw face positions are already speaker-accurate
+    // from backend _speaker_aware_keyframes(). Cluster snapping introduces quantization
+    // error (e.g. a face at x=30 snaps to cluster center 24 instead of 36).
     const snapped = snapToClusters(raw, clusters);
 
     // Remove consecutive duplicates (same speaker holding) to clean up
@@ -1022,16 +1027,21 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   // Sparse data detection: when we have very few keyframes (≤ 4),
   // relax pipeline thresholds so the little tracking data we have
   // doesn't get killed by dead zones and convergence checks.
-  // Dense data (100+ scenes = per-second tracking) also gets relaxed
-  // thresholds since the positions are already speaker-accurate.
+  // Dense data (100+ scenes = per-second tracking) gets special handling:
+  // - NO compression (positions are already speaker-accurate from face detection)
+  // - Minimal dead zone (just filter sub-pixel jitter)
+  // - Higher smooth speed (allow fast speaker transitions)
   const isSparse = raw.length <= 4;
   const isDense = raw.length >= 100;  // Per-second synthetic scenes from dense face detection
-  const deadZoneThreshold = isSparse ? 3 : (isDense ? 3 : 5);
-  const compressMaxRange = isSparse ? 60 : (isDense ? 80 : 30);
-  const smoothMaxSpeed = isSparse ? 30 : (isDense ? 50 : 22);
+  const deadZoneThreshold = isSparse ? 3 : (isDense ? 2 : 5);
+  const compressMaxRange = isSparse ? 60 : (isDense ? 100 : 30);
+  const smoothMaxSpeed = isSparse ? 30 : (isDense ? 80 : 22);
   const holdTolerance = isSparse ? 2 : (isDense ? 2 : 3);
 
-  const afterCompress = compressRange(raw, compressMaxRange, srcRatio, targetRatio);
+  // For dense data, skip compression entirely — the face positions are pixel-accurate
+  // from backend speaker-aware detection. Compressing toward median pulls all positions
+  // toward the dominant speaker, causing off-center framing for other speakers.
+  const afterCompress = isDenseData ? [...raw.map(k => ({ ...k }))] : compressRange(raw, compressMaxRange, srcRatio, targetRatio);
   const afterDeadZone = applyDeadZone(afterCompress, deadZoneThreshold, srcRatio, targetRatio);
   let afterCuts3 = handleSceneCuts(afterDeadZone);
   afterCuts3 = injectShotBoundaryCuts(afterCuts3, sceneCuts, clipStart, clipEnd);

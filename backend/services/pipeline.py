@@ -2196,12 +2196,14 @@ async def _run_analysis_inner(job_id: str):
                     chosen_face = dfr.faces[dfr.primary_face_idx]
 
                 if chosen_face:
+                    sx_val = round(chosen_face.nose_x)
                     scenes.append(SceneDescription(
                         timestamp=dfr.timestamp,
                         description="[dense face tracking]",
                         importance_score=5,
                         thumbnail_path="",
-                        subject_x=round(chosen_face.nose_x),
+                        subject_x=sx_val,
+                        active_speaker_x=sx_val if slot_id >= 0 else None,
                         face_count=len(dfr.faces),
                     ))
                     synthetic_count += 1

@@ -6130,8 +6130,9 @@ async def export_clip(
                 # Works WITHOUT audio diarization — catches multi-speaker scenarios
                 # even when Whisper only detects 1 speaker.
                 _cluster_used = False
+                _is_dense = len(raw_kf) >= 100  # Per-second dense face detection
                 clusters = _detect_position_clusters(raw_kf)
-                if clusters and len(clusters) >= 2:
+                if clusters and len(clusters) >= 2 and not _is_dense:
                     centers = [c["center"] for c in clusters]
                     logger.info(
                         "[SubjectTracking] clip %s: %d CLUSTERS detected — centers=%s",
@@ -6243,14 +6244,21 @@ async def export_clip(
                 # ── PHASE 3: Single-subject tracking (original pipeline) ──
                 if not _cluster_used and not _speaker_kf_used and len(raw_kf) > 1:
                     # Sparse data detection: relax thresholds when we have ≤4 keyframes
+                    # Dense data (100+ keyframes = per-second tracking) gets special handling:
+                    # - NO compression (positions are already speaker-accurate from face detection)
+                    # - Minimal dead zone (just filter sub-pixel jitter)
+                    # - Higher smooth speed (allow fast speaker transitions)
                     is_sparse = len(raw_kf) <= 4
-                    dz_threshold = 3 if is_sparse else 5
-                    compress_max = 60 if is_sparse else 30
-                    smooth_speed = 30 if is_sparse else 22
-                    hold_tolerance = 2 if is_sparse else 3
+                    dz_threshold = 3 if is_sparse else (2 if _is_dense else 5)
+                    compress_max = 60 if is_sparse else (100 if _is_dense else 30)
+                    smooth_speed = 30 if is_sparse else (80 if _is_dense else 22)
+                    hold_tolerance = 2 if is_sparse else (2 if _is_dense else 3)
 
                     # Full pipeline: build → compress range → dead zone → scene cuts → smooth → merge holds
-                    after_compress = _compress_range(raw_kf, max_range=compress_max, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                    # For dense data, skip compression — the face positions are pixel-accurate
+                    # from backend speaker-aware detection. Compressing toward median pulls all
+                    # positions toward the dominant speaker, causing off-center framing.
+                    after_compress = raw_kf[:] if _is_dense else _compress_range(raw_kf, max_range=compress_max, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_dead_zone = _apply_dead_zone(after_compress, threshold=dz_threshold, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_cuts = _handle_scene_cuts(after_dead_zone)
                     after_cuts = _inject_shot_boundary_cuts(after_cuts, scene_cut_timestamps, start, end)
