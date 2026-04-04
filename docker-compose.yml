@@ -13,9 +13,6 @@ services:
       - ./data/logs:/data/logs
       - ./data/fonts:/data/fonts
       - whisper_models:/root/.cache/huggingface
-      # Mount backend source for hot-reload without full Docker rebuild
-      # Frontend must be rebuilt via: docker compose build app (uses Dockerfile multi-stage)
-      - ./backend:/app/backend
     environment:
       - PYTHONUNBUFFERED=1
       - NVIDIA_VISIBLE_DEVICES=all
