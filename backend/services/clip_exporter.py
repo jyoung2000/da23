@@ -6254,7 +6254,8 @@ async def export_clip(
                     smooth_speed = 30 if is_sparse else (80 if _is_dense else 22)
                     hold_tolerance = 2 if is_sparse else (2 if _is_dense else 3)
 
-                    # Full pipeline: build → compress range → dead zone → scene cuts → smooth → merge holds
+                    # Full pipeline: compress → deadzone → scene cuts → snap transitions → smooth → merge holds
+                    # Matches frontend processKeyframes() pipeline exactly for preview-export parity.
                     # For dense data, skip compression — the face positions are pixel-accurate
                     # from backend speaker-aware detection. Compressing toward median pulls all
                     # positions toward the dominant speaker, causing off-center framing.
@@ -6262,7 +6263,9 @@ async def export_clip(
                     after_dead_zone = _apply_dead_zone(after_compress, threshold=dz_threshold, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_cuts = _handle_scene_cuts(after_dead_zone)
                     after_cuts = _inject_shot_boundary_cuts(after_cuts, scene_cut_timestamps, start, end)
-                    after_smooth = _smooth_keyframes_bidirectional(after_cuts, max_speed=smooth_speed, src_ratio=_src_ratio, target_ratio=_target_ratio)
+                    # Insert hold-then-snap transitions BEFORE smoothing (matches frontend ordering)
+                    after_snaps = _insert_snap_transitions(after_cuts)
+                    after_smooth = _smooth_keyframes_bidirectional(after_snaps, max_speed=smooth_speed, src_ratio=_src_ratio, target_ratio=_target_ratio)
                     after_holds = _merge_holds(after_smooth, tolerance=hold_tolerance)
 
                     # Final bounds enforcement — clamp every keyframe to safe range
@@ -6275,9 +6278,9 @@ async def export_clip(
                     ]
 
                     logger.info(
-                        "[SubjectTracking] clip %s: pipeline stages — raw=%d → compress=%d → deadzone=%d → cuts=%d → smooth=%d → holds=%d → clamped=%d (safe=[%d,%d])",
+                        "[SubjectTracking] clip %s: pipeline stages — raw=%d → compress=%d → deadzone=%d → cuts=%d → snaps=%d → smooth=%d → holds=%d → clamped=%d (safe=[%d,%d])",
                         clip_id, len(raw_kf), len(after_compress), len(after_dead_zone), len(after_cuts),
-                        len(after_smooth), len(after_holds), len(keyframes), safe_lo, safe_hi,
+                        len(after_snaps), len(after_smooth), len(after_holds), len(keyframes), safe_lo, safe_hi,
                     )
 
                     # If pipeline collapsed to single value, keep as-is (static)

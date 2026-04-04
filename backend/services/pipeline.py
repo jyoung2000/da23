@@ -2197,6 +2197,17 @@ async def _run_analysis_inner(job_id: str):
 
                 if chosen_face:
                     sx_val = round(chosen_face.nose_x)
+                    # Build face_positions array for frontend vertical tracking
+                    fp = []
+                    for f in dfr.faces:
+                        fp.append({
+                            "x": round(f.nose_x),
+                            "y": round(f.nose_y),
+                            "w": round(f.width) if hasattr(f, "width") else 0,
+                            "h": round(f.height) if hasattr(f, "height") else 0,
+                            "is_speaking": (f.identity_id == slot_id) if slot_id >= 0 else False,
+                            "identity_id": f.identity_id if hasattr(f, "identity_id") else -1,
+                        })
                     scenes.append(SceneDescription(
                         timestamp=dfr.timestamp,
                         description="[dense face tracking]",
@@ -2205,6 +2216,7 @@ async def _run_analysis_inner(job_id: str):
                         subject_x=sx_val,
                         active_speaker_x=sx_val if slot_id >= 0 else None,
                         face_count=len(dfr.faces),
+                        face_positions=fp,
                     ))
                     synthetic_count += 1
 

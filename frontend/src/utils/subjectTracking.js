@@ -1222,6 +1222,86 @@ export function isDynamic(keyframes) {
   return keyframes.some((kf) => kf.x !== first);
 }
 
+/**
+ * Compute average face Y center from scenes within a clip range.
+ * Uses face_positions[].y data from dense face detection when available.
+ *
+ * @param {Array} scenes - Scene objects with face_positions
+ * @param {number} clipStart - Clip start time
+ * @param {number} clipEnd - Clip end time
+ * @returns {number} Average face Y position (0-100), or 50 if no data
+ */
+export function computeFaceYCenter(scenes, clipStart, clipEnd) {
+  if (!scenes?.length) return 50;
+  const ys = [];
+  for (const s of scenes) {
+    const t = s.timestamp;
+    if (t < clipStart || t > clipEnd) continue;
+    if (s.face_positions?.length) {
+      // Prefer speaking face, else largest face
+      const speaking = s.face_positions.find(f => f.is_speaking);
+      const face = speaking || s.face_positions[0];
+      if (face && typeof face.y === 'number') {
+        ys.push(face.y);
+      }
+    }
+  }
+  if (ys.length === 0) return 50;
+  return ys.reduce((a, b) => a + b, 0) / ys.length;
+}
+
+/**
+ * Convert face Y center percentage to CSS objectPosition Y percentage.
+ * Matches backend _compute_face_y_offset() logic: places face at 38% of
+ * crop height (rule of thirds / broadcast framing).
+ *
+ * For horizontal crops (e.g. 16:9→9:16), vertical magnification R_v > 1
+ * means the crop is taller than the source visible area, so face Y
+ * positioning matters. For vertical crops of landscape video, R_v < 1
+ * (crop is shorter than source), which is when Y repositioning helps most.
+ *
+ * @param {number} faceY - Face Y center as 0-100 percentage of source height
+ * @param {number} srcRatio - Source aspect ratio (e.g. 16/9)
+ * @param {number} targetRatio - Target aspect ratio (e.g. 9/16)
+ * @param {number} targetFacePosition - Where face should be in crop (0.38 = upper third)
+ * @returns {number} CSS objectPosition Y percentage (0-100)
+ */
+export function faceYToCenterPct(faceY, srcRatio, targetRatio, targetFacePosition = 0.38) {
+  // Vertical magnification: how much taller the crop is relative to source
+  const R_v = (targetRatio > 0 && srcRatio > 0)
+    ? (srcRatio / targetRatio)  // For 16:9→9:16: R=3.16 (crop is much narrower but same height)
+    : 1;
+
+  // When target is taller than source (portrait from landscape), there's no vertical
+  // overflow — objectFit:cover handles it. When target is wider (landscape from portrait),
+  // there IS vertical overflow and we need to position Y.
+  // Actually: objectFit:cover scales to fill, so for 16:9→9:16:
+  //   - Source 16:9 scaled to fill 9:16 container: width matches, height overflows
+  //   - The video is scaled up so its width fills the container
+  //   - Height overflows: (sourceH * scale) > containerH
+  //   - So vertical Y positioning DOES matter
+  // R_v for vertical overflow = sourceH_scaled / containerH
+  // When crop is narrower: the video is scaled by containerW/sourceW
+  // Scaled height = sourceH * (containerW/sourceW) = containerW / srcRatio
+  // Container height = containerW / targetRatio
+  // R_v = (containerW/srcRatio) / (containerW/targetRatio) = targetRatio/srcRatio
+  const verticalR = targetRatio / srcRatio;
+
+  if (verticalR <= 1.01) {
+    // No vertical overflow — any Y position is fine, default to center
+    return 50;
+  }
+
+  // Convert faceY to objectPosition Y percentage
+  // We want the face at targetFacePosition (38%) of the visible crop
+  // objectPosition Y = percentage of the overflow region
+  // Similar to horizontal: pct = (verticalR * faceY - targetFacePosition*100) / (verticalR - 1)
+  // But we want face at 38% of crop, not 50%, so adjust:
+  const targetPct = targetFacePosition * 100; // 38
+  const pct = (verticalR * faceY - targetPct) / (verticalR - 1);
+  return Math.max(0, Math.min(100, pct));
+}
+
 
 /**
  * QA validation for subject tracking output.

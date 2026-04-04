@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
 import { outlineTextShadow } from '../utils/textOutline';
 import useResponsive from '../hooks/useResponsive';
 
@@ -308,6 +308,26 @@ export default function ClipPreview({
     () => subjectKeyframes && isDynamic(subjectKeyframes),
     [subjectKeyframes],
   );
+
+  // Compute face Y center from scene data for vertical positioning
+  // Matches backend _compute_face_y_offset() for preview-export parity
+  const faceYCenter = useMemo(() => {
+    if (!scenes?.length) return 50;
+    const y = computeFaceYCenter(scenes, clipStart, clipEnd);
+    console.log(`[SubjectTracking] faceYCenter=${y.toFixed(1)}% (from scenes ${clipStart.toFixed(1)}s-${clipEnd.toFixed(1)}s)`);
+    return y;
+  }, [scenes, clipStart, clipEnd]);
+
+  // Compute Y objectPosition percentage (for vertical crop offset)
+  const yPositionPct = useMemo(() => {
+    const _srcRatio = sourceWidth / sourceHeight;
+    const _targetRatio = (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) ? ASPECT_RATIO_VALUES[aspectRatio] : _srcRatio;
+    const pct = faceYToCenterPct(faceYCenter, _srcRatio, _targetRatio);
+    if (pct !== 50) {
+      console.log(`[SubjectTracking] yPositionPct=${pct.toFixed(1)}% (faceY=${faceYCenter.toFixed(1)}%, R_v=${(_targetRatio/_srcRatio).toFixed(2)})`);
+    }
+    return pct;
+  }, [faceYCenter, sourceWidth, sourceHeight, aspectRatio]);
 
   // Tracking status for user feedback
   const trackingStatus = useMemo(() => {
@@ -634,7 +654,7 @@ export default function ClipPreview({
       const initRel = video.currentTime - clipStart;
       const initSx = interpolateSubjectX(subjectKeyframes, initRel);
       const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
-      video.style.objectPosition = `${initPct}% 50%`;
+      video.style.objectPosition = `${initPct}% ${yPositionPct}%`;
       if (lastAppliedPctRef.current === null) {
         lastAppliedPctRef.current = initPct;
       }
@@ -660,13 +680,13 @@ export default function ClipPreview({
       // while still preventing unnecessary DOM updates
       const rounded = Math.round(centerPct * 10000) / 10000;
       if (rounded !== lastPct) {
-        video.style.objectPosition = `${centerPct}% 50%`;
+        video.style.objectPosition = `${centerPct}% ${yPositionPct}%`;
         lastPct = rounded;
         lastAppliedPctRef.current = centerPct;
         // Log first 5 updates and then every 30th for debugging
         if (logCount < 5 || logCount % 30 === 0) {
           console.log(
-            `[SubjectTracking] t=${relTime.toFixed(2)}s: sx=${sx.toFixed(1)} → objectPosition=${centerPct.toFixed(2)}% 50%`
+            `[SubjectTracking] t=${relTime.toFixed(2)}s: sx=${sx.toFixed(1)} → objectPosition=${centerPct.toFixed(2)}% ${yPositionPct.toFixed(1)}%`
           );
         }
         logCount++;
@@ -680,7 +700,7 @@ export default function ClipPreview({
       // after React's DOM commit, so clearing would overwrite the correct
       // static objectPosition that React just applied.
     };
-  }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio]);
+  }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio, yPositionPct]);
 
   // When switching from dynamic to static mode (e.g. after "Reset Subject to
   // Center"), ensure the video's objectPosition is set to the correct static
@@ -699,8 +719,8 @@ export default function ClipPreview({
     const centerPct = subjectXToCenterPct(
       Math.max(0, Math.min(100, sx)), srcRatio, targetRatio,
     );
-    video.style.objectPosition = `${centerPct}% 50%`;
-  }, [hasDynamicSubject, isCrop, subjectX, subjectKeyframes, srcRatio, targetRatio]);
+    video.style.objectPosition = `${centerPct}% ${yPositionPct}%`;
+  }, [hasDynamicSubject, isCrop, subjectX, subjectKeyframes, srcRatio, targetRatio, yPositionPct]);
 
   // --- Controls ---
   const togglePlay = useCallback(() => {
@@ -1065,7 +1085,7 @@ export default function ClipPreview({
                   height: '100%',
                   display: 'block',
                   objectFit: 'cover',
-                  objectPosition: `${topPct}% 50%`,
+                  objectPosition: `${topPct}% ${yPositionPct}%`,
                 }}
                 onClick={togglePlay}
               />
@@ -1083,7 +1103,7 @@ export default function ClipPreview({
                   height: '100%',
                   display: 'block',
                   objectFit: 'cover',
-                  objectPosition: `${bottomPct}% 50%`,
+                  objectPosition: `${bottomPct}% ${yPositionPct}%`,
                 }}
                 onClick={togglePlay}
               />
@@ -1106,7 +1126,7 @@ export default function ClipPreview({
       const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, initialSx)), srcRatioLocal, targetRatio);
       Object.assign(videoStyle, {
         objectFit: 'cover',
-        objectPosition: `${centerPct}% 50%`,
+        objectPosition: `${centerPct}% ${yPositionPct}%`,
       });
     } else {
       Object.assign(videoStyle, {
@@ -1133,24 +1153,50 @@ export default function ClipPreview({
             {trackingStatus.label}
           </div>
         )}
-        {/* Speaker position indicator — shows where ClipAI thinks the subject is */}
-        {isCrop && hasDynamicSubject && (
-          <div
-            className="speaker-indicator"
-            style={{
-              position: 'absolute',
-              top: '10%',
-              bottom: '10%',
-              left: '50%',
-              width: 2,
-              background: 'rgba(16, 185, 129, 0.6)',
-              boxShadow: '0 0 6px rgba(16, 185, 129, 0.4)',
-              zIndex: 14,
-              pointerEvents: 'none',
-              transition: 'none',
-              borderRadius: 1,
-            }}
-          />
+        {/* Subject tracking overlay — shows crop center and tracking status */}
+        {isCrop && (
+          <>
+            {/* Center crosshair — shows where the subject is being centered */}
+            {hasDynamicSubject && (
+              <>
+                {/* Vertical center line */}
+                <div style={{
+                  position: 'absolute',
+                  top: '20%', bottom: '20%', left: '50%',
+                  width: 1, marginLeft: -0.5,
+                  background: 'rgba(16, 185, 129, 0.5)',
+                  zIndex: 14, pointerEvents: 'none',
+                }} />
+                {/* Horizontal center line */}
+                <div style={{
+                  position: 'absolute',
+                  left: '20%', right: '20%',
+                  top: yPositionPct !== 50 ? `${Math.max(10, Math.min(90, 100 - yPositionPct))}%` : '50%',
+                  height: 1, marginTop: -0.5,
+                  background: 'rgba(16, 185, 129, 0.35)',
+                  zIndex: 14, pointerEvents: 'none',
+                }} />
+                {/* Center target dot */}
+                <div style={{
+                  position: 'absolute',
+                  left: '50%',
+                  top: yPositionPct !== 50 ? `${Math.max(10, Math.min(90, 100 - yPositionPct))}%` : '50%',
+                  width: 8, height: 8, marginLeft: -4, marginTop: -4,
+                  borderRadius: '50%',
+                  border: '1.5px solid rgba(16, 185, 129, 0.7)',
+                  background: 'rgba(16, 185, 129, 0.15)',
+                  zIndex: 14, pointerEvents: 'none',
+                }} />
+              </>
+            )}
+            {/* Crop boundary — subtle border showing the active crop region */}
+            <div style={{
+              position: 'absolute', inset: 0,
+              border: '1px solid rgba(255, 255, 255, 0.15)',
+              borderRadius: 2,
+              zIndex: 13, pointerEvents: 'none',
+            }} />
+          </>
         )}
         <video
           ref={fgVideoRef}
