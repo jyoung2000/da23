@@ -13,8 +13,8 @@ services:
       - ./data/logs:/data/logs
       - ./data/fonts:/data/fonts
       - whisper_models:/root/.cache/huggingface
-      # Mount source code for hot-reload without full Docker rebuild
-      - ./frontend/dist:/app/static
+      # Mount backend source for hot-reload without full Docker rebuild
+      # Frontend must be rebuilt via: docker compose build app (uses Dockerfile multi-stage)
       - ./backend:/app/backend
     environment:
       - PYTHONUNBUFFERED=1
