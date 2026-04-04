@@ -395,6 +395,32 @@ async def get_scenes(job_id: str):
     return _ok([s.model_dump() for s in job.scenes])
 
 
+@router.get("/videos/{job_id}/tracking-debug", summary="Debug subject tracking data", dependencies=[Depends(verify_api_key)])
+async def get_tracking_debug(job_id: str):
+    """Diagnostic endpoint to verify per-second tracking data in database."""
+    job = await database.load_job(job_id)
+    if not job:
+        _err("VIDEO_NOT_FOUND", f"No video found with job_id '{job_id}'", 404)
+
+    scenes = job.scenes or []
+    dense_scenes = [s for s in scenes if s.description == "[dense face tracking]"]
+    ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
+    sx_values = [s.subject_x for s in scenes]
+    asx_values = [s.active_speaker_x for s in scenes if s.active_speaker_x is not None]
+
+    return _ok({
+        "total_scenes": len(scenes),
+        "dense_face_scenes": len(dense_scenes),
+        "ai_vision_scenes": len(ai_scenes),
+        "subject_x_range": [min(sx_values), max(sx_values)] if sx_values else None,
+        "active_speaker_x_count": len(asx_values),
+        "unique_subject_x": len(set(sx_values)),
+        "scenes_with_face_positions": sum(1 for s in scenes if s.face_positions),
+        "dense_tracking_summary": job.dense_tracking_summary,
+        "expected": "total_scenes should be ~648 (589 dense + 59 AI) for per-second tracking",
+    })
+
+
 @router.get("/videos/{job_id}/clips", summary="Get viral clip candidates", dependencies=[Depends(verify_api_key)])
 async def get_clips(
     job_id: str,

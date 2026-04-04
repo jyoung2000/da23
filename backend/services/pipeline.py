@@ -2271,6 +2271,10 @@ async def _run_analysis_inner(job_id: str):
                 # so the frontend API receives ALL per-second tracking data, not just the 59 AI scenes.
                 # Without this, the frontend only gets 59 scenes and isDense=false, breaking tracking.
                 await database.update_job_status(job_id, scenes=list(scenes))
+                logger.info(
+                    "[%s] *** SAVED %d scenes to database (was 59 AI-only, now includes %d dense tracking scenes) ***",
+                    job_id, len(scenes), synthetic_count,
+                )
                 await _update_progress(
                     job_id, JobStatus.DETECTING_CLIPS, 67,
                     f"Per-second tracking ready: {len(scenes)} total scenes ({synthetic_count} from face detection + {len(scenes) - synthetic_count} from AI)",
