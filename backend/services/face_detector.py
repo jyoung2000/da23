@@ -620,6 +620,7 @@ def detect_faces_dense(
     sample_rate: float = 0.5,
     min_confidence: float = 0.5,
     extract_embeddings: bool = True,
+    progress_callback=None,
 ) -> list:
     """Dense face detection for a clip's time range.
 
@@ -685,13 +686,20 @@ def detect_faces_dense(
         if not frame_files:
             return []
 
+        if progress_callback:
+            progress_callback("extracting_done", len(frame_files), expected_frames)
+
         frame_paths = []
         for i, fname in enumerate(frame_files):
             ts = start + i * sample_rate
             frame_paths.append((ts, os.path.join(tmpdir, fname)))
 
-        # Run face detection with embeddings
+        # Run face detection with FaceMesh
+        if progress_callback:
+            progress_callback("facemesh_start", 0, len(frame_paths))
         results = detect_faces_batch(frame_paths, min_confidence=min_confidence)
+        if progress_callback:
+            progress_callback("facemesh_done", len(results), len(frame_paths))
 
         # If batch detection didn't produce embeddings (e.g. FaceMesh path),
         # supplement with YuNet+SFace for embeddings
@@ -700,6 +708,8 @@ def detect_faces_dense(
             for fr in results for f in fr.faces
         )
         if not has_embeddings and extract_embeddings:
+            if progress_callback:
+                progress_callback("yunet_start", 0, len(frame_paths))
             yunet_results = _detect_with_opencv_dnn(
                 frame_paths, min_confidence, extract_embeddings=True
             )
@@ -719,6 +729,9 @@ def detect_faces_dense(
                                 best_yf = yf
                         if best_yf and best_dist < 10:
                             mf.identity_embedding = best_yf.identity_embedding
+
+        if progress_callback:
+            progress_callback("complete", len(results), len(frame_paths))
 
         logger.info(
             "[DenseFaces] %d frames, %d with faces, %d with embeddings (%.1fs clip, %.1fs rate)",

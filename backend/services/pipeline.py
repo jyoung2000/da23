@@ -1021,11 +1021,38 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Running dense face detection (%.1fs intervals, ~%d frames)...",
                 job_id, dense_sample_rate, expected_frames,
             )
-            # Send progress update so frontend doesn't show "stuck"
             await _update_progress(
                 job_id, JobStatus.EXTRACTING_FRAMES, 15,
-                f"Running dense face detection (~{expected_frames} frames)... this may take a few minutes",
+                f"Extracting {expected_frames} dense frames for face detection...",
             )
+
+            # Thread-safe progress callback for dense face detection
+            _dense_loop = asyncio.get_event_loop()
+
+            def _dense_progress(stage, done, total):
+                """Called from executor thread — schedules async progress update."""
+                if stage == "extracting_done":
+                    msg = f"Dense frames extracted ({done}/{total}) — running FaceMesh..."
+                    pct = 15
+                elif stage == "facemesh_start":
+                    msg = f"Running FaceMesh on {total} frames (detecting faces + lip aperture)..."
+                    pct = 15
+                elif stage == "facemesh_done":
+                    faces_found = done  # done = len(results)
+                    msg = f"FaceMesh complete ({faces_found} frames) — running YuNet for speaker identification..."
+                    pct = 15
+                elif stage == "yunet_start":
+                    msg = f"Running YuNet + SFace on {total} frames (face embeddings for speaker ID)..."
+                    pct = 15
+                elif stage == "complete":
+                    msg = f"Dense face detection complete: {done} frames analyzed"
+                    pct = 15
+                else:
+                    return
+                asyncio.run_coroutine_threadsafe(
+                    _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, pct, msg),
+                    _dense_loop,
+                )
 
             # Run in executor to avoid blocking the async event loop
             loop = asyncio.get_event_loop()
@@ -1038,6 +1065,7 @@ async def _run_analysis_inner(job_id: str):
                     sample_rate=dense_sample_rate,
                     min_confidence=0.4,
                     extract_embeddings=True,
+                    progress_callback=_dense_progress,
                 ),
             )
             dense_with_faces = sum(1 for r in dense_face_results if r.faces)
@@ -1053,6 +1081,10 @@ async def _run_analysis_inner(job_id: str):
     # Falls back to sparse position-based clustering if dense unavailable.
     if settings.SUBJECT_TRACKING_ENABLED and (face_results or dense_face_results):
         try:
+            await _update_progress(
+                job_id, JobStatus.EXTRACTING_FRAMES, 15,
+                f"Building face registry — identifying unique speakers from {len(dense_face_results or face_results)} frames...",
+            )
             from backend.services.face_registry import (
                 build_face_registry,
                 build_face_registry_with_embeddings,
@@ -1078,20 +1110,24 @@ async def _run_analysis_inner(job_id: str):
                 for frame in frames:
                     frame.face_registry = face_registry
                 if face_registry.multi_speaker:
+                    slot_info = ", ".join(f"slot{s.slot_id}@{s.x_center:.0f}%" for s in face_registry.slots)
                     logger.info(
                         "[%s] Multi-speaker face registry: %d face slots (%s)",
-                        job_id,
-                        len(face_registry.slots),
-                        ", ".join(f"slot{s.slot_id}@{s.x_center:.0f}%" for s in face_registry.slots),
+                        job_id, len(face_registry.slots), slot_info,
+                    )
+                    await _update_progress(
+                        job_id, JobStatus.EXTRACTING_FRAMES, 15,
+                        f"Identified {len(face_registry.slots)} speakers — positions: {slot_info}",
                     )
         except Exception as e:
             logger.warning("[%s] Face registry build failed (non-fatal): %s", job_id, e)
 
     _phase_timings["extraction"] = _pipeline_elapsed()
     logger.info("[%s] Extracted %d frames + audio track", job_id, total_frames)
+    _dense_count = len(dense_face_results) if dense_face_results else 0
     await _update_progress(
         job_id, JobStatus.EXTRACTING_FRAMES, 15,
-        f"Extracted {total_frames} frames + audio track{_pipeline_eta(15)}",
+        f"Extracted {total_frames} frames + {_dense_count} dense face frames + audio track{_pipeline_eta(15)}",
     )
 
     # ── Steps 3+4 — Run transcription and scene analysis CONCURRENTLY ──
@@ -2157,6 +2193,10 @@ async def _run_analysis_inner(job_id: str):
     # tracking pipeline gets 600+ keyframes instead of 59.
     if dense_face_results and active_speaker_events and face_registry and scenes:
         try:
+            await _update_progress(
+                job_id, JobStatus.DETECTING_CLIPS, 66,
+                f"Building per-second tracking data from {len(dense_face_results)} face frames + {len(active_speaker_events)} speaker events...",
+            )
             from backend.services.active_speaker import get_active_slot_at_time
             from backend.models import SceneDescription
 
@@ -2226,6 +2266,10 @@ async def _run_analysis_inner(job_id: str):
                     "[%s] Created %d synthetic per-second scenes from dense face + active speaker data "
                     "(total scenes: %d)",
                     job_id, synthetic_count, len(scenes),
+                )
+                await _update_progress(
+                    job_id, JobStatus.DETECTING_CLIPS, 67,
+                    f"Per-second tracking ready: {len(scenes)} total scenes ({synthetic_count} from face detection + {len(scenes) - synthetic_count} from AI)",
                 )
         except Exception as e:
             logger.warning("[%s] Per-second scene synthesis failed (non-fatal): %s", job_id, e)
