@@ -1133,6 +1133,25 @@ export default function ClipPreview({
             {trackingStatus.label}
           </div>
         )}
+        {/* Speaker position indicator — shows where ClipAI thinks the subject is */}
+        {isCrop && hasDynamicSubject && (
+          <div
+            className="speaker-indicator"
+            style={{
+              position: 'absolute',
+              top: '10%',
+              bottom: '10%',
+              left: '50%',
+              width: 2,
+              background: 'rgba(16, 185, 129, 0.6)',
+              boxShadow: '0 0 6px rgba(16, 185, 129, 0.4)',
+              zIndex: 14,
+              pointerEvents: 'none',
+              transition: 'none',
+              borderRadius: 1,
+            }}
+          />
+        )}
         <video
           ref={fgVideoRef}
           src={src}

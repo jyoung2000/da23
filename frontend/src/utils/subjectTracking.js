@@ -1022,11 +1022,14 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   // Sparse data detection: when we have very few keyframes (≤ 4),
   // relax pipeline thresholds so the little tracking data we have
   // doesn't get killed by dead zones and convergence checks.
+  // Dense data (100+ scenes = per-second tracking) also gets relaxed
+  // thresholds since the positions are already speaker-accurate.
   const isSparse = raw.length <= 4;
-  const deadZoneThreshold = isSparse ? 3 : 5;
-  const compressMaxRange = isSparse ? 60 : 30;
-  const smoothMaxSpeed = isSparse ? 30 : 22;
-  const holdTolerance = isSparse ? 2 : 3;
+  const isDense = raw.length >= 100;  // Per-second synthetic scenes from dense face detection
+  const deadZoneThreshold = isSparse ? 3 : (isDense ? 3 : 5);
+  const compressMaxRange = isSparse ? 60 : (isDense ? 80 : 30);
+  const smoothMaxSpeed = isSparse ? 30 : (isDense ? 50 : 22);
+  const holdTolerance = isSparse ? 2 : (isDense ? 2 : 3);
 
   const afterCompress = compressRange(raw, compressMaxRange, srcRatio, targetRatio);
   const afterDeadZone = applyDeadZone(afterCompress, deadZoneThreshold, srcRatio, targetRatio);
