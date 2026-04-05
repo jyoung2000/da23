@@ -358,13 +358,10 @@ export function buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio = nul
 
   // Prefer active_speaker_x (when AI detected who is talking) over generic subject_x
   const _sx = (s) => s.active_speaker_x ?? s.subject_x ?? 50;
-  // precise_x: actual face nose_x from detection, not slot-snapped. Used for crop centering.
-  const _px = (s) => s.precise_x ?? _sx(s);
 
   const raw = within.map((s) => ({
     t: s.timestamp - clipStart,
     x: safeSubjectX(_sx(s), srcRatio, targetRatio),
-    px: safeSubjectX(_px(s), srcRatio, targetRatio),
   }));
 
   const interp = (tAbs, s1, s2) => {
@@ -845,14 +842,7 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     // Dense data from backend slot-center-snapping benefits from cluster snap too:
     // reinforces stability and ensures the Phase 1 instant-snap path is used
     // instead of Phase 3 smoothing which creates off-center intermediate values.
-    // Snap to cluster centers for speaker-change detection, but keep precise_x
-    // for the actual crop position. This way cluster logic determines WHICH speaker,
-    // and precise_x determines WHERE to center the crop on that speaker's face.
     const snapped = snapToClusters(raw, clusters);
-    // Carry precise_x from the original raw keyframe
-    for (let i = 0; i < snapped.length; i++) {
-      snapped[i].px = raw[i]?.px ?? snapped[i].x;
-    }
 
     // Remove consecutive duplicates (same speaker holding) to clean up
     const deduped = [snapped[0]];
@@ -860,7 +850,7 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       if (snapped[i].x !== deduped[deduped.length - 1].x) {
         deduped.push(snapped[i]);
       } else if (i === snapped.length - 1) {
-        deduped.push({ t: snapped[i].t, x: deduped[deduped.length - 1].x, px: snapped[i].px });
+        deduped.push({ t: snapped[i].t, x: deduped[deduped.length - 1].x });
       }
     }
 
@@ -1003,42 +993,6 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
           }
         }
       }
-    }
-
-    // ── Precise face centering for dense data ──
-    // Replace slot-center values with median precise_x for that cluster.
-    // This keeps cluster-based speaker switching stable while using the actual
-    // face position for crop centering (±7% more accurate than slot center).
-    if (isDenseData && raw.some(kf => kf.px !== undefined && kf.px !== kf.x)) {
-      // Build median px per cluster center
-      const clusterPxMap = {};
-      for (const kf of raw) {
-        if (kf.px === undefined) continue;
-        // Find which cluster this kf was snapped to
-        let nearestCluster = clusters[0].center;
-        let minDist = Math.abs(kf.x - nearestCluster);
-        for (const c of clusters) {
-          const d = Math.abs(kf.x - c.center);
-          if (d < minDist) { minDist = d; nearestCluster = c.center; }
-        }
-        if (!clusterPxMap[nearestCluster]) clusterPxMap[nearestCluster] = [];
-        clusterPxMap[nearestCluster].push(kf.px);
-      }
-      // Compute median for each cluster
-      const clusterMedianPx = {};
-      for (const [center, pxValues] of Object.entries(clusterPxMap)) {
-        const sorted = [...pxValues].sort((a, b) => a - b);
-        clusterMedianPx[center] = sorted[Math.floor(sorted.length / 2)];
-      }
-      // Replace cluster centers with median precise_x in the result
-      const range = srcRatio && targetRatio ? computeSafeRange(srcRatio, targetRatio) : { min: 0, max: 100 };
-      for (const kf of result) {
-        const medianPx = clusterMedianPx[kf.x];
-        if (medianPx !== undefined) {
-          kf.x = Math.max(range.min, Math.min(range.max, Math.round(medianPx)));
-        }
-      }
-      console.log('[SubjectTracking] Precise face centering applied:', clusterMedianPx);
     }
 
     // ── QA validation: fix extended center holds and missing instant cuts ──
