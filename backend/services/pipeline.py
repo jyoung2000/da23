@@ -2260,6 +2260,7 @@ async def _run_analysis_inner(job_id: str):
             _mapping_face_data = dense_face_results if dense_face_results else face_results
             speaker_slot_map = map_speakers_to_face_slots(
                 transcript, face_registry, _mapping_face_data,
+                scenes=scenes,
             )
             if speaker_slot_map:
                 logger.info("[%s] Speaker→slot mapping: %s", job_id, speaker_slot_map)
@@ -2328,15 +2329,10 @@ async def _run_analysis_inner(job_id: str):
                             chosen_face = min(dfr.faces,
                                 key=lambda f: abs(f.nose_x - slot.x_center))
 
-                # Fallback: highest lip aperture
-                if not chosen_face:
-                    speaking = [f for f in dfr.faces if f.lip_aperture > 0.02]
-                    if speaking:
-                        chosen_face = max(speaking, key=lambda f: f.lip_aperture)
-
-                # Last fallback: largest face
-                if not chosen_face and dfr.primary_face_idx >= 0:
-                    chosen_face = dfr.faces[dfr.primary_face_idx]
+                # Fallback: largest face (most reliable in multi-speaker panels)
+                if not chosen_face and dfr.faces:
+                    chosen_face = max(dfr.faces,
+                        key=lambda f: f.width * (f.height if hasattr(f, 'height') else f.width))
 
                 if chosen_face:
                     # ── AutoFlip-style slot center snapping ──

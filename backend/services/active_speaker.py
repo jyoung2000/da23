@@ -39,11 +39,10 @@ def _compute_lip_motion_score(
 ) -> float:
     """Score how much a face's lips are MOVING (not just open).
 
-    Speaking produces rapid lip oscillation (4-8 Hz).
-    Laughing produces sustained opening.
-    This score favors speaking over laughing/yawning.
-
-    Returns: motion score 0.0-1.0
+    At >= 4fps: uses rate of change (derivative) to detect speech oscillation.
+    At < 4fps: falls back to size-weighted aperture, because the motion
+    derivative is unreliable when sampling below the Nyquist rate for
+    speech cadence (4-8 Hz).
     """
     apertures = []
     for fr in face_results:
@@ -58,15 +57,32 @@ def _compute_lip_motion_score(
                 if slot and slot.slot_id == slot_id:
                     matched = True
             if matched:
-                apertures.append((fr.timestamp, face.lip_aperture))
+                face_w = face.width if hasattr(face, 'width') else 8.0
+                apertures.append((fr.timestamp, face.lip_aperture, face_w))
                 break
 
-    if len(apertures) < 3:
-        return sum(a for _, a in apertures) / max(len(apertures), 1) if apertures else 0.0
+    if not apertures:
+        return 0.0
+    if len(apertures) < 2:
+        return sum(a for _, a, _ in apertures) / len(apertures)
 
     apertures.sort(key=lambda x: x[0])
 
-    # Compute rate of change (derivative)
+    # Check effective sample rate
+    total_dt = apertures[-1][0] - apertures[0][0]
+    effective_fps = (len(apertures) - 1) / max(total_dt, 0.01) if total_dt > 0 else 0
+
+    avg_aperture = sum(a for _, a, _ in apertures) / len(apertures)
+    avg_face_width = sum(w for _, _, w in apertures) / len(apertures)
+
+    if effective_fps < 4.0:
+        # Low fps: lip motion derivative is noise.
+        # Use size-weighted aperture — larger faces have more reliable
+        # lip measurements and are more likely to be the actual speaker.
+        size_weight = min(2.0, avg_face_width / 8.0)
+        return min(1.0, avg_aperture * size_weight / 0.04)
+
+    # High fps: use motion analysis
     deltas = []
     for i in range(1, len(apertures)):
         dt = apertures[i][0] - apertures[i - 1][0]
@@ -78,11 +94,6 @@ def _compute_lip_motion_score(
         return 0.0
 
     avg_motion = sum(deltas) / len(deltas)
-    avg_aperture = sum(a for _, a in apertures) / len(apertures)
-
-    # Combined score: motion * aperture weighting
-    # High motion + moderate aperture = speaking (score ~0.5-1.0)
-    # Low motion + high aperture = laughing/yawning (score ~0.2-0.4)
     motion_score = min(1.0, avg_motion / 0.08)
     aperture_score = min(1.0, avg_aperture / 0.04)
 
@@ -438,6 +449,13 @@ def build_active_speaker_timeline_v2(
                     face_results, iid, seg_start, seg_end, face_registry
                 )
 
+            # Audio sync: boost score for face whose lips correlate with words
+            for iid in id_motion_scores:
+                sync = _compute_lip_audio_sync(
+                    face_results, iid, seg, face_registry
+                )
+                id_motion_scores[iid] *= (0.7 + 0.6 * sync)
+
             # Continuity prior
             if events and events[-1].slot_id >= 0:
                 prev_sid = events[-1].slot_id
@@ -477,12 +495,61 @@ def build_active_speaker_timeline_v2(
                 merged.append(ev)
         events = merged
 
+    # ── Dominant speaker momentum ──
+    if events:
+        cumulative_time: dict[int, float] = {}
+        for ev in events:
+            if ev.slot_id >= 0:
+                cumulative_time[ev.slot_id] = cumulative_time.get(ev.slot_id, 0) + (ev.end - ev.start)
+
+        if cumulative_time:
+            total_time = sum(cumulative_time.values())
+            dominant_slot = max(cumulative_time, key=cumulative_time.get)
+            dominant_frac = cumulative_time[dominant_slot] / max(total_time, 0.1)
+
+            if dominant_frac > 0.4:
+                MIN_SWITCH_CONFIDENCE = 0.5
+                reverted = 0
+                for i in range(1, len(events)):
+                    if (events[i - 1].slot_id == dominant_slot and
+                            events[i].slot_id != dominant_slot and
+                            events[i].confidence < MIN_SWITCH_CONFIDENCE):
+                        events[i] = SpeakerEvent(
+                            start=events[i].start, end=events[i].end,
+                            slot_id=dominant_slot,
+                            confidence=events[i - 1].confidence * 0.9,
+                        )
+                        reverted += 1
+                if reverted > 0:
+                    logger.info(
+                        "V2 dominant speaker momentum: slot %d (%.0f%%), reverted %d switches",
+                        dominant_slot, dominant_frac * 100, reverted,
+                    )
+                    merged2 = [events[0]]
+                    for ev in events[1:]:
+                        if ev.slot_id == merged2[-1].slot_id and ev.start - merged2[-1].end < 1.0:
+                            merged2[-1] = SpeakerEvent(
+                                start=merged2[-1].start, end=ev.end,
+                                slot_id=ev.slot_id,
+                                confidence=max(merged2[-1].confidence, ev.confidence),
+                            )
+                        else:
+                            merged2.append(ev)
+                    events = merged2
+
     logger.info(
         "Active speaker V2 timeline: %d events, %d unique speakers, avg confidence=%.2f",
         len(events),
         len(set(e.slot_id for e in events if e.slot_id >= 0)),
         sum(e.confidence for e in events) / max(len(events), 1),
     )
+    slot_times: dict[int, float] = {}
+    for ev in events:
+        if ev.slot_id >= 0:
+            slot_times[ev.slot_id] = slot_times.get(ev.slot_id, 0) + (ev.end - ev.start)
+    for sid, secs in sorted(slot_times.items()):
+        logger.info("  V2 Slot %d speaking: %.1fs (%.0f%%)",
+                     sid, secs, secs / max(sum(slot_times.values()), 1) * 100)
 
     return events
 
@@ -491,14 +558,83 @@ def map_speakers_to_face_slots(
     transcript_segments: list,
     face_registry,
     face_results: list,
+    scenes: list = None,
 ) -> dict[str, int]:
     """Map Whisper speaker labels to face registry slot IDs.
 
-    Uses ALL frames within each segment (not just midpoint) and weights
-    by lip_aperture * face_size for more robust mapping. Greedy assignment
-    ensures each slot is assigned to at most one speaker.
+    PRIMARY method: correlate AI scene analysis subject_x with transcript
+    speaker timing. The AI vision model already identifies the main subject
+    position — we just match it with who Whisper says is speaking.
+
+    FALLBACK: if no scene data, use the largest face during speaking
+    segments (the most prominent face is usually the speaker).
     """
-    if not face_registry or not face_results or not transcript_segments:
+    if not face_registry or not transcript_segments:
+        return {}
+
+    # ── PRIMARY: Scene-based mapping ──
+    if scenes and len(scenes) >= 5:
+        scene_data = sorted(
+            [(s.timestamp, s.subject_x) for s in scenes if hasattr(s, 'subject_x')],
+            key=lambda x: x[0],
+        )
+        if scene_data:
+            speaker_slot_votes: dict[str, dict[int, float]] = {}
+
+            for seg in transcript_segments:
+                speaker = seg.speaker if hasattr(seg, 'speaker') else seg.get('speaker', '')
+                if not speaker:
+                    continue
+                seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
+                seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
+                seg_mid = (seg_start + seg_end) / 2
+                seg_duration = max(seg_end - seg_start, 0.1)
+
+                # Find scenes that overlap or are nearest to this segment
+                matching_scenes = [
+                    sx for ts, sx in scene_data
+                    if abs(ts - seg_mid) < max(seg_duration, 5.0)
+                ]
+                if not matching_scenes:
+                    nearest = min(scene_data, key=lambda x: abs(x[0] - seg_mid))
+                    matching_scenes = [nearest[1]]
+
+                for sx in matching_scenes:
+                    slot = face_registry.nearest_slot(sx)
+                    if slot:
+                        if speaker not in speaker_slot_votes:
+                            speaker_slot_votes[speaker] = {}
+                        sid = slot.slot_id
+                        speaker_slot_votes[speaker][sid] = (
+                            speaker_slot_votes[speaker].get(sid, 0) + seg_duration
+                        )
+
+            if speaker_slot_votes:
+                result = {}
+                used_slots = set()
+                sorted_speakers = sorted(
+                    speaker_slot_votes.keys(),
+                    key=lambda sp: sum(speaker_slot_votes[sp].values()),
+                    reverse=True,
+                )
+                for speaker in sorted_speakers:
+                    slot_scores = speaker_slot_votes[speaker]
+                    for slot_id, _score in sorted(slot_scores.items(), key=lambda x: -x[1]):
+                        if slot_id not in used_slots:
+                            result[speaker] = slot_id
+                            used_slots.add(slot_id)
+                            break
+
+                if result:
+                    logger.info("Speaker-to-slot mapping (scene-based): %s", result)
+                    for sp, votes in speaker_slot_votes.items():
+                        top = sorted(votes.items(), key=lambda x: -x[1])[:3]
+                        logger.info("  %s votes: %s → assigned slot %s",
+                                    sp, top, result.get(sp, 'NONE'))
+                    return result
+
+    # ── FALLBACK: Face-size weighted mapping ──
+    if not face_results:
         return {}
 
     frame_map = {}
@@ -506,7 +642,7 @@ def map_speakers_to_face_slots(
         frame_map[fr.timestamp] = fr
     frame_times = sorted(frame_map.keys())
 
-    votes: dict[str, list[tuple[int, float]]] = {}  # speaker -> [(slot_id, weight)]
+    speaker_slot_votes: dict[str, dict[int, float]] = {}
 
     for seg in transcript_segments:
         speaker = seg.speaker if hasattr(seg, 'speaker') else seg.get('speaker', '')
@@ -515,7 +651,6 @@ def map_speakers_to_face_slots(
         seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
         seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
 
-        # Use ALL frames within the segment
         nearby_frames = [
             frame_map[ft] for ft in frame_times
             if seg_start - 0.5 <= ft <= seg_end + 0.5
@@ -524,37 +659,36 @@ def map_speakers_to_face_slots(
         for fr in nearby_frames:
             if not fr.faces:
                 continue
-            for face in fr.faces:
-                if face.lip_aperture < 0.02:
-                    continue
-                size_weight = min(2.0, face.width / 8.0)
-                score = face.lip_aperture * size_weight
-                slot = face_registry.nearest_slot(face.nose_x)
-                if slot:
-                    votes.setdefault(speaker, []).append((slot.slot_id, score))
+            largest = max(fr.faces,
+                          key=lambda f: f.width * (f.height if hasattr(f, 'height') else f.width))
+            slot = face_registry.nearest_slot(largest.nose_x)
+            if slot:
+                if speaker not in speaker_slot_votes:
+                    speaker_slot_votes[speaker] = {}
+                size_score = largest.width * (largest.height if hasattr(largest, 'height') else largest.width)
+                speaker_slot_votes[speaker][slot.slot_id] = (
+                    speaker_slot_votes[speaker].get(slot.slot_id, 0) + size_score
+                )
 
-    # Weighted score per speaker per slot, greedy assignment
+    if not speaker_slot_votes:
+        return {}
+
     result = {}
     used_slots = set()
-
-    speaker_evidence = {
-        speaker: sum(w for _, w in slot_votes)
-        for speaker, slot_votes in votes.items()
-    }
-    sorted_speakers = sorted(speaker_evidence, key=speaker_evidence.get, reverse=True)
-
+    sorted_speakers = sorted(
+        speaker_slot_votes.keys(),
+        key=lambda sp: sum(speaker_slot_votes[sp].values()),
+        reverse=True,
+    )
     for speaker in sorted_speakers:
-        slot_scores: dict[int, float] = {}
-        for slot_id, weight in votes[speaker]:
-            slot_scores[slot_id] = slot_scores.get(slot_id, 0) + weight
-
+        slot_scores = speaker_slot_votes[speaker]
         for slot_id, _score in sorted(slot_scores.items(), key=lambda x: -x[1]):
             if slot_id not in used_slots:
                 result[speaker] = slot_id
                 used_slots.add(slot_id)
                 break
 
-    logger.info("Speaker-to-slot mapping: %s", result)
+    logger.info("Speaker-to-slot mapping (face-size fallback): %s", result)
     return result
 
 
@@ -566,9 +700,11 @@ def build_transcript_speaker_timeline(
     """Build a speaker timeline directly from Whisper transcript speaker labels.
 
     More reliable than lip-aperture detection because Whisper uses audio
-    features (voice embeddings, spectral analysis) which don't depend on
-    face detection sampling rate. Each transcript segment has a definitive
-    speaker label from audio-based diarization.
+    features (voice embeddings, spectral analysis). Each transcript segment
+    has a definitive speaker label from audio-based diarization.
+
+    Gap filling: extends events to cover sub-second gaps between consecutive
+    segments, preventing fallback to unreliable lip-based detection.
     """
     if not transcript_segments or not speaker_slot_map:
         return []
@@ -590,19 +726,41 @@ def build_transcript_speaker_timeline(
             confidence=0.95,
         ))
 
-    # Merge consecutive events with the same speaker (gap < 2s)
-    if events:
-        merged = [events[0]]
-        for ev in events[1:]:
-            if ev.slot_id == merged[-1].slot_id and ev.start - merged[-1].end < 2.0:
-                merged[-1] = SpeakerEvent(
-                    start=merged[-1].start, end=ev.end,
-                    slot_id=ev.slot_id,
-                    confidence=max(merged[-1].confidence, ev.confidence),
-                )
-            else:
-                merged.append(ev)
-        events = merged
+    if not events:
+        return []
+
+    # Sort by start time
+    events.sort(key=lambda e: e.start)
+
+    # Gap filling: merge same-speaker gaps < 3s, split different-speaker gaps < 1.5s
+    filled = [events[0]]
+    for ev in events[1:]:
+        prev = filled[-1]
+        gap = ev.start - prev.end
+
+        if ev.slot_id == prev.slot_id and gap < 3.0:
+            # Same speaker, small gap — merge
+            filled[-1] = SpeakerEvent(
+                start=prev.start, end=ev.end,
+                slot_id=ev.slot_id,
+                confidence=max(prev.confidence, ev.confidence),
+            )
+        elif gap < 1.5:
+            # Different speaker but tiny gap — extend previous to midpoint
+            midpoint = prev.end + gap / 2
+            filled[-1] = SpeakerEvent(
+                start=prev.start, end=midpoint,
+                slot_id=prev.slot_id,
+                confidence=prev.confidence,
+            )
+            filled.append(SpeakerEvent(
+                start=midpoint, end=ev.end,
+                slot_id=ev.slot_id,
+                confidence=ev.confidence,
+            ))
+        else:
+            filled.append(ev)
+    events = filled
 
     if events:
         logger.info(
@@ -614,8 +772,8 @@ def build_transcript_speaker_timeline(
         for ev in events:
             if ev.slot_id >= 0:
                 slot_times[ev.slot_id] = slot_times.get(ev.slot_id, 0) + (ev.end - ev.start)
+        total = max(sum(slot_times.values()), 1)
         for sid, secs in sorted(slot_times.items()):
-            logger.info("  Slot %d speaking: %.1fs (%.0f%%)",
-                        sid, secs, secs / max(sum(slot_times.values()), 1) * 100)
+            logger.info("  Slot %d speaking: %.1fs (%.0f%%)", sid, secs, secs / total * 100)
 
     return events
