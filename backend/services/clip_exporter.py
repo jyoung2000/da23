@@ -2471,9 +2471,23 @@ def _speaker_aware_keyframes(
             chosen_face = fd.faces[fd.primary_face_idx]
 
         if chosen_face:
-            keyframes.append((rel_t, round(chosen_face.nose_x)))
-            face_ys.append(chosen_face.nose_y)
-            face_widths.append(chosen_face.width)
+            # ── Slot center snapping for multi-speaker (AutoFlip-style) ──
+            is_closeup = (len(fd.faces) == 1 and chosen_face.width > 12.0)
+
+            if is_closeup:
+                sx = int(round(chosen_face.nose_x))
+            elif face_registry and face_registry.multi_speaker:
+                slot = face_registry.nearest_slot(chosen_face.nose_x)
+                if slot:
+                    sx = int(round(slot.x_center))
+                else:
+                    sx = int(round(chosen_face.nose_x))
+            else:
+                sx = int(round(chosen_face.nose_x))
+
+            keyframes.append((rel_t, sx))
+            face_ys.append(float(chosen_face.nose_y))
+            face_widths.append(float(chosen_face.width))
 
     return keyframes, face_ys, face_widths
 
@@ -6078,10 +6092,25 @@ async def export_clip(
                         min_confidence=0.4,
                         extract_embeddings=False,
                     )
+                    # Reconstruct face_registry for slot center snapping
+                    _clip_face_registry = None
+                    if face_registry_data:
+                        from backend.services.face_registry import FaceRegistry, FaceSlot
+                        _clip_slots = [
+                            FaceSlot(slot_id=s["id"], x_center=s["x"], x_min=s["x"], x_max=s["x"],
+                                     frame_count=s.get("frames", 0), avg_width=0, avg_height=0)
+                            for s in face_registry_data.get("slots", [])
+                        ]
+                        _clip_face_registry = FaceRegistry(
+                            slots=_clip_slots,
+                            total_frames=face_registry_data.get("total_frames", 0),
+                            frames_with_faces=face_registry_data.get("frames_with_faces", 0),
+                        )
                     # Use speaker-aware keyframes: track who's SPEAKING, not who's BIGGEST
                     dense_kf, _face_ys, _face_widths = _speaker_aware_keyframes(
                         _dense_results, start,
                         transcript=transcript,
+                        face_registry=_clip_face_registry,
                     )
                     # Compute face metadata for vertical tracking and zoom
                     if _face_ys:

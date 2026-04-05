@@ -2040,7 +2040,34 @@ async def _run_analysis_inner(job_id: str):
                     }
                     for f in best_dfr.faces
                 ]
-                if best_dfr.primary_face_idx >= 0:
+                # Determine best face for subject_x:
+                # 1. Single large face (close-up) → use raw nose_x for precision
+                # 2. Multi-speaker with active speaker → use slot center for stability
+                # 3. Fallback → largest face with slot center snapping
+                is_closeup = (len(best_dfr.faces) == 1 and best_dfr.faces[0].width > 12.0)
+
+                if is_closeup:
+                    best_face = best_dfr.faces[0]
+                    old_sx = scene.subject_x
+                    scene.subject_x = int(round(best_face.nose_x))
+                    if abs(old_sx - scene.subject_x) > 5:
+                        enriched += 1
+                elif face_registry and face_registry.multi_speaker:
+                    # Prefer active speaker (lip aperture proxy)
+                    speaking = [f for f in best_dfr.faces if f.lip_aperture > 0.03]
+                    target_face = None
+                    if speaking:
+                        target_face = max(speaking, key=lambda f: f.lip_aperture)
+                    elif best_dfr.primary_face_idx >= 0:
+                        target_face = best_dfr.faces[best_dfr.primary_face_idx]
+                    if target_face:
+                        slot = face_registry.nearest_slot(target_face.nose_x)
+                        if slot:
+                            old_sx = scene.subject_x
+                            scene.subject_x = int(round(slot.x_center))
+                            if abs(old_sx - scene.subject_x) > 5:
+                                enriched += 1
+                elif best_dfr.primary_face_idx >= 0:
                     primary = best_dfr.faces[best_dfr.primary_face_idx]
                     old_sx = scene.subject_x
                     scene.subject_x = int(round(primary.nose_x))
@@ -2236,7 +2263,30 @@ async def _run_analysis_inner(job_id: str):
                     chosen_face = dfr.faces[dfr.primary_face_idx]
 
                 if chosen_face:
-                    sx_val = int(round(chosen_face.nose_x))
+                    # ── AutoFlip-style slot center snapping ──
+                    # For multi-speaker panels, use the stable slot center instead
+                    # of raw per-frame nose_x. The slot center is median of hundreds
+                    # of frames — much more stable than individual detections.
+                    # Only use raw nose_x for single-face close-ups where precise
+                    # tracking matters and there's no slot ambiguity.
+                    is_closeup = (len(dfr.faces) == 1 and chosen_face.width > 12.0)
+
+                    if is_closeup:
+                        sx_val = int(round(chosen_face.nose_x))
+                    elif slot_id >= 0 and face_registry:
+                        slot = face_registry.slot_by_id(slot_id)
+                        if slot:
+                            sx_val = int(round(slot.x_center))
+                        else:
+                            sx_val = int(round(chosen_face.nose_x))
+                    elif face_registry and face_registry.multi_speaker:
+                        slot = face_registry.nearest_slot(chosen_face.nose_x)
+                        if slot:
+                            sx_val = int(round(slot.x_center))
+                        else:
+                            sx_val = int(round(chosen_face.nose_x))
+                    else:
+                        sx_val = int(round(chosen_face.nose_x))
                     # Build face_positions array for frontend vertical tracking
                     # IMPORTANT: Convert all values to native Python types (int/float/bool)
                     # because numpy.float32/int64 can't be serialized by Pydantic/JSON
@@ -2261,6 +2311,36 @@ async def _run_analysis_inner(job_id: str):
                         face_positions=fp,
                     ))
                     synthetic_count += 1
+
+            # ── Temporal hold: minimum speaker duration ──
+            # Prevent rapid oscillation between speaker positions.
+            # If a speaker appears for <2 seconds surrounded by a different
+            # speaker, merge into the surrounding speaker's position.
+            if synthetic_count > 10 and face_registry and face_registry.multi_speaker:
+                synth_scenes = [s for s in scenes if s.description == "[dense face tracking]"]
+                synth_scenes.sort(key=lambda s: s.timestamp)
+
+                MIN_HOLD_SECONDS = 2.0
+                smoothed = 0
+                i = 1
+                while i < len(synth_scenes) - 1:
+                    prev_sx = synth_scenes[i - 1].subject_x
+                    curr_sx = synth_scenes[i].subject_x
+                    next_sx = synth_scenes[i + 1].subject_x
+
+                    dt = synth_scenes[i + 1].timestamp - synth_scenes[i].timestamp
+                    if dt < MIN_HOLD_SECONDS and abs(curr_sx - prev_sx) > 10 and abs(curr_sx - next_sx) > 10:
+                        synth_scenes[i].subject_x = prev_sx
+                        if synth_scenes[i].active_speaker_x is not None:
+                            synth_scenes[i].active_speaker_x = prev_sx
+                        smoothed += 1
+                    i += 1
+
+                if smoothed > 0:
+                    logger.info(
+                        "[%s] Temporal hold: smoothed %d brief speaker blips (<%ss)",
+                        job_id, smoothed, MIN_HOLD_SECONDS,
+                    )
 
             if synthetic_count > 0:
                 scenes.sort(key=lambda s: s.timestamp)
