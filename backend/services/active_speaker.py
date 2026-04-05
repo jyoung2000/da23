@@ -492,16 +492,11 @@ def map_speakers_to_face_slots(
     face_registry,
     face_results: list,
 ) -> dict[str, int]:
-    """Map Whisper speaker labels ("Speaker 1") to face registry slot IDs.
+    """Map Whisper speaker labels to face registry slot IDs.
 
-    Algorithm:
-    1. For each transcript segment with a speaker label, find the frame
-       closest to the segment's midpoint
-    2. In that frame, find the face with the highest lip aperture
-    3. That face's identity_id maps to this speaker label
-    4. Aggregate across all segments — majority vote per speaker
-
-    Returns: {"Speaker 1": 0, "Speaker 2": 1, ...}
+    Uses ALL frames within each segment (not just midpoint) and weights
+    by lip_aperture * face_size for more robust mapping. Greedy assignment
+    ensures each slot is assigned to at most one speaker.
     """
     if not face_registry or not face_results or not transcript_segments:
         return {}
@@ -511,8 +506,7 @@ def map_speakers_to_face_slots(
         frame_map[fr.timestamp] = fr
     frame_times = sorted(frame_map.keys())
 
-    # Collect votes: speaker_label -> [slot_id, ...]
-    votes: dict[str, list[int]] = {}
+    votes: dict[str, list[tuple[int, float]]] = {}  # speaker -> [(slot_id, weight)]
 
     for seg in transcript_segments:
         speaker = seg.speaker if hasattr(seg, 'speaker') else seg.get('speaker', '')
@@ -520,31 +514,108 @@ def map_speakers_to_face_slots(
             continue
         seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
         seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
-        midpoint = (seg_start + seg_end) / 2
 
-        # Find closest frame to midpoint
-        closest_time = min(frame_times, key=lambda t: abs(t - midpoint), default=None)
-        if closest_time is None:
-            continue
-        fr = frame_map[closest_time]
-        if not fr.faces:
-            continue
+        # Use ALL frames within the segment
+        nearby_frames = [
+            frame_map[ft] for ft in frame_times
+            if seg_start - 0.5 <= ft <= seg_end + 0.5
+        ]
 
-        # Find face with highest lip aperture
-        best_face = max(fr.faces, key=lambda f: f.lip_aperture, default=None)
-        if best_face is None:
-            continue
+        for fr in nearby_frames:
+            if not fr.faces:
+                continue
+            for face in fr.faces:
+                if face.lip_aperture < 0.02:
+                    continue
+                size_weight = min(2.0, face.width / 8.0)
+                score = face.lip_aperture * size_weight
+                slot = face_registry.nearest_slot(face.nose_x)
+                if slot:
+                    votes.setdefault(speaker, []).append((slot.slot_id, score))
 
-        slot = face_registry.nearest_slot(best_face.nose_x)
-        if slot:
-            votes.setdefault(speaker, []).append(slot.slot_id)
-
-    # Majority vote
+    # Weighted score per speaker per slot, greedy assignment
     result = {}
-    for speaker, slot_votes in votes.items():
-        from collections import Counter
-        counts = Counter(slot_votes)
-        result[speaker] = counts.most_common(1)[0][0]
+    used_slots = set()
+
+    speaker_evidence = {
+        speaker: sum(w for _, w in slot_votes)
+        for speaker, slot_votes in votes.items()
+    }
+    sorted_speakers = sorted(speaker_evidence, key=speaker_evidence.get, reverse=True)
+
+    for speaker in sorted_speakers:
+        slot_scores: dict[int, float] = {}
+        for slot_id, weight in votes[speaker]:
+            slot_scores[slot_id] = slot_scores.get(slot_id, 0) + weight
+
+        for slot_id, _score in sorted(slot_scores.items(), key=lambda x: -x[1]):
+            if slot_id not in used_slots:
+                result[speaker] = slot_id
+                used_slots.add(slot_id)
+                break
 
     logger.info("Speaker-to-slot mapping: %s", result)
     return result
+
+
+def build_transcript_speaker_timeline(
+    transcript_segments: list,
+    speaker_slot_map: dict,
+    face_registry=None,
+) -> list[SpeakerEvent]:
+    """Build a speaker timeline directly from Whisper transcript speaker labels.
+
+    More reliable than lip-aperture detection because Whisper uses audio
+    features (voice embeddings, spectral analysis) which don't depend on
+    face detection sampling rate. Each transcript segment has a definitive
+    speaker label from audio-based diarization.
+    """
+    if not transcript_segments or not speaker_slot_map:
+        return []
+
+    events = []
+    for seg in transcript_segments:
+        speaker = seg.speaker if hasattr(seg, 'speaker') else seg.get('speaker', '')
+        if not speaker or speaker not in speaker_slot_map:
+            continue
+
+        seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
+        seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
+        slot_id = speaker_slot_map[speaker]
+
+        events.append(SpeakerEvent(
+            start=seg_start,
+            end=seg_end,
+            slot_id=slot_id,
+            confidence=0.95,
+        ))
+
+    # Merge consecutive events with the same speaker (gap < 2s)
+    if events:
+        merged = [events[0]]
+        for ev in events[1:]:
+            if ev.slot_id == merged[-1].slot_id and ev.start - merged[-1].end < 2.0:
+                merged[-1] = SpeakerEvent(
+                    start=merged[-1].start, end=ev.end,
+                    slot_id=ev.slot_id,
+                    confidence=max(merged[-1].confidence, ev.confidence),
+                )
+            else:
+                merged.append(ev)
+        events = merged
+
+    if events:
+        logger.info(
+            "Transcript-driven speaker timeline: %d events, %d unique speakers",
+            len(events),
+            len(set(e.slot_id for e in events if e.slot_id >= 0)),
+        )
+        slot_times: dict[int, float] = {}
+        for ev in events:
+            if ev.slot_id >= 0:
+                slot_times[ev.slot_id] = slot_times.get(ev.slot_id, 0) + (ev.end - ev.start)
+        for sid, secs in sorted(slot_times.items()):
+            logger.info("  Slot %d speaking: %.1fs (%.0f%%)",
+                        sid, secs, secs / max(sum(slot_times.values()), 1) * 100)
+
+    return events

@@ -2246,21 +2246,63 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Lip-only speaker fallback failed (non-fatal): %s", job_id, e)
 
-    # ── Per-second scene synthesis from dense face + active speaker data ──
+    # ── Speaker → Face Slot Mapping (BEFORE per-second synthesis) ──
+    # Map Whisper speaker labels to face registry slots using audio diarization.
+    # This must run before synthesis so transcript-driven tracking can be used.
+    speaker_slot_map = {}
+    transcript_speaker_events = []
+    if face_registry and face_registry.multi_speaker and transcript:
+        try:
+            from backend.services.active_speaker import (
+                map_speakers_to_face_slots,
+                build_transcript_speaker_timeline,
+            )
+            _mapping_face_data = dense_face_results if dense_face_results else face_results
+            speaker_slot_map = map_speakers_to_face_slots(
+                transcript, face_registry, _mapping_face_data,
+            )
+            if speaker_slot_map:
+                logger.info("[%s] Speaker→slot mapping: %s", job_id, speaker_slot_map)
+                transcript_speaker_events = build_transcript_speaker_timeline(
+                    transcript, speaker_slot_map, face_registry,
+                )
+                logger.info(
+                    "[%s] Transcript-driven timeline: %d events (PRIMARY source for tracking)",
+                    job_id, len(transcript_speaker_events),
+                )
+        except Exception as e:
+            logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
+
+    # ── Per-second scene synthesis from dense face + speaker data ──
     # The AI vision model produces ~59 scenes (1 per 10s). Dense face detection
     # has 606 data points (1 per second). Create synthetic scene descriptions at
     # 1-second intervals using the ACTIVE SPEAKER's face position, so the
     # tracking pipeline gets 600+ keyframes instead of 59.
-    if dense_face_results and active_speaker_events and face_registry and scenes:
+    _has_speaker_data = active_speaker_events or transcript_speaker_events
+    if dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
             await _update_progress(
                 job_id, JobStatus.DETECTING_CLIPS, 66,
-                f"Building per-second tracking data from {len(dense_face_results)} face frames + {len(active_speaker_events)} speaker events...",
+                f"Building per-second tracking data from {len(dense_face_results)} face frames + "
+                f"{len(transcript_speaker_events)} transcript events + {len(active_speaker_events)} lip events...",
             )
             from backend.services.active_speaker import get_active_slot_at_time
             from backend.models import SceneDescription
 
+            def _get_speaker_at_time(timestamp):
+                """Get speaker slot. Transcript (audio) > lip-based > fallback."""
+                if transcript_speaker_events:
+                    for ev in transcript_speaker_events:
+                        if ev.start <= timestamp <= ev.end:
+                            return ev.slot_id, 'transcript'
+                if active_speaker_events:
+                    sid = get_active_slot_at_time(active_speaker_events, timestamp)
+                    if sid >= 0:
+                        return sid, 'lip'
+                return -1, 'none'
+
             synthetic_count = 0
+            source_counts = {'transcript': 0, 'lip': 0, 'none': 0}
             for dfr in dense_face_results:
                 # Skip timestamps that already have a real scene
                 has_real_scene = any(abs(s.timestamp - dfr.timestamp) < 0.5 for s in scenes)
@@ -2270,7 +2312,8 @@ async def _run_analysis_inner(job_id: str):
                     continue
 
                 # Find which face slot is the active speaker at this timestamp
-                slot_id = get_active_slot_at_time(active_speaker_events, dfr.timestamp)
+                slot_id, speaker_source = _get_speaker_at_time(dfr.timestamp)
+                source_counts[speaker_source] = source_counts.get(speaker_source, 0) + 1
                 chosen_face = None
 
                 if slot_id >= 0:
@@ -2344,6 +2387,12 @@ async def _run_analysis_inner(job_id: str):
                         face_positions=fp,
                     ))
                     synthetic_count += 1
+
+            logger.info(
+                "[%s] Per-second speaker sources: %d transcript-driven, %d lip-based, %d fallback",
+                job_id, source_counts.get('transcript', 0),
+                source_counts.get('lip', 0), source_counts.get('none', 0),
+            )
 
             # ── Temporal hold: minimum speaker duration ──
             # Prevent rapid oscillation between speaker positions.
@@ -2420,19 +2469,6 @@ async def _run_analysis_inner(job_id: str):
                 logger.info("[%s] Per-second scene save SUCCEEDED on retry after sanitization", job_id)
             except Exception as e2:
                 logger.error("[%s] Per-second scene save FAILED even after sanitization: %s", job_id, e2)
-
-    # ── Speaker → Face Slot Mapping ──
-    if face_registry and face_registry.multi_speaker and transcript:
-        try:
-            from backend.services.active_speaker import map_speakers_to_face_slots
-            _mapping_face_data = dense_face_results if dense_face_results else face_results
-            speaker_slot_map = map_speakers_to_face_slots(
-                transcript, face_registry, _mapping_face_data,
-            )
-            if speaker_slot_map:
-                logger.info("[%s] Speaker→slot mapping: %s", job_id, speaker_slot_map)
-        except Exception as e:
-            logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
 
     # ── Post-scene speaker refinement ──
     # Now that we have active speaker events (the best lip-audio correlation),
