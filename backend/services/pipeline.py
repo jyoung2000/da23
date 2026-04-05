@@ -2296,11 +2296,37 @@ async def _run_analysis_inner(job_id: str):
             from backend.models import SceneDescription
 
             def _get_speaker_at_time(timestamp):
-                """Get speaker slot. Transcript (audio) > lip-based > fallback."""
+                """Get speaker slot. Transcript (audio) > lip-based > fallback.
+                With per-timestamp lip verification for couch/panel scenes."""
+                transcript_slot = -1
                 if transcript_speaker_events:
                     for ev in transcript_speaker_events:
                         if ev.start <= timestamp <= ev.end:
-                            return ev.slot_id, 'transcript'
+                            transcript_slot = ev.slot_id
+                            break
+
+                if transcript_slot >= 0:
+                    # Verify: check if transcript's face is actually speaking
+                    dfr = next((d for d in dense_face_results
+                                if abs(d.timestamp - timestamp) < 0.3), None)
+                    if dfr and dfr.faces and face_registry and face_registry.multi_speaker:
+                        transcript_lip = 0.0
+                        best_alt_lip = 0.0
+                        best_alt_slot = -1
+                        for f in dfr.faces:
+                            if f.identity_id == transcript_slot:
+                                transcript_lip = f.lip_aperture
+                            elif f.identity_id >= 0 and f.lip_aperture > best_alt_lip:
+                                best_alt_lip = f.lip_aperture
+                                best_alt_slot = f.identity_id
+                        # Only override if alternative has MUCH higher lip aperture
+                        if (best_alt_slot >= 0 and
+                                best_alt_lip > 0.05 and
+                                transcript_lip < 0.02 and
+                                best_alt_lip > transcript_lip * 5):
+                            return best_alt_slot, 'lip-override'
+                    return transcript_slot, 'transcript'
+
                 if active_speaker_events:
                     sid = get_active_slot_at_time(active_speaker_events, timestamp)
                     if sid >= 0:
@@ -2308,7 +2334,7 @@ async def _run_analysis_inner(job_id: str):
                 return -1, 'none'
 
             synthetic_count = 0
-            source_counts = {'transcript': 0, 'lip': 0, 'none': 0}
+            source_counts = {'transcript': 0, 'lip': 0, 'lip-override': 0, 'none': 0}
             for dfr in dense_face_results:
                 # Skip timestamps that already have a real scene
                 has_real_scene = any(abs(s.timestamp - dfr.timestamp) < 0.5 for s in scenes)

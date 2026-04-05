@@ -358,10 +358,13 @@ export function buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio = nul
 
   // Prefer active_speaker_x (when AI detected who is talking) over generic subject_x
   const _sx = (s) => s.active_speaker_x ?? s.subject_x ?? 50;
+  // precise_x: actual face nose_x from detection, not slot-snapped
+  const _px = (s) => s.precise_x ?? _sx(s);
 
   const raw = within.map((s) => ({
     t: s.timestamp - clipStart,
     x: safeSubjectX(_sx(s), srcRatio, targetRatio),
+    px: safeSubjectX(_px(s), srcRatio, targetRatio),
   }));
 
   const interp = (tAbs, s1, s2) => {
@@ -843,6 +846,10 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     // reinforces stability and ensures the Phase 1 instant-snap path is used
     // instead of Phase 3 smoothing which creates off-center intermediate values.
     const snapped = snapToClusters(raw, clusters);
+    // Carry precise_x from the original raw keyframe
+    for (let i = 0; i < snapped.length; i++) {
+      snapped[i].px = raw[i]?.px ?? snapped[i].x;
+    }
 
     // Remove consecutive duplicates (same speaker holding) to clean up
     const deduped = [snapped[0]];
@@ -993,6 +1000,29 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
           }
         }
       }
+    }
+
+    // ── Per-keyframe precise face centering for dense data ──
+    // Use the active speaker's actual face position from dense detection.
+    // Cluster snap determines WHICH speaker (instant cut logic).
+    // Precise_x determines WHERE to center the crop on that speaker's face.
+    // Only applies when px is within ±15% of cluster center (same speaker).
+    if (isDenseData) {
+      const range = srcRatio && targetRatio ? computeSafeRange(srcRatio, targetRatio) : { min: 0, max: 100 };
+      for (const kf of result) {
+        // Find raw keyframes near this time with valid px
+        const nearbyRaw = raw.filter(r => Math.abs(r.t - kf.t) < 1.5 && r.px !== undefined);
+        if (nearbyRaw.length === 0) continue;
+        // Only use px values close to the cluster center (same speaker, not contamination)
+        const validPx = nearbyRaw.filter(r => Math.abs(r.px - kf.x) <= 15);
+        if (validPx.length === 0) continue;
+        const nearest = validPx.reduce((best, r) =>
+          Math.abs(r.t - kf.t) < Math.abs(best.t - kf.t) ? r : best
+        );
+        kf.x = Math.max(range.min, Math.min(range.max, Math.round(nearest.px)));
+      }
+      const uniqueX = [...new Set(result.map(kf => kf.x))].sort((a, b) => a - b);
+      console.log('[SubjectTracking] Precise face centering (per-keyframe):', uniqueX);
     }
 
     // ── QA validation: fix extended center holds and missing instant cuts ──

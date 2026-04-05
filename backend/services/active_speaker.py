@@ -306,8 +306,17 @@ def build_active_speaker_timeline(
             dominant_slot = max(cumulative_time, key=cumulative_time.get)
             dominant_frac = cumulative_time[dominant_slot] / max(total_time, 0.1)
 
-            if dominant_frac > 0.4:
+            # Scale threshold based on speaker count — aggressive momentum
+            # suppresses minority speakers in 4+ person panels
+            num_speakers = len([s for s in cumulative_time if cumulative_time[s] > 5.0])
+            if num_speakers >= 4:
+                MIN_SWITCH_CONFIDENCE = 0.3 if dominant_frac > 0.70 else None
+            elif dominant_frac > 0.4:
                 MIN_SWITCH_CONFIDENCE = 0.5
+            else:
+                MIN_SWITCH_CONFIDENCE = None
+
+            if MIN_SWITCH_CONFIDENCE is not None:
                 reverted = 0
                 for i in range(1, len(events)):
                     if (events[i - 1].slot_id == dominant_slot and
@@ -321,11 +330,11 @@ def build_active_speaker_timeline(
                         reverted += 1
                 if reverted > 0:
                     logger.info(
-                        "Dominant speaker momentum: slot %d (%.0f%% of time), "
-                        "reverted %d low-confidence switches",
-                        dominant_slot, dominant_frac * 100, reverted,
+                        "Dominant speaker momentum: slot %d (%.0f%% of time, %d speakers), "
+                        "reverted %d low-confidence switches (threshold=%.1f)",
+                        dominant_slot, dominant_frac * 100, num_speakers,
+                        reverted, MIN_SWITCH_CONFIDENCE,
                     )
-                    # Re-merge after reverting
                     merged2 = [events[0]]
                     for ev in events[1:]:
                         if ev.slot_id == merged2[-1].slot_id and ev.start - merged2[-1].end < 1.0:
@@ -507,8 +516,15 @@ def build_active_speaker_timeline_v2(
             dominant_slot = max(cumulative_time, key=cumulative_time.get)
             dominant_frac = cumulative_time[dominant_slot] / max(total_time, 0.1)
 
-            if dominant_frac > 0.4:
+            num_speakers = len([s for s in cumulative_time if cumulative_time[s] > 5.0])
+            if num_speakers >= 4:
+                MIN_SWITCH_CONFIDENCE = 0.3 if dominant_frac > 0.70 else None
+            elif dominant_frac > 0.4:
                 MIN_SWITCH_CONFIDENCE = 0.5
+            else:
+                MIN_SWITCH_CONFIDENCE = None
+
+            if MIN_SWITCH_CONFIDENCE is not None:
                 reverted = 0
                 for i in range(1, len(events)):
                     if (events[i - 1].slot_id == dominant_slot and
@@ -522,8 +538,10 @@ def build_active_speaker_timeline_v2(
                         reverted += 1
                 if reverted > 0:
                     logger.info(
-                        "V2 dominant speaker momentum: slot %d (%.0f%%), reverted %d switches",
-                        dominant_slot, dominant_frac * 100, reverted,
+                        "V2 dominant speaker momentum: slot %d (%.0f%%, %d speakers), "
+                        "reverted %d switches (threshold=%.1f)",
+                        dominant_slot, dominant_frac * 100, num_speakers,
+                        reverted, MIN_SWITCH_CONFIDENCE,
                     )
                     merged2 = [events[0]]
                     for ev in events[1:]:
@@ -608,10 +626,15 @@ def map_speakers_to_face_slots(
         slot_size_scores: dict[int, float] = {}
         for fr in nearby_frames:
             for face in fr.faces:
-                slot = face_registry.nearest_slot(face.nose_x)
-                if not slot:
-                    continue
-                sid = slot.slot_id
+                # Prefer identity_id (assigned during face registry build)
+                # over nearest_slot (which can misassign nearby faces)
+                if hasattr(face, 'identity_id') and face.identity_id >= 0:
+                    sid = face.identity_id
+                else:
+                    slot = face_registry.nearest_slot(face.nose_x)
+                    if not slot:
+                        continue
+                    sid = slot.slot_id
                 size = face.width * (face.height if hasattr(face, 'height') else face.width)
                 size_weight = min(2.0, face.width / 8.0)
                 slot_lip_scores[sid] = slot_lip_scores.get(sid, 0) + face.lip_aperture * size_weight
