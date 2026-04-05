@@ -563,88 +563,16 @@ def map_speakers_to_face_slots(
 ) -> dict[str, int]:
     """Map Whisper speaker labels to face registry slot IDs.
 
-    PRIMARY method: correlate AI scene analysis subject_x with transcript
-    speaker timing. The AI vision model already identifies the main subject
-    position — we just match it with who Whisper says is speaking.
+    Uses dense face detection data directly: for each transcript segment,
+    find which face slot has the highest size-weighted lip aperture.
+    This gives a direct speaker→slot mapping without relying on the AI
+    vision model's scene subject_x (which clusters everything to center).
 
-    FALLBACK: if no scene data, use the largest face during speaking
-    segments (the most prominent face is usually the speaker).
+    Falls back to face size if no lip data available.
     """
     if not face_registry or not transcript_segments:
         return {}
 
-    # ── PRIMARY: Scene-based mapping ──
-    # Use ORIGINAL AI subject_x if available (before lip-based overwrites corrupted it).
-    if (original_scene_sx or scenes) and (
-        len(original_scene_sx or []) >= 5 or (scenes and len(scenes) >= 5)
-    ):
-        if original_scene_sx and len(original_scene_sx) >= 5:
-            scene_data = sorted(original_scene_sx, key=lambda x: x[0])
-            logger.info("Using %d ORIGINAL AI scene subject_x values (pre-override)",
-                        len(scene_data))
-        else:
-            scene_data = sorted(
-                [(s.timestamp, s.subject_x) for s in scenes if hasattr(s, 'subject_x')],
-                key=lambda x: x[0],
-            )
-            logger.info("Using %d scene subject_x values (no originals available)",
-                        len(scene_data))
-        if scene_data:
-            speaker_slot_votes: dict[str, dict[int, float]] = {}
-
-            for seg in transcript_segments:
-                speaker = seg.speaker if hasattr(seg, 'speaker') else seg.get('speaker', '')
-                if not speaker:
-                    continue
-                seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
-                seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
-                seg_mid = (seg_start + seg_end) / 2
-                seg_duration = max(seg_end - seg_start, 0.1)
-
-                # Find scenes that overlap or are nearest to this segment
-                matching_scenes = [
-                    sx for ts, sx in scene_data
-                    if abs(ts - seg_mid) < max(seg_duration, 5.0)
-                ]
-                if not matching_scenes:
-                    nearest = min(scene_data, key=lambda x: abs(x[0] - seg_mid))
-                    matching_scenes = [nearest[1]]
-
-                for sx in matching_scenes:
-                    slot = face_registry.nearest_slot(sx)
-                    if slot:
-                        if speaker not in speaker_slot_votes:
-                            speaker_slot_votes[speaker] = {}
-                        sid = slot.slot_id
-                        speaker_slot_votes[speaker][sid] = (
-                            speaker_slot_votes[speaker].get(sid, 0) + seg_duration
-                        )
-
-            if speaker_slot_votes:
-                result = {}
-                used_slots = set()
-                sorted_speakers = sorted(
-                    speaker_slot_votes.keys(),
-                    key=lambda sp: sum(speaker_slot_votes[sp].values()),
-                    reverse=True,
-                )
-                for speaker in sorted_speakers:
-                    slot_scores = speaker_slot_votes[speaker]
-                    for slot_id, _score in sorted(slot_scores.items(), key=lambda x: -x[1]):
-                        if slot_id not in used_slots:
-                            result[speaker] = slot_id
-                            used_slots.add(slot_id)
-                            break
-
-                if result:
-                    logger.info("Speaker-to-slot mapping (scene-based): %s", result)
-                    for sp, votes in speaker_slot_votes.items():
-                        top = sorted(votes.items(), key=lambda x: -x[1])[:3]
-                        logger.info("  %s votes: %s → assigned slot %s",
-                                    sp, top, result.get(sp, 'NONE'))
-                    return result
-
-    # ── FALLBACK: Face-size weighted mapping ──
     if not face_results:
         return {}
 
@@ -653,6 +581,8 @@ def map_speakers_to_face_slots(
         frame_map[fr.timestamp] = fr
     frame_times = sorted(frame_map.keys())
 
+    # For each transcript segment, vote for which slot the speaker is at
+    # using size-weighted lip aperture from face detection data
     speaker_slot_votes: dict[str, dict[int, float]] = {}
 
     for seg in transcript_segments:
@@ -661,29 +591,55 @@ def map_speakers_to_face_slots(
             continue
         seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
         seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
+        seg_duration = max(seg_end - seg_start, 0.1)
 
+        # Find face frames within this speech segment
         nearby_frames = [
             frame_map[ft] for ft in frame_times
             if seg_start - 0.5 <= ft <= seg_end + 0.5
         ]
 
+        if not nearby_frames:
+            continue
+
+        # Find which slot has highest lip aperture during this segment
+        # Weight by face size — larger faces have more reliable lip data
+        slot_lip_scores: dict[int, float] = {}
+        slot_size_scores: dict[int, float] = {}
         for fr in nearby_frames:
-            if not fr.faces:
-                continue
-            largest = max(fr.faces,
-                          key=lambda f: f.width * (f.height if hasattr(f, 'height') else f.width))
-            slot = face_registry.nearest_slot(largest.nose_x)
-            if slot:
-                if speaker not in speaker_slot_votes:
-                    speaker_slot_votes[speaker] = {}
-                size_score = largest.width * (largest.height if hasattr(largest, 'height') else largest.width)
-                speaker_slot_votes[speaker][slot.slot_id] = (
-                    speaker_slot_votes[speaker].get(slot.slot_id, 0) + size_score
-                )
+            for face in fr.faces:
+                slot = face_registry.nearest_slot(face.nose_x)
+                if not slot:
+                    continue
+                sid = slot.slot_id
+                size = face.width * (face.height if hasattr(face, 'height') else face.width)
+                size_weight = min(2.0, face.width / 8.0)
+                slot_lip_scores[sid] = slot_lip_scores.get(sid, 0) + face.lip_aperture * size_weight
+                slot_size_scores[sid] = slot_size_scores.get(sid, 0) + size
+
+        # Pick the slot with highest lip activity for this speaker
+        # If no lip data, fall back to largest face
+        best_slot = None
+        if slot_lip_scores:
+            max_lip = max(slot_lip_scores.values())
+            if max_lip > 0.01:
+                best_slot = max(slot_lip_scores, key=slot_lip_scores.get)
+
+        if best_slot is None and slot_size_scores:
+            best_slot = max(slot_size_scores, key=slot_size_scores.get)
+
+        if best_slot is not None:
+            if speaker not in speaker_slot_votes:
+                speaker_slot_votes[speaker] = {}
+            # Weight the vote by segment duration — longer segments are more reliable
+            speaker_slot_votes[speaker][best_slot] = (
+                speaker_slot_votes[speaker].get(best_slot, 0) + seg_duration
+            )
 
     if not speaker_slot_votes:
         return {}
 
+    # Greedy assignment: speakers with most evidence first
     result = {}
     used_slots = set()
     sorted_speakers = sorted(
@@ -699,7 +655,11 @@ def map_speakers_to_face_slots(
                 used_slots.add(slot_id)
                 break
 
-    logger.info("Speaker-to-slot mapping (face-size fallback): %s", result)
+    logger.info("Speaker-to-slot mapping (dense face lip+size): %s", result)
+    for sp, votes in speaker_slot_votes.items():
+        top = sorted(votes.items(), key=lambda x: -x[1])[:3]
+        logger.info("  %s votes: %s → assigned slot %s",
+                    sp, top, result.get(sp, 'NONE'))
     return result
 
 

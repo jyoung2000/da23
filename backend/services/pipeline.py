@@ -2384,6 +2384,8 @@ async def _run_analysis_inner(job_id: str):
                         thumbnail_path="",
                         subject_x=sx_val,
                         active_speaker_x=sx_val if slot_id >= 0 else None,
+                        precise_x=float(round(chosen_face.nose_x, 1)),
+                        precise_y=float(round(chosen_face.nose_y, 1)),
                         face_count=int(len(dfr.faces)),
                         face_positions=fp,
                     ))

@@ -47,6 +47,8 @@ class SceneDescription(BaseModel):
     face_count: int = 0                   # Number of faces detected at this timestamp
     face_positions: list[dict] = []       # [{slot_id, x, y, w, h, is_speaking, identity_id}]
     has_screen_content: bool = False       # Whether frame contains screen share / slides / text
+    precise_x: Optional[float] = None      # Actual face nose_x (0-100), not slot-snapped
+    precise_y: Optional[float] = None      # Actual face nose_y (0-100), for vertical centering
     primary_object_x: Optional[int] = None # Non-face object tracking position (0-100)
     primary_object_type: Optional[str] = None  # "ball", "product", "hand", "text", etc.
 

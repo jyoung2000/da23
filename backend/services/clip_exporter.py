@@ -2471,19 +2471,11 @@ def _speaker_aware_keyframes(
             chosen_face = fd.faces[fd.primary_face_idx]
 
         if chosen_face:
-            # ── Slot center snapping for multi-speaker (AutoFlip-style) ──
-            is_closeup = (len(fd.faces) == 1 and chosen_face.width > 12.0)
-
-            if is_closeup:
-                sx = int(round(chosen_face.nose_x))
-            elif face_registry and face_registry.multi_speaker:
-                slot = face_registry.nearest_slot(chosen_face.nose_x)
-                if slot:
-                    sx = int(round(slot.x_center))
-                else:
-                    sx = int(round(chosen_face.nose_x))
-            else:
-                sx = int(round(chosen_face.nose_x))
+            # Use actual face position for crop centering.
+            # The pipeline's cluster-snap logic determines WHICH speaker to track;
+            # here we use the precise face nose_x for WHERE to center the crop.
+            # This matches the frontend's precise_x approach for preview-export parity.
+            sx = int(round(chosen_face.nose_x))
 
             keyframes.append((rel_t, sx))
             face_ys.append(float(chosen_face.nose_y))
