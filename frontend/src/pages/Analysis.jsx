@@ -512,6 +512,11 @@ export default function Analysis() {
       clearTimeout(timeout);
       if (res.ok) {
         const data = sanitizeJob(await res.json());
+        // Log scene count on every fetch for tracking debug
+        if (data.scenes?.length) {
+          const denseCount = data.scenes.filter(s => s.description === '[dense face tracking]').length;
+          console.log(`[Analysis] fetchJob: ${data.scenes.length} scenes (${denseCount} dense face tracking, ${data.scenes.length - denseCount} AI), status=${data.status}`);
+        }
         setJob(data);
         fetchJobRetryRef.current = 0;
         // Sync generating state from job status (handles page refresh mid-generation)
