@@ -2817,11 +2817,20 @@ async def _run_analysis_inner(job_id: str):
         f"Analysis complete in {dur_str} — "
         f"{len(transcript)} segments, {len(scenes)} scenes, {len(clips)} clips"
     )
+    # FINAL SAVE: ensure ALL scenes (including 589+ synthetic per-second tracking scenes)
+    # are persisted. This is the authoritative save — if the earlier save at synthetic
+    # creation time was skipped or failed, this catches it.
+    logger.info(
+        "[%s] Final save: %d total scenes (%d with description '[dense face tracking]')",
+        job_id, len(scenes),
+        sum(1 for s in scenes if getattr(s, 'description', '') == '[dense face tracking]'),
+    )
     await database.update_job_status(
         job_id,
         status=JobStatus.COMPLETE,
         progress=100,
         progress_message=completion_msg,
+        scenes=list(scenes),
         analysis_duration_seconds=total_elapsed,
         estimated_cost_usd=estimated_cost if estimated_cost > 0 else None,
     )
