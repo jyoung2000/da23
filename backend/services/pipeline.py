@@ -2042,6 +2042,10 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Object tracking failed (non-fatal): %s", job_id, e)
 
+    # Save original AI vision subject_x BEFORE dense face or lip-audio overwrites.
+    # These originals are the AI model's spatial reasoning — not lip detection noise.
+    _original_scene_sx = [(s.timestamp, s.subject_x) for s in scenes] if scenes else []
+
     # ── Merge dense face data into scene descriptions ──
     # Override AI vision model's subject_x with actual face positions from
     # dense detection. Dense data is pixel-accurate; AI estimates are guesses.
@@ -2261,6 +2265,7 @@ async def _run_analysis_inner(job_id: str):
             speaker_slot_map = map_speakers_to_face_slots(
                 transcript, face_registry, _mapping_face_data,
                 scenes=scenes,
+                original_scene_sx=_original_scene_sx,
             )
             if speaker_slot_map:
                 logger.info("[%s] Speaker→slot mapping: %s", job_id, speaker_slot_map)

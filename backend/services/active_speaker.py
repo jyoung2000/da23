@@ -559,6 +559,7 @@ def map_speakers_to_face_slots(
     face_registry,
     face_results: list,
     scenes: list = None,
+    original_scene_sx: list = None,
 ) -> dict[str, int]:
     """Map Whisper speaker labels to face registry slot IDs.
 
@@ -573,11 +574,21 @@ def map_speakers_to_face_slots(
         return {}
 
     # ── PRIMARY: Scene-based mapping ──
-    if scenes and len(scenes) >= 5:
-        scene_data = sorted(
-            [(s.timestamp, s.subject_x) for s in scenes if hasattr(s, 'subject_x')],
-            key=lambda x: x[0],
-        )
+    # Use ORIGINAL AI subject_x if available (before lip-based overwrites corrupted it).
+    if (original_scene_sx or scenes) and (
+        len(original_scene_sx or []) >= 5 or (scenes and len(scenes) >= 5)
+    ):
+        if original_scene_sx and len(original_scene_sx) >= 5:
+            scene_data = sorted(original_scene_sx, key=lambda x: x[0])
+            logger.info("Using %d ORIGINAL AI scene subject_x values (pre-override)",
+                        len(scene_data))
+        else:
+            scene_data = sorted(
+                [(s.timestamp, s.subject_x) for s in scenes if hasattr(s, 'subject_x')],
+                key=lambda x: x[0],
+            )
+            logger.info("Using %d scene subject_x values (no originals available)",
+                        len(scene_data))
         if scene_data:
             speaker_slot_votes: dict[str, dict[int, float]] = {}
 
