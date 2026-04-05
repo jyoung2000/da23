@@ -833,15 +833,15 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   console.log(
     `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}, isDense=${isDenseData}`,
     clusters ? clusters.map(c => `center=${c.center} count=${c.count}`).join(', ') : 'none',
-    isDenseData ? '(skipping cluster snap for dense face data)' : `raw_x_unique=[${[...new Set(raw.map(k=>k.x))].sort((a,b)=>a-b).join(',')}]`
+    isDenseData ? '(dense face data — slot-center-snapped by backend)' : `raw_x_unique=[${[...new Set(raw.map(k=>k.x))].sort((a,b)=>a-b).join(',')}]`
   );
 
-  if (clusters && clusters.length >= 2 && !isDenseData) {
+  if (clusters && clusters.length >= 2) {
     // Multi-position mode: snap to cluster centers, then use scene cuts for instant jumps.
     // NO smoothing — speaker/position changes must be instant snaps, not pans.
-    // NOTE: Skip for dense data — the raw face positions are already speaker-accurate
-    // from backend _speaker_aware_keyframes(). Cluster snapping introduces quantization
-    // error (e.g. a face at x=30 snaps to cluster center 24 instead of 36).
+    // Dense data from backend slot-center-snapping benefits from cluster snap too:
+    // reinforces stability and ensures the Phase 1 instant-snap path is used
+    // instead of Phase 3 smoothing which creates off-center intermediate values.
     const snapped = snapToClusters(raw, clusters);
 
     // Remove consecutive duplicates (same speaker holding) to clean up
