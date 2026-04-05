@@ -18,6 +18,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 LAR_SPEAKING_THRESHOLD = 0.025
+CONTINUITY_BONUS = 0.015  # Bonus score for previous speaker (stickiness)
 
 
 @dataclass
@@ -27,6 +28,121 @@ class SpeakerEvent:
     end: float
     slot_id: int
     confidence: float
+
+
+def _compute_lip_motion_score(
+    face_results: list,
+    slot_id: int,
+    start_time: float,
+    end_time: float,
+    face_registry=None,
+) -> float:
+    """Score how much a face's lips are MOVING (not just open).
+
+    Speaking produces rapid lip oscillation (4-8 Hz).
+    Laughing produces sustained opening.
+    This score favors speaking over laughing/yawning.
+
+    Returns: motion score 0.0-1.0
+    """
+    apertures = []
+    for fr in face_results:
+        if fr.timestamp < start_time - 0.5 or fr.timestamp > end_time + 0.5:
+            continue
+        for face in fr.faces:
+            matched = False
+            if face.identity_id >= 0 and face.identity_id == slot_id:
+                matched = True
+            elif face_registry:
+                slot = face_registry.nearest_slot(face.nose_x)
+                if slot and slot.slot_id == slot_id:
+                    matched = True
+            if matched:
+                apertures.append((fr.timestamp, face.lip_aperture))
+                break
+
+    if len(apertures) < 3:
+        return sum(a for _, a in apertures) / max(len(apertures), 1) if apertures else 0.0
+
+    apertures.sort(key=lambda x: x[0])
+
+    # Compute rate of change (derivative)
+    deltas = []
+    for i in range(1, len(apertures)):
+        dt = apertures[i][0] - apertures[i - 1][0]
+        if dt > 0:
+            da = abs(apertures[i][1] - apertures[i - 1][1])
+            deltas.append(da / dt)
+
+    if not deltas:
+        return 0.0
+
+    avg_motion = sum(deltas) / len(deltas)
+    avg_aperture = sum(a for _, a in apertures) / len(apertures)
+
+    # Combined score: motion * aperture weighting
+    # High motion + moderate aperture = speaking (score ~0.5-1.0)
+    # Low motion + high aperture = laughing/yawning (score ~0.2-0.4)
+    motion_score = min(1.0, avg_motion / 0.08)
+    aperture_score = min(1.0, avg_aperture / 0.04)
+
+    return motion_score * 0.6 + aperture_score * 0.4
+
+
+def _compute_lip_audio_sync(
+    face_results: list,
+    slot_id: int,
+    transcript_segment,
+    face_registry=None,
+) -> float:
+    """Score lip-audio synchronization for a face during a transcript segment.
+
+    Computes correlation between word boundaries and lip motion.
+    High sync = this face is actually producing the speech audio.
+
+    Returns: sync score 0.0-1.0
+    """
+    words = getattr(transcript_segment, 'words', None)
+    if not words or len(words) < 2:
+        return 0.5  # Neutral — can't verify
+
+    seg_start = transcript_segment.start if hasattr(transcript_segment, 'start') else transcript_segment.get('start', 0)
+    seg_end = transcript_segment.end if hasattr(transcript_segment, 'end') else transcript_segment.get('end', 0)
+
+    lip_timeline = []
+    for fr in face_results:
+        if fr.timestamp < seg_start - 0.2 or fr.timestamp > seg_end + 0.2:
+            continue
+        for face in fr.faces:
+            matched = (face.identity_id == slot_id) if face.identity_id >= 0 else False
+            if not matched and face_registry:
+                slot = face_registry.nearest_slot(face.nose_x)
+                matched = slot and slot.slot_id == slot_id
+            if matched:
+                lip_timeline.append((fr.timestamp, face.lip_aperture))
+                break
+
+    if len(lip_timeline) < 3:
+        return 0.5
+
+    word_sync_scores = []
+    for w in words:
+        w_start = w.start if hasattr(w, 'start') else w.get('start', 0)
+        w_end = w.end if hasattr(w, 'end') else w.get('end', 0)
+
+        during = [a for t, a in lip_timeline if w_start - 0.1 <= t <= w_end + 0.1]
+        outside = [a for t, a in lip_timeline if t < w_start - 0.1 or t > w_end + 0.1]
+
+        if during and outside:
+            avg_during = sum(during) / len(during)
+            avg_outside = sum(outside) / len(outside)
+            if avg_outside > 0:
+                ratio = avg_during / avg_outside
+                word_sync_scores.append(min(1.0, ratio / 2.0))
+            else:
+                word_sync_scores.append(1.0 if avg_during > 0.02 else 0.0)
+
+    return sum(word_sync_scores) / len(word_sync_scores) if word_sync_scores else 0.5
 
 
 def build_active_speaker_timeline(
@@ -85,14 +201,34 @@ def build_active_speaker_timeline(
                         sid = slot.slot_id
                         if sid not in slot_scores:
                             slot_scores[sid] = []
-                        slot_scores[sid].append(face.lip_aperture)
+                        # Weight by face size — larger faces have more reliable lip data
+                        size_weight = min(2.0, face.width / 8.0)
+                        slot_scores[sid].append(face.lip_aperture * size_weight)
 
             if slot_scores:
-                best_slot_id = max(
-                    slot_scores,
-                    key=lambda sid: sum(slot_scores[sid]) / len(slot_scores[sid])
-                )
-                avg_lar = sum(slot_scores[best_slot_id]) / len(slot_scores[best_slot_id])
+                # Use lip motion score (rate of change) instead of raw aperture
+                slot_motion_scores = {}
+                for sid in slot_scores:
+                    slot_motion_scores[sid] = _compute_lip_motion_score(
+                        face_results, sid, seg_start, seg_end, face_registry
+                    )
+
+                # Audio sync: boost score for face whose lips correlate with words
+                for sid in slot_motion_scores:
+                    sync = _compute_lip_audio_sync(
+                        face_results, sid, seg, face_registry
+                    )
+                    # Sync score 0.5 = neutral, >0.5 = boost, <0.5 = penalty
+                    slot_motion_scores[sid] *= (0.7 + 0.6 * sync)
+
+                # Continuity prior: bias toward previous speaker
+                if events and events[-1].slot_id >= 0:
+                    prev_sid = events[-1].slot_id
+                    if prev_sid in slot_motion_scores:
+                        slot_motion_scores[prev_sid] += CONTINUITY_BONUS
+
+                best_slot_id = max(slot_motion_scores, key=slot_motion_scores.get)
+                avg_lar = slot_motion_scores[best_slot_id]
                 # Only assign a speaker if LAR is above the speaking threshold.
                 # When no one is clearly speaking (both slots have near-zero LAR),
                 # emit slot_id=-1 so the pipeline doesn't incorrectly override
@@ -143,6 +279,53 @@ def build_active_speaker_timeline(
             else:
                 merged.append(ev)
         events = merged
+
+    # ── Dominant speaker momentum ──
+    # If one speaker dominates (>40% of time), require higher confidence
+    # to switch away. This prevents brief reactions/laughing from causing
+    # false speaker switches.
+    if events:
+        cumulative_time: dict[int, float] = {}
+        for ev in events:
+            if ev.slot_id >= 0:
+                cumulative_time[ev.slot_id] = cumulative_time.get(ev.slot_id, 0) + (ev.end - ev.start)
+
+        if cumulative_time:
+            total_time = sum(cumulative_time.values())
+            dominant_slot = max(cumulative_time, key=cumulative_time.get)
+            dominant_frac = cumulative_time[dominant_slot] / max(total_time, 0.1)
+
+            if dominant_frac > 0.4:
+                MIN_SWITCH_CONFIDENCE = 0.5
+                reverted = 0
+                for i in range(1, len(events)):
+                    if (events[i - 1].slot_id == dominant_slot and
+                            events[i].slot_id != dominant_slot and
+                            events[i].confidence < MIN_SWITCH_CONFIDENCE):
+                        events[i] = SpeakerEvent(
+                            start=events[i].start, end=events[i].end,
+                            slot_id=dominant_slot,
+                            confidence=events[i - 1].confidence * 0.9,
+                        )
+                        reverted += 1
+                if reverted > 0:
+                    logger.info(
+                        "Dominant speaker momentum: slot %d (%.0f%% of time), "
+                        "reverted %d low-confidence switches",
+                        dominant_slot, dominant_frac * 100, reverted,
+                    )
+                    # Re-merge after reverting
+                    merged2 = [events[0]]
+                    for ev in events[1:]:
+                        if ev.slot_id == merged2[-1].slot_id and ev.start - merged2[-1].end < 1.0:
+                            merged2[-1] = SpeakerEvent(
+                                start=merged2[-1].start, end=ev.end,
+                                slot_id=ev.slot_id,
+                                confidence=max(merged2[-1].confidence, ev.confidence),
+                            )
+                        else:
+                            merged2.append(ev)
+                    events = merged2
 
     logger.info(
         "Active speaker timeline: %d events, %d unique speakers, avg confidence=%.2f",
@@ -236,21 +419,33 @@ def build_active_speaker_timeline_v2(
             ))
             continue
 
-        # Score each identity by lip aperture during this speech window
+        # Score each identity by lip motion + size-weighted aperture
         identity_scores: dict[int, list[float]] = {}
         for fr in nearby_frames:
             for face in fr.faces:
                 if face.identity_id < 0:
                     continue
-                identity_scores.setdefault(face.identity_id, []).append(face.lip_aperture)
+                size_weight = min(2.0, face.width / 8.0)
+                identity_scores.setdefault(face.identity_id, []).append(
+                    face.lip_aperture * size_weight
+                )
 
         if identity_scores:
-            # Pick identity with highest average lip aperture
-            best_id = max(
-                identity_scores,
-                key=lambda iid: sum(identity_scores[iid]) / len(identity_scores[iid])
-            )
-            avg_lar = sum(identity_scores[best_id]) / len(identity_scores[best_id])
+            # Use lip motion score for each identity
+            id_motion_scores = {}
+            for iid in identity_scores:
+                id_motion_scores[iid] = _compute_lip_motion_score(
+                    face_results, iid, seg_start, seg_end, face_registry
+                )
+
+            # Continuity prior
+            if events and events[-1].slot_id >= 0:
+                prev_sid = events[-1].slot_id
+                if prev_sid in id_motion_scores:
+                    id_motion_scores[prev_sid] += CONTINUITY_BONUS
+
+            best_id = max(id_motion_scores, key=id_motion_scores.get)
+            avg_lar = id_motion_scores[best_id]
 
             # Mark speaking faces
             for fr in nearby_frames:

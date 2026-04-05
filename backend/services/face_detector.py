@@ -661,7 +661,7 @@ def detect_faces_dense(
             "-i", video_path,
             "-vf", (
                 f"fps=1/{sample_rate},"
-                "scale='min(1280,iw)':'min(720,ih)'"
+                "scale='min(1920,iw)':'min(1080,ih)'"
                 ":force_original_aspect_ratio=decrease"
             ),
             "-vsync", "vfr", "-q:v", "5",

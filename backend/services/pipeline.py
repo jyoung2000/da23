@@ -1093,7 +1093,7 @@ async def _run_analysis_inner(job_id: str):
                 face_registry = build_face_registry_with_embeddings(
                     dense_face_results,
                     min_appearances=3,
-                    cosine_threshold=0.35,
+                    cosine_threshold=0.25,
                 )
                 logger.info(
                     "[%s] Face registry built from %d dense frames (embedding-based)",
@@ -1119,6 +1119,38 @@ async def _run_analysis_inner(job_id: str):
                         job_id, JobStatus.EXTRACTING_FRAMES, 15,
                         f"Identified {len(face_registry.slots)} speakers — positions: {slot_info}",
                     )
+            # ── Safety net: ensure all dense faces have identity_id assigned ──
+            if face_registry and face_registry.slots and dense_face_results:
+                unassigned = sum(
+                    1 for fr in dense_face_results for f in fr.faces
+                    if f.identity_id < 0
+                )
+                if unassigned > 0:
+                    logger.warning(
+                        "[%s] %d faces still have identity_id=-1 after registry build — "
+                        "running assign_identities explicitly",
+                        job_id, unassigned,
+                    )
+                    from backend.services.face_registry import assign_identities
+                    assign_identities(dense_face_results, face_registry)
+                    still_unassigned = sum(
+                        1 for fr in dense_face_results for f in fr.faces
+                        if f.identity_id < 0
+                    )
+                    logger.info(
+                        "[%s] After explicit assignment: %d unassigned (was %d)",
+                        job_id, still_unassigned, unassigned,
+                    )
+                else:
+                    assigned_count = sum(
+                        1 for fr in dense_face_results for f in fr.faces
+                        if f.identity_id >= 0
+                    )
+                    logger.info(
+                        "[%s] Identity assignment verified: %d faces have identity_id >= 0",
+                        job_id, assigned_count,
+                    )
+
         except Exception as e:
             logger.warning("[%s] Face registry build failed (non-fatal): %s", job_id, e)
 
@@ -2109,6 +2141,7 @@ async def _run_analysis_inner(job_id: str):
             else:
                 active_speaker_events = build_active_speaker_timeline(
                     _speaker_face_data, transcript, face_registry,
+                    window_seconds=0.5 if dense_face_results else 2.0,
                 )
             if active_speaker_events:
                 logger.info(
