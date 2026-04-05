@@ -26,6 +26,15 @@ class FaceSlot:
     avg_width: float      # Average face width
     avg_height: float     # Average face height
 
+    def __post_init__(self):
+        self.slot_id = int(self.slot_id)
+        self.x_center = float(self.x_center)
+        self.x_min = float(self.x_min)
+        self.x_max = float(self.x_max)
+        self.frame_count = int(self.frame_count)
+        self.avg_width = float(self.avg_width)
+        self.avg_height = float(self.avg_height)
+
 
 @dataclass
 class FaceRegistry:
@@ -278,12 +287,12 @@ def build_face_registry(
 
         slots.append(FaceSlot(
             slot_id=len(slots),
-            x_center=round(median_x, 1),
-            x_min=round(min(x_positions), 1),
-            x_max=round(max(x_positions), 1),
+            x_center=float(round(median_x, 1)),
+            x_min=float(round(min(x_positions), 1)),
+            x_max=float(round(max(x_positions), 1)),
             frame_count=unique_frames,
-            avg_width=round(sum(widths) / len(widths), 1),
-            avg_height=round(sum(heights) / len(heights), 1),
+            avg_width=float(round(sum(widths) / len(widths), 1)),
+            avg_height=float(round(sum(heights) / len(heights), 1)),
         ))
 
     # Sort by x position (left to right)
@@ -344,12 +353,12 @@ def build_face_registry(
 
                     peak_slots.append(FaceSlot(
                         slot_id=len(peak_slots),
-                        x_center=round(median_x, 1),
-                        x_min=round(min(x_positions), 1),
-                        x_max=round(max(x_positions), 1),
+                        x_center=float(round(median_x, 1)),
+                        x_min=float(round(min(x_positions), 1)),
+                        x_max=float(round(max(x_positions), 1)),
                         frame_count=unique_frames,
-                        avg_width=round(sum(widths) / len(widths), 1),
-                        avg_height=round(sum(heights) / len(heights), 1),
+                        avg_width=float(round(sum(widths) / len(widths), 1)),
+                        avg_height=float(round(sum(heights) / len(heights), 1)),
                     ))
 
             if len(peak_slots) >= 2:
@@ -473,12 +482,12 @@ def build_face_registry_with_embeddings(
 
         slots.append(FaceSlot(
             slot_id=len(slots),
-            x_center=round(median_x, 1),
-            x_min=round(min(x_positions), 1),
-            x_max=round(max(x_positions), 1),
+            x_center=float(round(median_x, 1)),
+            x_min=float(round(min(x_positions), 1)),
+            x_max=float(round(max(x_positions), 1)),
             frame_count=unique_frames,
-            avg_width=round(sum(widths) / len(widths), 1),
-            avg_height=round(sum(heights) / len(heights), 1),
+            avg_width=float(round(sum(widths) / len(widths), 1)),
+            avg_height=float(round(sum(heights) / len(heights), 1)),
         ))
 
     # Sort left to right

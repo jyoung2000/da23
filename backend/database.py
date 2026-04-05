@@ -13,6 +13,23 @@ from backend.models import JobResult
 logger = logging.getLogger(__name__)
 
 
+def _numpy_safe_default(obj):
+    """JSON serializer fallback for numpy types that slip through."""
+    try:
+        import numpy as np
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+    except ImportError:
+        pass
+    return str(obj)
+
+
 _file_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -37,7 +54,7 @@ async def save_job(job: JobResult) -> None:
         os.makedirs(directory, exist_ok=True)
         path = _job_path(job.job_id)
         data = job.model_dump(mode="json")
-        content = json.dumps(data, indent=2, default=str)
+        content = json.dumps(data, indent=2, default=_numpy_safe_default)
         # Atomic write: write to temp file then rename to prevent readers
         # from seeing a truncated/empty file during concurrent access.
         fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")

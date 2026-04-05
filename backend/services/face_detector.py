@@ -28,6 +28,20 @@ class FaceInfo:
     is_speaking: bool = False   # Set by active speaker detection
     y_bottom: float = 0.0      # Bottom of face bbox as % of frame (for vertical positioning)
 
+    def __post_init__(self):
+        """Ensure all numeric fields are native Python types, not numpy."""
+        self.x_center = float(self.x_center)
+        self.y_center = float(self.y_center)
+        self.width = float(self.width)
+        self.height = float(self.height)
+        self.nose_x = float(self.nose_x)
+        self.nose_y = float(self.nose_y)
+        self.confidence = float(self.confidence)
+        self.lip_aperture = float(self.lip_aperture)
+        self.identity_id = int(self.identity_id)
+        self.is_speaking = bool(self.is_speaking)
+        self.y_bottom = float(self.y_bottom)
+
 
 @dataclass
 class FrameFaces:
@@ -206,14 +220,14 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence, extract_embeddings=True
                     lip_aperture = abs(mouth_center_y - nose_y_px) / max(fh_px, 1) * 0.3
 
                     faces.append(FaceInfo(
-                        x_center=round(cx, 1),
-                        y_center=round(cy, 1),
-                        width=round(fw_pct, 1),
-                        height=round(fh_pct, 1),
-                        nose_x=round(nose_x_pct, 1),
-                        nose_y=round(nose_y_pct, 1),
-                        confidence=round(float(score), 3),
-                        lip_aperture=round(lip_aperture, 3),
+                        x_center=float(round(cx, 1)),
+                        y_center=float(round(cy, 1)),
+                        width=float(round(fw_pct, 1)),
+                        height=float(round(fh_pct, 1)),
+                        nose_x=float(round(nose_x_pct, 1)),
+                        nose_y=float(round(nose_y_pct, 1)),
+                        confidence=float(round(float(score), 3)),
+                        lip_aperture=float(round(lip_aperture, 3)),
                     ))
 
         elif use_haar:
@@ -255,9 +269,9 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence, extract_embeddings=True
                     pull = min(3.0, fw_pct * 0.15)
                     cx = cx + pull if cx < 50 else cx - pull
                 faces.append(FaceInfo(
-                    x_center=round(cx, 1), y_center=round(cy, 1),
-                    width=round(fw_pct, 1), height=round(fh_pct, 1),
-                    nose_x=round(cx, 1), nose_y=round(cy, 1),
+                    x_center=float(round(cx, 1)), y_center=float(round(cy, 1)),
+                    width=float(round(fw_pct, 1)), height=float(round(fh_pct, 1)),
+                    nose_x=float(round(cx, 1)), nose_y=float(round(cy, 1)),
                     confidence=0.8,  # Haar doesn't provide confidence
                 ))
 

@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Optional, Union
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class JobStatus(str, Enum):
@@ -49,6 +49,29 @@ class SceneDescription(BaseModel):
     has_screen_content: bool = False       # Whether frame contains screen share / slides / text
     primary_object_x: Optional[int] = None # Non-face object tracking position (0-100)
     primary_object_type: Optional[str] = None  # "ball", "product", "hand", "text", etc.
+
+    @model_validator(mode='before')
+    @classmethod
+    def sanitize_numpy_types(cls, data):
+        """Convert numpy types to native Python types before validation."""
+        if isinstance(data, dict):
+            for key in ('subject_x', 'active_speaker_x', 'face_count',
+                        'importance_score', 'primary_object_x'):
+                if key in data and data[key] is not None:
+                    data[key] = int(data[key])
+            if 'timestamp' in data:
+                data['timestamp'] = float(data['timestamp'])
+            if 'face_positions' in data and data['face_positions']:
+                sanitized = []
+                for fp in data['face_positions']:
+                    sanitized.append({
+                        k: (bool(v) if k == 'is_speaking'
+                            else int(v) if isinstance(v, (int, float)) and not isinstance(v, bool)
+                            else v)
+                        for k, v in fp.items()
+                    })
+                data['face_positions'] = sanitized
+        return data
 
 
 class WordTimestamp(BaseModel):

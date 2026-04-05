@@ -1599,7 +1599,7 @@ async def _run_analysis_inner(job_id: str):
                 sx = scene.subject_x
                 min_dist_to_slot = min(abs(sx - sc) for sc in slot_centers)
                 if min_dist_to_slot > snap_threshold:
-                    nearest = round(min(slot_centers, key=lambda sc: abs(sc - sx)))
+                    nearest = int(round(min(slot_centers, key=lambda sc: abs(sc - sx))))
                     scene.subject_x = nearest
                     corrected += 1
             if corrected > 0:
@@ -1638,7 +1638,7 @@ async def _run_analysis_inner(job_id: str):
                         best_dist = dist
                         best_sx = other.subject_x
                 if best_sx is not None:
-                    scene.subject_x = best_sx
+                    scene.subject_x = int(best_sx)
                     fixed_center += 1
             if fixed_center > 0:
                 logger.info(
@@ -2005,7 +2005,7 @@ async def _run_analysis_inner(job_id: str):
                             if abs(obj_t - scene.timestamp) < 2.0:
                                 scene.primary_object_x = obj_sx
                                 scene.primary_object_type = "saliency"
-                                scene.subject_x = obj_sx
+                                scene.subject_x = int(obj_sx)
                                 break
         except Exception as e:
             logger.warning("[%s] Object tracking failed (non-fatal): %s", job_id, e)
@@ -2027,23 +2027,23 @@ async def _run_analysis_inner(job_id: str):
                     best_dist = dist
                     best_dfr = dfr
             if best_dfr and best_dfr.faces:
-                scene.face_count = len(best_dfr.faces)
+                scene.face_count = int(len(best_dfr.faces))
                 scene.face_positions = [
                     {
-                        "slot_id": f.identity_id,
-                        "x": round(f.nose_x, 1),
-                        "y": round(f.nose_y, 1),
-                        "w": round(f.width, 1),
-                        "h": round(f.height, 1),
-                        "is_speaking": f.is_speaking,
-                        "identity_id": f.identity_id,
+                        "slot_id": int(f.identity_id),
+                        "x": int(round(f.nose_x)),
+                        "y": int(round(f.nose_y)),
+                        "w": int(round(f.width)),
+                        "h": int(round(f.height)),
+                        "is_speaking": bool(f.is_speaking),
+                        "identity_id": int(f.identity_id),
                     }
                     for f in best_dfr.faces
                 ]
                 if best_dfr.primary_face_idx >= 0:
                     primary = best_dfr.faces[best_dfr.primary_face_idx]
                     old_sx = scene.subject_x
-                    scene.subject_x = round(primary.nose_x)
+                    scene.subject_x = int(round(primary.nose_x))
                     if abs(old_sx - scene.subject_x) > 5:
                         enriched += 1
         if enriched > 0:
@@ -2116,7 +2116,7 @@ async def _run_analysis_inner(job_id: str):
                                 continue  # Skip low-confidence corrections
                             slot = face_registry.slot_by_id(active_slot_id)
                             if slot and abs(scene.subject_x - slot.x_center) > 15:
-                                scene.subject_x = round(slot.x_center)
+                                scene.subject_x = int(round(slot.x_center))
                                 lip_corrected += 1
                     if lip_corrected > 0:
                         logger.info(
@@ -2282,7 +2282,31 @@ async def _run_analysis_inner(job_id: str):
                     f"Per-second tracking ready: {len(scenes)} total scenes ({synthetic_count} from face detection + {len(scenes) - synthetic_count} from AI)",
                 )
         except Exception as e:
-            logger.warning("[%s] Per-second scene synthesis failed (non-fatal): %s", job_id, e)
+            logger.error(
+                "[%s] Per-second scene synthesis save FAILED: %s — "
+                "This means the frontend will only receive %d AI scenes instead of %d total. "
+                "Subject tracking will be degraded (isDense=false).",
+                job_id, e, len([s for s in scenes if s.description != '[dense face tracking]']), len(scenes),
+            )
+            # Attempt sanitization and retry
+            try:
+                for scene in scenes:
+                    scene.subject_x = int(scene.subject_x)
+                    if scene.active_speaker_x is not None:
+                        scene.active_speaker_x = int(scene.active_speaker_x)
+                    scene.face_count = int(scene.face_count)
+                    scene.timestamp = float(scene.timestamp)
+                    scene.face_positions = [
+                        {k: (bool(v) if k == 'is_speaking'
+                             else int(v) if isinstance(v, (int, float)) and not isinstance(v, bool)
+                             else v)
+                         for k, v in fp.items()}
+                        for fp in scene.face_positions
+                    ]
+                await database.update_job_status(job_id, scenes=list(scenes))
+                logger.info("[%s] Per-second scene save SUCCEEDED on retry after sanitization", job_id)
+            except Exception as e2:
+                logger.error("[%s] Per-second scene save FAILED even after sanitization: %s", job_id, e2)
 
     # ── Speaker → Face Slot Mapping ──
     if face_registry and face_registry.multi_speaker and transcript:
