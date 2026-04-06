@@ -2347,18 +2347,29 @@ async def _run_analysis_inner(job_id: str):
                 slot_id, speaker_source = _get_speaker_at_time(dfr.timestamp)
                 source_counts[speaker_source] = source_counts.get(speaker_source, 0) + 1
                 chosen_face = None
+                identity_matched = False
 
                 if slot_id >= 0:
                     # Find face matching the active speaker's slot
                     for f in dfr.faces:
                         if f.identity_id == slot_id:
                             chosen_face = f
+                            identity_matched = True
                             break
-                    if not chosen_face and face_registry:
-                        slot = face_registry.slot_by_id(slot_id)
-                        if slot:
-                            chosen_face = min(dfr.faces,
-                                key=lambda f: abs(f.nose_x - slot.x_center))
+                    if not chosen_face:
+                        # Identity not found — different camera angle (e.g., 2-person couch
+                        # shot where nobody sits at the panel center position).
+                        # Prefer face with highest lip aperture (most likely actually speaking)
+                        # over nearest-to-slot-center (which picks the wrong person).
+                        speaking_faces = [f for f in dfr.faces if f.lip_aperture > 0.03]
+                        if speaking_faces:
+                            chosen_face = max(speaking_faces,
+                                key=lambda f: f.lip_aperture * min(2.0, f.width / 8.0))
+                        elif face_registry:
+                            slot = face_registry.slot_by_id(slot_id)
+                            if slot:
+                                chosen_face = min(dfr.faces,
+                                    key=lambda f: abs(f.nose_x - slot.x_center))
 
                 # Fallback: largest face (most reliable in multi-speaker panels)
                 if not chosen_face and dfr.faces:
@@ -2366,23 +2377,19 @@ async def _run_analysis_inner(job_id: str):
                         key=lambda f: f.width * (f.height if hasattr(f, 'height') else f.width))
 
                 if chosen_face:
-                    # ── AutoFlip-style slot center snapping ──
-                    # For multi-speaker panels, use the stable slot center instead
-                    # of raw per-frame nose_x. The slot center is median of hundreds
-                    # of frames — much more stable than individual detections.
-                    # Only use raw nose_x for single-face close-ups where precise
-                    # tracking matters and there's no slot ambiguity.
                     is_closeup = (len(dfr.faces) == 1 and chosen_face.width > 12.0)
 
                     if is_closeup:
                         sx_val = int(round(chosen_face.nose_x))
-                    elif slot_id >= 0 and face_registry:
+                    elif slot_id >= 0 and face_registry and identity_matched:
+                        # Identity matched — use the assigned slot center (stable)
                         slot = face_registry.slot_by_id(slot_id)
                         if slot:
                             sx_val = int(round(slot.x_center))
                         else:
                             sx_val = int(round(chosen_face.nose_x))
                     elif face_registry and face_registry.multi_speaker:
+                        # Identity NOT matched — use the face's OWN slot center
                         slot = face_registry.nearest_slot(chosen_face.nose_x)
                         if slot:
                             sx_val = int(round(slot.x_center))
@@ -2418,9 +2425,12 @@ async def _run_analysis_inner(job_id: str):
                     synthetic_count += 1
 
             logger.info(
-                "[%s] Per-second speaker sources: %d transcript-driven, %d lip-based, %d fallback",
+                "[%s] Per-second speaker sources: %d transcript-driven, %d lip-based, "
+                "%d lip-override, %d fallback",
                 job_id, source_counts.get('transcript', 0),
-                source_counts.get('lip', 0), source_counts.get('none', 0),
+                source_counts.get('lip', 0),
+                source_counts.get('lip-override', 0),
+                source_counts.get('none', 0),
             )
 
             # ── Temporal hold: minimum speaker duration ──
