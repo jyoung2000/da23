@@ -482,12 +482,17 @@ async def extract_frames(
         except asyncio.TimeoutError:
             logger.warning("GPU quick-test timed out after 15s — removing GPU from fallback chain")
             attempts = [a for a in attempts if a[2] != "GPU+scene"]
-            # Kill the timed-out process
+            # Kill the timed-out process (may have already exited)
             try:
                 qt_proc.terminate()
                 await asyncio.wait_for(qt_proc.wait(), timeout=5)
+            except ProcessLookupError:
+                pass  # Process already exited
             except Exception:
-                qt_proc.kill()
+                try:
+                    qt_proc.kill()
+                except ProcessLookupError:
+                    pass  # Process already exited
         except Exception as e:
             logger.warning("GPU quick-test error: %s — removing GPU from fallback chain", e)
             attempts = [a for a in attempts if a[2] != "GPU+scene"]

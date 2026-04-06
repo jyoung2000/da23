@@ -6071,6 +6071,8 @@ async def export_clip(
 
             # ── Frontend keyframe override: use preview player's exact keyframes ──
             if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
+                _avg_face_y = 50.0
+                _avg_face_w = 0.0
                 keyframes = [
                     (round(kf.get("time", 0), 3), int(round(kf.get("x", 50))))
                     for kf in frontend_subject_keyframes
