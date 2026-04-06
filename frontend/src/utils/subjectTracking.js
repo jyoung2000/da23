@@ -183,7 +183,7 @@ export function buildSpeakerKeyframes(transcript, speakerMap, clipStart, clipEnd
  * @param {number} maxClusters - Maximum clusters to detect (default 6)
  * @returns {Array<{center: number, count: number}>|null} Sorted clusters or null
  */
-export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterSize = 2) {
+export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterSize = 2, skipCenterStrip = false) {
   if (!keyframes || keyframes.length < 4) return null;
 
   const xs = keyframes.map(k => k.x);
@@ -236,11 +236,14 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
     // is likely an averaging artifact (e.g., merged face detection spanning
     // both speakers). Remove it.
     if (result.length >= 3) {
+      const totalCount = result.reduce((sum, c) => sum + c.count, 0);
       for (let i = result.length - 2; i >= 1; i--) {
         const mid = (result[i - 1].center + result[i + 1].center) / 2;
         const span = result[i + 1].center - result[i - 1].center;
+        // Never reject a cluster with 20%+ of total keyframes (e.g., center speaker)
         if (Math.abs(result[i].center - mid) < span * 0.3 &&
-            result[i].count < Math.max(result[i - 1].count, result[i + 1].count)) {
+            result[i].count < Math.max(result[i - 1].count, result[i + 1].count) &&
+            result[i].count < totalCount * 0.2) {
           result.splice(i, 1);
         }
       }
@@ -257,29 +260,35 @@ export function detectPositionClusters(keyframes, gapThreshold = 10, minClusterS
 
   const result1 = buildResult(splitCluster(xs));
 
-  // Pass 2: Strip center noise zone [47, 53]
-  const CENTER_LO = 47, CENTER_HI = 53;
-  const nonCenter = xs.filter(x => x < CENTER_LO || x > CENTER_HI);
-  const centerCount = xs.length - nonCenter.length;
+  // Pass 2 & 3: Strip center noise zone — ONLY for sparse AI data.
+  // Dense face tracking (per-second) uses actual face positions from slot centers,
+  // not AI vision defaults. Stripping center values from dense data deletes real
+  // speaker positions (e.g., a center speaker at 53% in a multi-person panel).
   let result2 = null;
-  if (centerCount > xs.length * 0.10 && nonCenter.length >= minClusterSize * 2) {
-    const hasLeft = nonCenter.some(x => x < CENTER_LO);
-    const hasRight = nonCenter.some(x => x > CENTER_HI);
-    if (hasLeft && hasRight) {
-      result2 = buildResult(splitCluster(nonCenter));
-    }
-  }
-
-  // Pass 3: Aggressive strip [44, 56]
-  const WIDE_LO = 44, WIDE_HI = 56;
-  const farFromCenter = xs.filter(x => x < WIDE_LO || x > WIDE_HI);
-  const wideCount = xs.length - farFromCenter.length;
   let result3 = null;
-  if (wideCount > xs.length * 0.15 && farFromCenter.length >= minClusterSize * 2) {
-    const hasLeft = farFromCenter.some(x => x < WIDE_LO);
-    const hasRight = farFromCenter.some(x => x > WIDE_HI);
-    if (hasLeft && hasRight) {
-      result3 = buildResult(splitCluster(farFromCenter));
+  if (!skipCenterStrip) {
+    // Pass 2: Strip center noise zone [47, 53]
+    const CENTER_LO = 47, CENTER_HI = 53;
+    const nonCenter = xs.filter(x => x < CENTER_LO || x > CENTER_HI);
+    const centerCount = xs.length - nonCenter.length;
+    if (centerCount > xs.length * 0.10 && nonCenter.length >= minClusterSize * 2) {
+      const hasLeft = nonCenter.some(x => x < CENTER_LO);
+      const hasRight = nonCenter.some(x => x > CENTER_HI);
+      if (hasLeft && hasRight) {
+        result2 = buildResult(splitCluster(nonCenter));
+      }
+    }
+
+    // Pass 3: Aggressive strip [44, 56]
+    const WIDE_LO = 44, WIDE_HI = 56;
+    const farFromCenter = xs.filter(x => x < WIDE_LO || x > WIDE_HI);
+    const wideCount = xs.length - farFromCenter.length;
+    if (wideCount > xs.length * 0.15 && farFromCenter.length >= minClusterSize * 2) {
+      const hasLeft = farFromCenter.some(x => x < WIDE_LO);
+      const hasRight = farFromCenter.some(x => x > WIDE_HI);
+      if (hasLeft && hasRight) {
+        result3 = buildResult(splitCluster(farFromCenter));
+      }
     }
   }
 
@@ -829,9 +838,10 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   // This works WITHOUT audio diarization — catches multi-speaker scenarios
   // even when Whisper only detects 1 speaker, by finding position clusters
   // in the scene analysis subject_x values.
-  const clusters = detectPositionClusters(raw);
-
   const isDenseData = raw.length >= 100;  // Per-second dense face detection
+  // For dense data, skip center-stripping — values come from actual face positions,
+  // not noisy AI defaults. A speaker at 53% is real, not center noise.
+  const clusters = detectPositionClusters(raw, 10, 2, isDenseData);
 
   console.log(
     `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}, isDense=${isDenseData}`,
@@ -1013,8 +1023,21 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
         // Find raw keyframes near this time with valid px
         const nearbyRaw = raw.filter(r => Math.abs(r.t - kf.t) < 1.5 && r.px !== undefined);
         if (nearbyRaw.length === 0) continue;
-        // Only use px values close to the cluster center (same speaker, not contamination)
-        const validPx = nearbyRaw.filter(r => Math.abs(r.px - kf.x) <= 15);
+        // Guard radius = half distance to nearest other cluster (prevents cross-contamination)
+        let guardRadius = 15;
+        if (clusters && clusters.length >= 2) {
+          let minClusterDist = Infinity;
+          for (const c of clusters) {
+            if (c.center !== kf.x) {
+              const d = Math.abs(c.center - kf.x);
+              if (d < minClusterDist) minClusterDist = d;
+            }
+          }
+          if (minClusterDist < Infinity) {
+            guardRadius = Math.max(5, Math.floor(minClusterDist / 2));
+          }
+        }
+        const validPx = nearbyRaw.filter(r => Math.abs(r.px - kf.x) <= guardRadius);
         if (validPx.length === 0) continue;
         const nearest = validPx.reduce((best, r) =>
           Math.abs(r.t - kf.t) < Math.abs(best.t - kf.t) ? r : best
