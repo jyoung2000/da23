@@ -2520,43 +2520,43 @@ async def _run_analysis_inner(job_id: str):
                 source_counts.get('none', 0),
             )
 
-            # ── Temporal hold: minimum speaker duration ──
-            # Prevent rapid oscillation between speaker positions.
-            # If a speaker appears for <2 seconds surrounded by a different
-            # speaker, merge into the surrounding speaker's position.
+            # ── Temporal hold: smooth isolated detection gaps only ──
+            # Only smooth when a single scene disagrees with BOTH neighbors
+            # AND those neighbors have the SAME speaker position. This catches
+            # face detection dropouts (momentary tracking loss) without
+            # suppressing genuine brief speaker interjections.
             if synthetic_count > 10 and face_registry and face_registry.multi_speaker:
                 synth_scenes = [s for s in scenes if s.description == "[dense face tracking]"]
                 synth_scenes.sort(key=lambda s: s.timestamp)
 
-                MIN_HOLD_SECONDS = 2.5
                 smoothed = 0
-                # Multi-pass: repeat until stable (cascading blips get
-                # caught in subsequent passes)
-                for _pass in range(3):
-                    changed_this_pass = 0
-                    i = 1
-                    while i < len(synth_scenes) - 1:
-                        prev_sx = synth_scenes[i - 1].subject_x
-                        curr_sx = synth_scenes[i].subject_x
-                        next_sx = synth_scenes[i + 1].subject_x
+                i = 1
+                while i < len(synth_scenes) - 1:
+                    prev_sx = synth_scenes[i - 1].subject_x
+                    curr_sx = synth_scenes[i].subject_x
+                    next_sx = synth_scenes[i + 1].subject_x
 
-                        dt = synth_scenes[i + 1].timestamp - synth_scenes[i].timestamp
-                        if dt < MIN_HOLD_SECONDS and abs(curr_sx - prev_sx) > 10 and abs(curr_sx - next_sx) > 10:
-                            synth_scenes[i].subject_x = prev_sx
-                            if synth_scenes[i].active_speaker_x is not None:
-                                synth_scenes[i].active_speaker_x = prev_sx
-                            if synth_scenes[i].precise_x is not None:
-                                synth_scenes[i].precise_x = prev_sx
-                            changed_this_pass += 1
-                        i += 1
-                    smoothed += changed_this_pass
-                    if changed_this_pass == 0:
-                        break
+                    dt = synth_scenes[i + 1].timestamp - synth_scenes[i].timestamp
+                    # Only smooth if: neighbors agree with each other (same speaker),
+                    # current disagrees (detection gap), and it's a single sample (≤1s)
+                    is_isolated_gap = (
+                        abs(prev_sx - next_sx) <= 10 and  # neighbors same speaker
+                        abs(curr_sx - prev_sx) > 10 and   # current is different
+                        dt <= 1.0                          # single sample
+                    )
+                    if is_isolated_gap:
+                        synth_scenes[i].subject_x = prev_sx
+                        if synth_scenes[i].active_speaker_x is not None:
+                            synth_scenes[i].active_speaker_x = prev_sx
+                        if synth_scenes[i].precise_x is not None:
+                            synth_scenes[i].precise_x = prev_sx
+                        smoothed += 1
+                    i += 1
 
                 if smoothed > 0:
                     logger.info(
-                        "[%s] Temporal hold: smoothed %d brief speaker blips (<%ss, %d passes)",
-                        job_id, smoothed, MIN_HOLD_SECONDS, _pass + 1,
+                        "[%s] Temporal hold: smoothed %d isolated detection gaps (≤1s, neighbors agree)",
+                        job_id, smoothed,
                     )
 
             if synthetic_count > 0:

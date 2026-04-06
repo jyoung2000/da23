@@ -882,39 +882,64 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }
     }
 
-    // ── Anti-jitter: minimum hold duration ──
-    // After snapping to clusters, single-frame noise creates rapid oscillations
-    // like [40, 65, 40] where the 65 holds for only 1-2 seconds. Merge brief
-    // holds into the surrounding position.
-    const MIN_HOLD_SECONDS = isDenseData ? 1.0 : 2.0;
-    if (deduped.length >= 3) {
-      // Pass 1: remove brief blips where surrounding positions are the same
-      let i = 1;
-      while (i < deduped.length - 1) {
-        const nextT = deduped[i + 1].t;
-        const holdDuration = nextT - deduped[i].t;
-        if (holdDuration < MIN_HOLD_SECONDS && deduped[i - 1].x === deduped[i + 1].x) {
-          deduped.splice(i, 1);
-        } else {
-          i++;
+    // ── Anti-jitter: filter detection noise ──
+    // For dense data: only remove isolated single-sample blips (≤1s) where
+    // both neighbors have the same position (face detection artifact, not a
+    // real speaker change). Real speaker changes — even brief 1s ones — are
+    // preserved for fluid responsive reframing.
+    // For sparse AI data: use minimum hold to suppress noisy scene descriptions.
+    if (isDenseData) {
+      if (deduped.length >= 3) {
+        let noiseRemoved = 0;
+        let ni = 1;
+        while (ni < deduped.length - 1) {
+          const holdDuration = deduped[ni + 1].t - deduped[ni].t;
+          const isIsolatedBlip = (
+            deduped[ni - 1].x === deduped[ni + 1].x &&  // neighbors agree
+            deduped[ni].x !== deduped[ni - 1].x &&       // this one disagrees
+            holdDuration <= 1.0                            // single sample (≤1s)
+          );
+          if (isIsolatedBlip) {
+            deduped.splice(ni, 1);
+            noiseRemoved++;
+          } else {
+            ni++;
+          }
+        }
+        if (noiseRemoved > 0) {
+          console.log(`[SubjectTracking] Noise filter: removed ${noiseRemoved} isolated detection blips (≤1s)`);
         }
       }
-    }
-    if (deduped.length >= 3) {
-      // Pass 2: extend dominant position over any remaining short holds
-      let i = 1;
-      while (i < deduped.length - 1) {
-        const nextT = deduped[i + 1].t;
-        const holdDuration = nextT - deduped[i].t;
-        if (holdDuration < MIN_HOLD_SECONDS) {
-          deduped[i].x = deduped[i - 1].x;
-          if (deduped[i].x === deduped[i - 1].x) {
+    } else {
+      // Sparse AI data: use minimum hold duration to suppress noise
+      const MIN_HOLD_SECONDS = 2.0;
+      if (deduped.length >= 3) {
+        let i = 1;
+        while (i < deduped.length - 1) {
+          const nextT = deduped[i + 1].t;
+          const holdDuration = nextT - deduped[i].t;
+          if (holdDuration < MIN_HOLD_SECONDS && deduped[i - 1].x === deduped[i + 1].x) {
             deduped.splice(i, 1);
           } else {
             i++;
           }
-        } else {
-          i++;
+        }
+      }
+      if (deduped.length >= 3) {
+        let i = 1;
+        while (i < deduped.length - 1) {
+          const nextT = deduped[i + 1].t;
+          const holdDuration = nextT - deduped[i].t;
+          if (holdDuration < MIN_HOLD_SECONDS) {
+            deduped[i].x = deduped[i - 1].x;
+            if (deduped[i].x === deduped[i - 1].x) {
+              deduped.splice(i, 1);
+            } else {
+              i++;
+            }
+          } else {
+            i++;
+          }
         }
       }
     }
@@ -935,9 +960,10 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       );
     });
     const isStaticContent = Math.max(...clusterVariances) < 5;
-    if (isStaticContent && deduped.length >= 3) {
-      // STATIONARY MODE: extend minimum hold to 3s for rock-solid stability
-      const STATIC_MIN_HOLD = isDenseData ? 1.5 : 3.0;
+    // STATIONARY MODE: for sparse AI data only, extend minimum hold for stability.
+    // Dense data tracks every speaker change responsively — no suppression.
+    if (!isDenseData && isStaticContent && deduped.length >= 3) {
+      const STATIC_MIN_HOLD = 3.0;
       let si = 1;
       while (si < deduped.length - 1) {
         const holdDuration = deduped[si + 1].t - deduped[si].t;
@@ -1000,14 +1026,13 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }));
     }
 
-    // ── Post-bounds minimum hold filter ──
-    // After scene cuts and bounds enforcement, remove any remaining sub-threshold
-    // holds that create visible micro-jumps. handleSceneCuts may have inserted
-    // 1ms transition pairs — those are fine. This targets real holds < 1.5s.
-    if (result.length >= 3) {
-      const POST_MIN_HOLD = isDenseData ? 1.5 : 2.0;
+    // ── Post-bounds blip filter (sparse AI data only) ──
+    // For sparse data, remove sub-threshold holds that create visible micro-jumps.
+    // For dense data, all speaker changes are preserved — noise was already
+    // filtered by the detection-noise filter above.
+    if (!isDenseData && result.length >= 3) {
+      const POST_MIN_HOLD = 2.0;
       let beforeCount = result.length;
-      // Pass 1: remove blips surrounded by same position
       let ri = 1;
       while (ri < result.length - 1) {
         const hold = result[ri + 1].t - result[ri].t;
@@ -1017,13 +1042,11 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
           ri++;
         }
       }
-      // Pass 2: merge remaining short holds into previous
       ri = 1;
       while (ri < result.length - 1) {
         const hold = result[ri + 1].t - result[ri].t;
         if (hold > 0.01 && hold < POST_MIN_HOLD) {
           result[ri].x = result[ri - 1].x;
-          // Deduplicate if now matches previous
           if (result[ri].x === result[ri - 1].x) {
             result.splice(ri, 1);
           } else {
