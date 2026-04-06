@@ -7176,7 +7176,115 @@ async def export_clip(
                     ])
                 ]
                 _error_msg = "\n".join(_error_lines[-5:]) if _error_lines else _stderr_text[-1500:]
-                raise RuntimeError(f"Clip export failed:\n{_error_msg}")
+
+                # ── GPU→CPU fallback: if CUDA/NVENC failed, retry with software encoding ──
+                _cuda_errors = ["cuda_error", "cuinit", "nvenc", "device creation failed", "hwdevice"]
+                _is_gpu_error = any(e in _stderr_text.lower() for e in _cuda_errors)
+                _using_gpu = any(
+                    arg in cmd for arg in ["h264_nvenc", "hevc_nvenc", "-hwaccel", "cuda"]
+                )
+                if _is_gpu_error and _using_gpu:
+                    logger.warning(
+                        "GPU encoding failed for clip %s — retrying with CPU (libx264). Error: %s",
+                        clip_id, _error_msg[:200],
+                    )
+                    await _notify(f"GPU encoding failed — retrying clip {clip_id} with CPU encoding...")
+                    # Rebuild command: strip GPU args, use CPU encoder
+                    cpu_cmd = []
+                    skip_next = False
+                    for ci, arg in enumerate(cmd):
+                        if skip_next:
+                            skip_next = False
+                            continue
+                        # Remove GPU decode args
+                        if arg in ("-hwaccel", "-hwaccel_output_format"):
+                            skip_next = True
+                            continue
+                        if arg in ("cuda", "cuvid"):
+                            continue
+                        # Replace GPU encoder with CPU
+                        if arg in ("h264_nvenc", "hevc_nvenc"):
+                            cpu_cmd.append("libx264")
+                            continue
+                        # Remove NVENC-specific args
+                        if arg in ("-gpu", "-rc", "-rc:v", "-spatial_aq", "-temporal_aq",
+                                   "-b_ref_mode", "-weighted_pred"):
+                            skip_next = True
+                            continue
+                        if arg in ("1", "middle", "vbr", "vbr_hq"):
+                            # Could be a value for a skipped arg; but if we're not
+                            # skipping, keep it. This is handled by skip_next above.
+                            pass
+                        cpu_cmd.append(arg)
+                    # Ensure CPU encoder settings
+                    if "-pix_fmt" not in cpu_cmd:
+                        # Insert before output path
+                        cpu_cmd.insert(-1, "-pix_fmt")
+                        cpu_cmd.insert(-1, "yuv420p")
+                    if "-crf" not in cpu_cmd:
+                        cpu_cmd.insert(-1, "-crf")
+                        cpu_cmd.insert(-1, str(qp.get("crf", 23)))
+                    if "-preset" not in cpu_cmd:
+                        cpu_cmd.insert(-1, "-preset")
+                        cpu_cmd.insert(-1, qp.get("preset", "medium"))
+                    # Remove any leftover NVENC quality args
+                    cpu_cmd = [a for a in cpu_cmd if a not in ("-qp", "-qmin", "-qmax")]
+
+                    logger.info("FFmpeg CPU retry command for clip %s: %s", clip_id, " ".join(cpu_cmd))
+
+                    # Delete failed output
+                    if os.path.exists(output_path):
+                        try:
+                            os.unlink(output_path)
+                        except OSError:
+                            pass
+
+                    proc2 = await asyncio.create_subprocess_exec(
+                        *cpu_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _enc_start2 = _time.monotonic()
+                    _stderr_chunks2: list[bytes] = []
+
+                    async def _drain_stderr2():
+                        while True:
+                            chunk = await proc2.stderr.read(8192)
+                            if not chunk:
+                                break
+                            _stderr_chunks2.append(chunk)
+
+                    _stderr_task2 = asyncio.create_task(_drain_stderr2())
+                    async for _line2 in proc2.stdout:
+                        _line2_str = _line2.decode("utf-8", errors="replace").strip()
+                        if _line2_str.startswith("out_time_us="):
+                            try:
+                                _us2 = int(_line2_str.split("=", 1)[1])
+                                if _us2 > 0:
+                                    _current_out_time = _us2 / 1_000_000
+                            except (ValueError, IndexError):
+                                pass
+                        _now2 = _time.monotonic()
+                        if _now2 - _last_notify_time >= 2.0:
+                            _last_notify_time = _now2
+                            if cancel_event and cancel_event.is_set():
+                                proc2.kill()
+                                await proc2.wait()
+                                raise asyncio.CancelledError("Export cancelled by user")
+                            if _current_out_time > 0.5 and _clip_dur > 0:
+                                _pct2 = min(99, int(_current_out_time / _clip_dur * 100))
+                                _elapsed2 = int(_now2 - _enc_start2)
+                                await _notify(f"Encoding clip {clip_id} [CPU libx264]... {_pct2}% ({_elapsed2}s elapsed)")
+
+                    await proc2.wait()
+                    await _stderr_task2
+                    stderr2 = b"".join(_stderr_chunks2)
+                    if proc2.returncode != 0:
+                        _stderr2_text = stderr2.decode(errors="replace")[-1500:]
+                        raise RuntimeError(f"Clip export failed (CPU retry):\n{_stderr2_text}")
+                    logger.info("CPU retry succeeded for clip %s", clip_id)
+                else:
+                    raise RuntimeError(f"Clip export failed:\n{_error_msg}")
         else:
             # No filters — use stream copy for speed
             await _notify(f"Exporting clip {clip_id} (stream copy — fast mode)")
