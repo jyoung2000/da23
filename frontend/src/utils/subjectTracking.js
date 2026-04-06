@@ -1014,65 +1014,17 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }
     }
 
-    // ── Per-CLUSTER precise face centering for dense data ──
-    // Compute a single stable precise_x per cluster (median of all raw px values
-    // belonging to that cluster). This gives face-accurate centering without
-    // per-frame jitter that causes visible panning within hold segments.
-    // Cluster snap determines WHICH speaker. Cluster median px determines
-    // WHERE to center the crop — stable but more accurate than slot center.
+    // ── Per-cluster precise face centering ──
+    // For dense data: the backend already slot-center-snaps to stable positions
+    // computed from hundreds of face detections. No frontend override needed.
+    // The px values from raw keyframes include noisy sparse AI scenes that
+    // pull medians away from correct positions (e.g., cluster 24 → median 15).
+    // For sparse data: could apply per-cluster median, but not needed since
+    // sparse data uses Phase 3 smoothing instead of Phase 1 clustering.
     if (isDenseData && clusters) {
-      const range = srcRatio && targetRatio ? computeSafeRange(srcRatio, targetRatio) : { min: 0, max: 100 };
-
-      // Build per-cluster median px from ALL raw keyframes
-      const clusterPx = new Map();
-      for (const c of clusters) {
-        // Collect px values from raw keyframes assigned to this cluster
-        const memberPxValues = [];
-        // Guard radius: half the distance to nearest other cluster center
-        let guardRadius = 15;
-        for (const otherC of clusters) {
-          if (otherC !== c) {
-            const d = Math.abs(otherC.center - c.center);
-            guardRadius = Math.min(guardRadius, Math.max(5, Math.floor(d / 2)));
-          }
-        }
-        for (const r of raw) {
-          if (r.px === undefined) continue;
-          // Assign to nearest cluster
-          let nearest = clusters[0];
-          let nearestDist = Math.abs(r.x - clusters[0].center);
-          for (let ci = 1; ci < clusters.length; ci++) {
-            const d = Math.abs(r.x - clusters[ci].center);
-            if (d < nearestDist) { nearestDist = d; nearest = clusters[ci]; }
-          }
-          if (nearest === c) {
-            // Only include px values within guard radius of cluster center
-            // This filters out outlier face positions from noisy sparse AI scenes
-            if (Math.abs(r.px - c.center) <= guardRadius) {
-              memberPxValues.push(r.px);
-            }
-          }
-        }
-        if (memberPxValues.length > 0) {
-          // Use median for stability (resists outliers better than mean)
-          memberPxValues.sort((a, b) => a - b);
-          const medianPx = memberPxValues[Math.floor(memberPxValues.length / 2)];
-          clusterPx.set(c.center, Math.max(range.min, Math.min(range.max, Math.round(medianPx))));
-        }
-        // If no valid px values within guard radius, don't override — keep cluster center
-      }
-
-      // Apply per-cluster median px to all result keyframes
-      for (const kf of result) {
-        const clusterMedian = clusterPx.get(kf.x);
-        if (clusterMedian !== undefined) {
-          kf.x = clusterMedian;
-        }
-      }
-
-      const uniqueX = [...new Set(result.map(kf => kf.x))].sort((a, b) => a - b);
-      console.log('[SubjectTracking] Precise face centering (per-cluster median):', uniqueX,
-        'cluster medians:', Object.fromEntries(clusterPx));
+      // Log cluster positions for debugging (no override applied)
+      console.log('[SubjectTracking] Dense data: using cluster centers directly (no px override)',
+        clusters.map(c => c.center));
     }
 
     // ── QA validation: fix extended center holds and missing instant cuts ──
