@@ -955,7 +955,8 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     // ── Fix initial snap: don't start at center default ──
     // If the first keyframe is in the center noise zone (44-56), it's likely
     // a title card or default. Snap to the first non-center value's cluster.
-    if (deduped.length > 0 && deduped[0].x >= 44 && deduped[0].x <= 56) {
+    // SKIP for dense data — center values are real speaker positions, not noise.
+    if (!isDenseData && deduped.length > 0 && deduped[0].x >= 44 && deduped[0].x <= 56) {
       const firstReal = raw.find(kf => kf.x < 44 || kf.x > 56);
       if (firstReal) {
         let nearestCenter = clusters[0].center;
@@ -989,7 +990,8 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     }
 
     // ── Fix leading center keyframes after bounds enforcement ──
-    if (result.length > 0) {
+    // SKIP for dense data — center values are real speaker positions, not noise.
+    if (!isDenseData && result.length > 0) {
       const firstRealKf = raw.find(kf => kf.x < 44 || kf.x > 56);
       if (firstRealKf) {
         let bestCenter = clusters[0].center;
@@ -1012,40 +1014,52 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }
     }
 
-    // ── Per-keyframe precise face centering for dense data ──
-    // Use the active speaker's actual face position from dense detection.
-    // Cluster snap determines WHICH speaker (instant cut logic).
-    // Precise_x determines WHERE to center the crop on that speaker's face.
-    // Only applies when px is within ±15% of cluster center (same speaker).
-    if (isDenseData) {
+    // ── Per-CLUSTER precise face centering for dense data ──
+    // Compute a single stable precise_x per cluster (median of all raw px values
+    // belonging to that cluster). This gives face-accurate centering without
+    // per-frame jitter that causes visible panning within hold segments.
+    // Cluster snap determines WHICH speaker. Cluster median px determines
+    // WHERE to center the crop — stable but more accurate than slot center.
+    if (isDenseData && clusters) {
       const range = srcRatio && targetRatio ? computeSafeRange(srcRatio, targetRatio) : { min: 0, max: 100 };
-      for (const kf of result) {
-        // Find raw keyframes near this time with valid px
-        const nearbyRaw = raw.filter(r => Math.abs(r.t - kf.t) < 1.5 && r.px !== undefined);
-        if (nearbyRaw.length === 0) continue;
-        // Guard radius = half distance to nearest other cluster (prevents cross-contamination)
-        let guardRadius = 15;
-        if (clusters && clusters.length >= 2) {
-          let minClusterDist = Infinity;
-          for (const c of clusters) {
-            if (c.center !== kf.x) {
-              const d = Math.abs(c.center - kf.x);
-              if (d < minClusterDist) minClusterDist = d;
-            }
+
+      // Build per-cluster median px from ALL raw keyframes
+      const clusterPx = new Map();
+      for (const c of clusters) {
+        // Collect px values from raw keyframes assigned to this cluster
+        const memberPxValues = [];
+        for (const r of raw) {
+          if (r.px === undefined) continue;
+          // Assign to nearest cluster
+          let nearest = clusters[0];
+          let nearestDist = Math.abs(r.x - clusters[0].center);
+          for (let ci = 1; ci < clusters.length; ci++) {
+            const d = Math.abs(r.x - clusters[ci].center);
+            if (d < nearestDist) { nearestDist = d; nearest = clusters[ci]; }
           }
-          if (minClusterDist < Infinity) {
-            guardRadius = Math.max(5, Math.floor(minClusterDist / 2));
+          if (nearest === c) {
+            memberPxValues.push(r.px);
           }
         }
-        const validPx = nearbyRaw.filter(r => Math.abs(r.px - kf.x) <= guardRadius);
-        if (validPx.length === 0) continue;
-        const nearest = validPx.reduce((best, r) =>
-          Math.abs(r.t - kf.t) < Math.abs(best.t - kf.t) ? r : best
-        );
-        kf.x = Math.max(range.min, Math.min(range.max, Math.round(nearest.px)));
+        if (memberPxValues.length > 0) {
+          // Use median for stability (resists outliers better than mean)
+          memberPxValues.sort((a, b) => a - b);
+          const medianPx = memberPxValues[Math.floor(memberPxValues.length / 2)];
+          clusterPx.set(c.center, Math.max(range.min, Math.min(range.max, Math.round(medianPx))));
+        }
       }
+
+      // Apply per-cluster median px to all result keyframes
+      for (const kf of result) {
+        const clusterMedian = clusterPx.get(kf.x);
+        if (clusterMedian !== undefined) {
+          kf.x = clusterMedian;
+        }
+      }
+
       const uniqueX = [...new Set(result.map(kf => kf.x))].sort((a, b) => a - b);
-      console.log('[SubjectTracking] Precise face centering (per-keyframe):', uniqueX);
+      console.log('[SubjectTracking] Precise face centering (per-cluster median):', uniqueX,
+        'cluster medians:', Object.fromEntries(clusterPx));
     }
 
     // ── QA validation: fix extended center holds and missing instant cuts ──
