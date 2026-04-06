@@ -1481,7 +1481,7 @@ class ChunkedClipDetectionMixin:
         # ── Retention curve analysis ──
         for clip in all_clips:
             retention_score, curve_shape = self._score_retention_curve(
-                clip, transcript, kwargs.get("audio_moments"),
+                clip, transcript, None,
             )
             retention_adj = int((retention_score - 50) * 0.15)
             clip.viral_score = max(1, min(100, clip.viral_score + retention_adj))
