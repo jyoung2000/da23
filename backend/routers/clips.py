@@ -101,6 +101,14 @@ async def export_clip_endpoint(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # Populate hook_text from stored clip data if not already set
+    if not req.hook_text and job.clips:
+        matching_clip = next(
+            (c for c in job.clips if c.id == req.clip_id), None
+        )
+        if matching_clip and matching_clip.hook_text:
+            req.hook_text = matching_clip.hook_text
+
     # Parse video resolution for crop/subtitle positioning
     vid_w, vid_h = 1920, 1080
     if job.resolution:
@@ -361,6 +369,7 @@ async def export_clip_endpoint(
                 pip_size_pct=getattr(req, 'pip_size_pct', 25.0),
                 face_registry_data=getattr(job, 'face_registry_data', None),
                 layout_timeline_data=getattr(job, 'layout_timeline', None),
+                hook_text=req.hook_text,
             )
 
             elapsed = int(time.monotonic() - export_start)

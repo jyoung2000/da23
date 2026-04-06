@@ -2837,9 +2837,29 @@ async def _run_analysis_inner(job_id: str):
     except Exception as e:
         logger.warning("[%s] Audio energy analysis failed (non-critical): %s", job_id, e)
 
+    # ── Filler word detection (instant, no AI calls) ──
+    filler_events: list[dict] = []
+    if transcript:
+        try:
+            from backend.services.transcript_utils import detect_filler_words
+            detected_lang = job.language or "en"
+            filler_events = detect_filler_words(transcript, language=detected_lang)
+            if filler_events:
+                filler_count = len([e for e in filler_events if e["type"] == "filler"])
+                dead_air_count = len([e for e in filler_events if e["type"] == "dead_air"])
+                logger.info(
+                    "[%s] Filler detection: %d filler words, %d dead air pauses",
+                    job_id, filler_count, dead_air_count,
+                )
+        except Exception as e:
+            logger.warning("[%s] Filler detection failed (non-fatal): %s", job_id, e)
+
     # Hot zone pre-scoring (instant, no AI calls)
     from backend.services.hot_zone_scorer import score_hot_zones, format_hot_zones_for_prompt
-    hot_zones = score_hot_zones(transcript, scenes, audio_moments, metadata["duration"])
+    hot_zones = score_hot_zones(
+        transcript, scenes, audio_moments, metadata["duration"],
+        filler_events=filler_events,
+    )
     hot_zone_text = format_hot_zones_for_prompt(hot_zones, top_n=tier.hot_zone_top_n)
     logger.info(
         "[%s] Hot zone scoring: %d zones, top score=%.1f",
@@ -3094,11 +3114,24 @@ async def _run_analysis_inner(job_id: str):
     for idx, clip in enumerate(clips, start=1):
         clip.id = idx
 
+    # ── Emphasis keyword detection ──
+    emphasis_keywords: list[str] = []
+    if transcript:
+        try:
+            from backend.services.transcript_utils import detect_emphasis_words
+            emphasis_keywords = sorted(detect_emphasis_words(
+                transcript, video_summary=summary_text, max_keywords=20,
+            ))
+        except Exception as e:
+            logger.warning("[%s] Emphasis keyword detection failed (non-fatal): %s", job_id, e)
+
     await database.update_job_status(
         job_id,
         summary=summary,
         clips=list(clips),
         provider_used=provider_used,
+        filler_events=filler_events,
+        emphasis_keywords=emphasis_keywords,
     )
     await _update_progress(
         job_id, JobStatus.DETECTING_CLIPS, 95,

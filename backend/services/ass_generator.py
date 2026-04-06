@@ -360,6 +360,7 @@ def generate_ass(
     active_word_bg_color: str = "#000000",
     active_word_bg_opacity: int = 0,
     active_word_bg_radius: int = 4,
+    hook_text: str = "",
 ) -> str:
     """Generate an ASS subtitle string from transcript segments within a time range.
 
@@ -707,9 +708,25 @@ def generate_ass(
             "0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1"
         )
 
+    # ── Hook text overlay style ──
+    if hook_text and len(hook_text) > 3:
+        hook_size = int(size_px * 1.4)  # Larger than subtitles
+        lines.append(
+            f"Style: Hook,{font},{hook_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+            f"1,0,0,0,100,100,0,0,1,3,0,5,30,30,30,1"
+        )
+
     lines.append("")
     lines.append("[Events]")
     lines.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+
+    # ── Hook text event (first 2.5 seconds) ──
+    if hook_text and len(hook_text) > 3:
+        hook_escaped = hook_text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+        lines.append(
+            f"Dialogue: 0,0:00:00.00,0:00:02.50,Hook,,0,0,0,,"
+            f"{{\\an5\\fad(300,500)}}{hook_escaped}"
+        )
 
     # Pre-compute active word ASS colors (defaults for when active word is off)
     aw_bg = None

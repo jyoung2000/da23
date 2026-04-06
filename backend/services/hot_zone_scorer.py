@@ -36,6 +36,7 @@ def score_hot_zones(
     video_duration: float,
     window_size: float = WINDOW_SIZE,
     overlap: float = WINDOW_OVERLAP,
+    filler_events: list[dict] | None = None,
 ) -> list[HotZone]:
     """Score every time window in the video for viral potential.
 
@@ -55,13 +56,24 @@ def score_hot_zones(
         scene_score, scene_signals = _score_scenes(scenes, window_start, window_end)
         speaker_score, speaker_signals = _score_speakers(transcript, window_start, window_end)
 
+        # Filler penalty: high filler density = low engagement potential
+        filler_penalty = 0.0
+        if filler_events:
+            from backend.services.transcript_utils import compute_filler_density
+            density = compute_filler_density(filler_events, window_start, window_end)
+            if density > 6:
+                filler_penalty = 15
+                audio_signals.append("high filler density")
+            elif density > 3:
+                filler_penalty = 8
+
         # Weighted composite (transcript and audio are strongest signals)
         composite = (
             audio_score * 0.25 +
             transcript_score * 0.35 +
             scene_score * 0.25 +
             speaker_score * 0.15
-        )
+        ) - filler_penalty
 
         signals = audio_signals + transcript_signals + scene_signals + speaker_signals
 

@@ -526,6 +526,122 @@ class AIProvider(ABC):
         return any(pattern in model for pattern in thinking_patterns)
 
 
+def _score_hook_strength(
+    clip: ClipCandidate,
+    transcript: list[TranscriptSegment],
+) -> tuple[int, str]:
+    """Score the hook (first 3 seconds) of a clip candidate.
+
+    Returns (score 0-100, reason string).
+    """
+    hook_start = clip.start_time
+    hook_end = hook_start + 3.0
+
+    hook_segs = [
+        s for s in transcript
+        if s.end > hook_start and s.start < hook_end
+    ]
+
+    if not hook_segs:
+        return 15, "dead_air_opening"
+
+    first_seg = min(hook_segs, key=lambda s: s.start)
+    first_text = first_seg.text.strip()
+    first_words = first_text.split()[:6]
+    first_word = first_words[0].lower().rstrip(".,!?") if first_words else ""
+
+    score = 50
+    reason_parts: list[str] = []
+
+    # Mid-sentence start penalty
+    if first_seg.start < hook_start - 0.5:
+        score -= 25
+        reason_parts.append("mid_sentence_start")
+
+    # Filler word opener penalty
+    filler_words = {"um", "uh", "like", "so", "and", "but", "well", "yeah"}
+    if first_word in filler_words:
+        score -= 20
+        reason_parts.append(f"filler_opener_{first_word}")
+
+    # Context-dependent opener penalty
+    context_openers = {"that", "this", "it", "they", "he", "she", "those", "these"}
+    if first_word in context_openers and len(first_words) > 1:
+        second = first_words[1].lower().rstrip(".,!?")
+        if second in {"is", "was", "were", "are", "'s", "thing"}:
+            score -= 15
+            reason_parts.append("context_dependent_opener")
+
+    # Question opener bonus
+    if "?" in " ".join(first_words):
+        score += 25
+        reason_parts.append("question_hook")
+
+    # Reaction word opener bonus
+    reaction_openers = {"wow", "oh", "wait", "no", "what", "holy", "damn", "yo", "bro"}
+    if first_word in reaction_openers:
+        score += 20
+        reason_parts.append("reaction_hook")
+
+    # Speaker change at clip start bonus
+    pre_clip_segs = [s for s in transcript if s.end <= hook_start + 0.5 and s.end > hook_start - 2.0]
+    if pre_clip_segs:
+        prev_speaker = max(pre_clip_segs, key=lambda s: s.end).speaker
+        if first_seg.speaker != prev_speaker:
+            score += 15
+            reason_parts.append("speaker_change_hook")
+
+    # Exclamation / emphasis bonus
+    if "!" in first_text:
+        score += 10
+        reason_parts.append("emphasis_hook")
+
+    # Bold claim detection
+    bold_markers = ["never", "always", "the truth", "the real", "actually", "honestly",
+                    "people don't", "nobody", "everybody", "the best", "the worst"]
+    first_text_lower = first_text.lower()
+    if any(m in first_text_lower for m in bold_markers):
+        score += 15
+        reason_parts.append("bold_claim_hook")
+
+    return max(0, min(100, score)), "+".join(reason_parts) if reason_parts else "neutral"
+
+
+def _find_better_hook(
+    clip: ClipCandidate,
+    transcript: list[TranscriptSegment],
+) -> "float | None":
+    """Try to find a better opening within 5 seconds of the original start."""
+    search_start = clip.start_time
+    search_end = clip.start_time + 5.0
+
+    candidates: list[tuple[float, int]] = []
+    for seg in transcript:
+        if seg.start < search_start or seg.start > search_end:
+            continue
+        text = seg.text.strip()
+        first_word = text.split()[0].lower().rstrip(".,!?") if text.split() else ""
+
+        if first_word in {"um", "uh", "like", "so", "and", "but", "well"}:
+            continue
+
+        score = 0
+        if "?" in text[:60]:
+            score += 3
+        if "!" in text[:60]:
+            score += 2
+        if first_word in {"wow", "oh", "wait", "no", "what", "holy"}:
+            score += 3
+
+        candidates.append((seg.start, score))
+
+    if candidates:
+        best = max(candidates, key=lambda c: c[1])
+        if best[1] > 0:
+            return best[0]
+    return None
+
+
 class ChunkedClipDetectionMixin:
     """Mixin providing multi-pass windowed clip detection for any provider.
 
@@ -835,6 +951,118 @@ class ChunkedClipDetectionMixin:
 
         return kept
 
+    @staticmethod
+    def _snap_to_speech_boundaries(
+        clip: ClipCandidate,
+        transcript: list[TranscriptSegment],
+        max_adjust: float = 3.0,
+    ) -> ClipCandidate:
+        """Snap clip start/end to natural speech boundaries using segment timestamps.
+
+        - Start: snap to the beginning of the nearest segment start
+        - End: snap to the end of the nearest segment end
+        - Never adjust by more than max_adjust seconds
+        """
+        best_start = clip.start_time
+        best_start_dist = float('inf')
+        for seg in transcript:
+            dist = abs(seg.start - clip.start_time)
+            if dist < best_start_dist and dist <= max_adjust:
+                if seg.start <= clip.start_time + 0.5:
+                    best_start = seg.start
+                    best_start_dist = dist
+
+        best_end = clip.end_time
+        best_end_dist = float('inf')
+        for seg in transcript:
+            dist = abs(seg.end - clip.end_time)
+            if dist < best_end_dist and dist <= max_adjust:
+                if seg.end >= clip.end_time - 0.5:
+                    best_end = seg.end
+                    best_end_dist = dist
+
+        if best_start != clip.start_time or best_end != clip.end_time:
+            clip.start_time = round(best_start, 2)
+            clip.end_time = round(best_end, 2)
+            clip.duration = round(clip.end_time - clip.start_time, 1)
+
+        return clip
+
+    @staticmethod
+    def _score_retention_curve(
+        clip: ClipCandidate,
+        transcript: list[TranscriptSegment],
+        audio_moments: "list[dict] | None" = None,
+    ) -> tuple[int, str]:
+        """Score a clip's retention curve — how well it sustains engagement.
+
+        Divides the clip into thirds and scores each for energy distribution.
+        Returns (score 0-100, curve_shape description).
+        """
+        dur = clip.end_time - clip.start_time
+        if dur < 10:
+            return 50, "too_short_to_measure"
+
+        third = dur / 3
+        boundaries = [
+            (clip.start_time, clip.start_time + third),
+            (clip.start_time + third, clip.start_time + 2 * third),
+            (clip.start_time + 2 * third, clip.end_time),
+        ]
+
+        third_scores = []
+        for t_start, t_end in boundaries:
+            segs = [s for s in transcript if s.end > t_start and s.start < t_end]
+
+            score = 0
+            total_words = sum(len(s.text.split()) for s in segs)
+            speech_duration = sum(
+                min(s.end, t_end) - max(s.start, t_start) for s in segs
+            )
+            if speech_duration > 0:
+                wps = total_words / speech_duration
+                score += min(40, int(wps * 12))
+
+            for seg in segs:
+                text = seg.text
+                if "!" in text:
+                    score += 8
+                if "?" in text:
+                    score += 6
+
+            speakers = set(s.speaker for s in segs)
+            if len(speakers) >= 2:
+                score += 10
+
+            if audio_moments:
+                moments_in_third = [
+                    m for m in audio_moments
+                    if t_start <= m.get("timestamp", 0) <= t_end
+                ]
+                score += len(moments_in_third) * 8
+
+            third_scores.append(min(100, score))
+
+        opening, middle, closing = third_scores
+
+        if middle < 20 and opening > 40:
+            curve = "energy_valley"
+            overall = int((opening * 0.4 + middle * 0.3 + closing * 0.3) * 0.7)
+        elif opening < 25:
+            curve = "slow_start"
+            overall = int((opening * 0.4 + middle * 0.3 + closing * 0.3) * 0.8)
+        elif closing < 20 and opening > 40:
+            curve = "fizzle_ending"
+            overall = int((opening * 0.4 + middle * 0.3 + closing * 0.3) * 0.75)
+        elif opening > 50 and middle > 30 and closing > 40:
+            curve = "sustained_energy"
+            overall = int(opening * 0.35 + middle * 0.30 + closing * 0.35)
+        else:
+            curve = "moderate"
+            overall = int(opening * 0.35 + middle * 0.30 + closing * 0.35)
+
+        return overall, curve
+
     async def _windowed_clip_detection(
         self,
         transcript: list[TranscriptSegment],
@@ -1067,7 +1295,12 @@ class ChunkedClipDetectionMixin:
         num_clips = clip_count or (tier.max_clip_candidates if tier else _settings.MAX_CLIP_CANDIDATES)
 
         # Window sizing — use tier if available, else adaptive
-        if tier and tier.window_duration > 0:
+        # Short videos (<5 min): single pass, no windowing needed
+        if video_duration <= 300:
+            window_dur = video_duration
+            overlap_dur = 0.0
+            _mixin_logger.info("Short video (%.0fs) — single-pass detection, no windowing", video_duration)
+        elif tier and tier.window_duration > 0:
             window_dur = tier.window_duration
             overlap_dur = tier.window_overlap
         elif video_duration > 1800:
@@ -1109,8 +1342,17 @@ class ChunkedClipDetectionMixin:
         if progress_callback:
             await progress_callback("pass1_done", {"clips": len(pass1_clips)})
 
+        # ── Early exit: skip Pass 2 if Pass 1 found enough quality clips ──
+        high_quality_clips = [c for c in all_clips if c.viral_score >= 60]
+        skip_pass2 = len(high_quality_clips) >= num_clips
+        if skip_pass2:
+            _mixin_logger.info(
+                "Pass 1 found %d high-quality clips (≥60 score) — skipping Pass 2 gap-fill",
+                len(high_quality_clips),
+            )
+
         # Pass 2: Coverage sweep — find regions with no clips
-        if len(all_clips) < num_clips:
+        if not skip_pass2 and len(all_clips) < num_clips:
             from backend.services.hot_zone_scorer import get_coverage_gaps
             gaps = get_coverage_gaps(
                 hot_zones or [], all_clips, video_duration,
@@ -1213,6 +1455,53 @@ class ChunkedClipDetectionMixin:
         _thematic_max = 3 if video_duration < 1800 else 4 if video_duration < 5400 else 5
         all_clips = self._deduplicate_thematic(all_clips, max_similar=_thematic_max)
         after_thematic = len(all_clips)
+
+        # ── Snap to speech boundaries ──
+        for i, clip in enumerate(all_clips):
+            all_clips[i] = self._snap_to_speech_boundaries(clip, transcript)
+
+        # ── Hook strength validation ──
+        for clip in all_clips:
+            hook_score, hook_reason = _score_hook_strength(clip, transcript)
+            hook_adjustment = int((hook_score - 50) * 0.2)
+            clip.viral_score = max(1, min(100, clip.viral_score + hook_adjustment))
+            clip.viral_score_reasoning += f" [Hook: {hook_score}/100 ({hook_reason})]"
+
+            if hook_score < 30 and transcript:
+                better_start = _find_better_hook(clip, transcript)
+                if better_start is not None and better_start > clip.start_time:
+                    old_start = clip.start_time
+                    clip.start_time = better_start
+                    clip.duration = round(clip.end_time - clip.start_time, 1)
+                    _mixin_logger.info(
+                        "Hook fix: '%s' start slid %.1f→%.1fs (hook was %s)",
+                        clip.title, old_start, better_start, hook_reason,
+                    )
+
+        # ── Retention curve analysis ──
+        for clip in all_clips:
+            retention_score, curve_shape = self._score_retention_curve(
+                clip, transcript, kwargs.get("audio_moments"),
+            )
+            retention_adj = int((retention_score - 50) * 0.15)
+            clip.viral_score = max(1, min(100, clip.viral_score + retention_adj))
+            clip.viral_score_reasoning += f" [Retention: {curve_shape}]"
+
+        # ── Platform duration validation ──
+        for clip in all_clips:
+            dur = clip.duration
+            platform = clip.platform.lower() if clip.platform else "both"
+
+            if platform == "tiktok" and dur > 60:
+                clip.platform = "youtube_shorts"
+                if dur > 90:
+                    clip.viral_score_reasoning += " [Re-platformed: too long for TikTok]"
+            elif platform == "tiktok" and dur < 15:
+                clip.viral_score = max(1, clip.viral_score - 10)
+                clip.viral_score_reasoning += " [Warning: very short clip]"
+            elif platform == "youtube_shorts" and dur > 180:
+                clip.viral_score_reasoning += " [Warning: may exceed Shorts limit]"
+
         all_clips.sort(key=lambda c: c.viral_score, reverse=True)
 
         if len(all_clips) > num_clips:

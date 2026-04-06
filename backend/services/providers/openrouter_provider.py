@@ -1463,9 +1463,20 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         dur_max_fmt = f"{dur_max // 60}:{dur_max % 60:02d}"
         num_clips = clip_count or settings.MAX_CLIP_CANDIDATES
 
+        platform_guidance = (
+            "PLATFORM DURATION TARGETS (optimize for the 'platform' you assign):\n"
+            "- tiktok: 15-60 seconds (sweet spot: 30-45s). Must hook in first 1-2 seconds.\n"
+            "- youtube_shorts: 30-90 seconds (sweet spot: 45-75s). Can have slightly longer setup.\n"
+            "- both: 30-60 seconds (works on all platforms).\n"
+            "- If a moment has enough content for 90+ seconds, assign platform='youtube_shorts'.\n"
+            "- If a moment is punchy and under 45 seconds, assign platform='tiktok'.\n"
+            "- NEVER pad a clip to reach a duration target. Shorter and punchy > longer and padded.\n\n"
+        )
+
         system_prompt = (
             instruction + "\n\n"
             f"{content_guidance}"
+            f"{platform_guidance}"
             "STRICT REQUIREMENTS:\n"
             f"- Each clip duration MUST be between {dur_min} and {dur_max} seconds ({dur_min_fmt} to {dur_max_fmt})\n"
             "- Segments marked [LOW_CONF] have unreliable transcription — avoid clips where "

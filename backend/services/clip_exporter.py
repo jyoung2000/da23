@@ -5523,6 +5523,7 @@ async def export_clip(
     pip_size_pct: float = 25.0,
     face_registry_data: dict | None = None,
     layout_timeline_data: list | None = None,
+    hook_text: str = "",
 ) -> str:
     """Export a clip from video using FFmpeg.
 
@@ -5875,6 +5876,7 @@ async def export_clip(
                 active_word_bg_color=settings.get("active_word_bg_color", "#000000"),
                 active_word_bg_opacity=settings.get("active_word_bg_opacity", 0),
                 active_word_bg_radius=settings.get("active_word_bg_radius", 4),
+                hook_text=hook_text,
             )
 
             if ass_content:

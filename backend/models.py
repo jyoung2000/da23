@@ -159,6 +159,8 @@ class JobResult(BaseModel):
     layout_timeline: list[dict] = []            # [{start, end, layout_mode, face_positions}]
     default_layout_mode: str = "single"         # Overall recommended layout for the video
     dense_tracking_summary: Optional[dict] = None  # {total_frames, frames_with_faces, sample_rate, ...}
+    filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
+    emphasis_keywords: list[str] = []  # Words to highlight in captions
 
 
 class ClipSEO(BaseModel):
@@ -334,6 +336,7 @@ class ExportRequest(BaseModel):
     layout_mode: str = "auto"  # "auto" | "single" | "split" | "triple" | "pip" | "screenshare"
     pip_position: str = "bottom_right"  # For PIP mode
     pip_size_pct: float = 25.0          # For PIP mode
+    hook_text: str = ""  # Text overlay for the opening frame
 
 
 class FullVideoExportRequest(BaseModel):

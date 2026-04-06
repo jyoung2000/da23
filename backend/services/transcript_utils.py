@@ -69,6 +69,45 @@ def analyze_transcript_energy(
         ):
             energy_signals.append("reaction")
 
+        # Disagreement / debate detection
+        disagreement_markers = [
+            "i disagree", "that's not true", "no way", "absolutely not",
+            "you're wrong", "that's not right", "i don't think so",
+            "but actually", "hold on", "wait a minute",
+        ]
+        if any(m in lower_text for m in disagreement_markers):
+            energy_signals.append("disagreement")
+
+        # Personal story / vulnerability detection
+        story_markers = [
+            "when i was", "i remember", "true story", "this happened to me",
+            "i've never told", "for the first time", "i was so", "i couldn't believe",
+        ]
+        if any(m in lower_text for m in story_markers):
+            energy_signals.append("personal_story")
+
+        # Reveal / surprise detection
+        reveal_markers = [
+            "the truth is", "turns out", "plot twist", "nobody knows",
+            "secret", "finally", "breaking", "just found out",
+            "guess what", "you won't believe",
+        ]
+        if any(m in lower_text for m in reveal_markers):
+            energy_signals.append("reveal")
+
+        # List / ranking energy
+        if any(f"number {n}" in lower_text or f"#{n}" in lower_text
+               for n in range(1, 11)):
+            energy_signals.append("ranking")
+
+        # Strong opinion / hot take
+        opinion_markers = [
+            "the best", "the worst", "overrated", "underrated",
+            "goat", "mid", "trash", "fire", "elite", "nobody can",
+        ]
+        if any(m in lower_text for m in opinion_markers):
+            energy_signals.append("hot_take")
+
         if hasattr(seg, 'confidence') and seg.confidence is not None and seg.confidence < 0.4:
             energy_signals.append("low_confidence")
 
@@ -242,3 +281,136 @@ def derive_content_guidance(video_summary: str | None) -> str:
         "PRIORITIZE: Emotional peaks, visual spectacle, quotable statements, "
         "complete micro-stories, reaction-worthy moments.\n\n"
     )
+
+
+# ── Filler Word and Dead Air Detection (Part 2) ──────────────────────────
+
+FILLER_PATTERNS: dict[str, list[str]] = {
+    "en": ["um", "uh", "uh huh", "you know", "i mean", "like", "basically",
+           "literally", "actually", "right", "so yeah", "kind of", "sort of"],
+}
+
+
+def detect_filler_words(
+    transcript: list[TranscriptSegment],
+    language: str = "en",
+) -> list[dict]:
+    """Detect filler words and dead air in the transcript.
+
+    Returns list of {start, end, type, text} dicts:
+    - type="filler": filler word/phrase detected
+    - type="dead_air": pause >1.5s between speech segments
+    - type="repetition": word/phrase repeated immediately
+    """
+    fillers = FILLER_PATTERNS.get(language, FILLER_PATTERNS["en"])
+    results: list[dict] = []
+
+    for seg in transcript:
+        text_lower = seg.text.lower().strip()
+        words = text_lower.split()
+
+        # Full-segment filler
+        if text_lower in fillers:
+            results.append({
+                "start": seg.start, "end": seg.end,
+                "type": "filler", "text": seg.text.strip(),
+            })
+            continue
+
+        # Word-level filler detection using per-word timestamps
+        if seg.words:
+            for w in seg.words:
+                word_lower = w.word.strip().lower().rstrip(".,!?")
+                if word_lower in {"um", "uh", "hmm", "huh"}:
+                    results.append({
+                        "start": w.start, "end": w.end,
+                        "type": "filler", "text": w.word.strip(),
+                    })
+
+        # Repetition detection
+        for i in range(len(words) - 1):
+            if words[i] == words[i + 1] and len(words[i]) > 1:
+                results.append({
+                    "start": seg.start, "end": seg.end,
+                    "type": "repetition", "text": f"{words[i]} {words[i+1]}",
+                })
+                break
+
+    # Dead air detection
+    for i in range(1, len(transcript)):
+        gap = transcript[i].start - transcript[i - 1].end
+        if gap > 1.5:
+            results.append({
+                "start": transcript[i - 1].end,
+                "end": transcript[i].start,
+                "type": "dead_air",
+                "text": f"{gap:.1f}s silence",
+            })
+
+    return results
+
+
+def compute_filler_density(
+    filler_events: list[dict],
+    start: float,
+    end: float,
+) -> float:
+    """Compute filler density (fillers per minute) for a time window."""
+    window_events = [e for e in filler_events if e["start"] >= start and e["end"] <= end]
+    duration_min = max((end - start) / 60.0, 0.01)
+    return len(window_events) / duration_min
+
+
+# ── Keyword Emphasis Detection (Part 9) ──────────────────────────────────
+
+def detect_emphasis_words(
+    transcript: list[TranscriptSegment],
+    video_summary: str = "",
+    max_keywords: int = 20,
+) -> set[str]:
+    """Identify words that should be visually emphasized in captions.
+
+    Returns a set of lowercase words that deserve highlighting:
+    - Key topics from the video summary
+    - Proper nouns (capitalized in middle of sentences)
+    - Numbers and statistics
+    - Words spoken with emphasis (all-caps in transcript)
+    """
+    import re as _re
+
+    keywords: set[str] = set()
+
+    if video_summary:
+        caps_words = _re.findall(r'\b[A-Z][a-z]{2,}\b', video_summary)
+        for w in caps_words[:10]:
+            keywords.add(w.lower())
+
+    for seg in transcript:
+        words = seg.text.split()
+        for i, word in enumerate(words):
+            clean = word.strip(".,!?\"'()[]")
+            if not clean:
+                continue
+
+            # All-caps words (shouted/emphasized)
+            if clean == clean.upper() and len(clean) > 2 and clean.isalpha():
+                keywords.add(clean.lower())
+
+            # Numbers and statistics
+            if any(c.isdigit() for c in clean) and len(clean) <= 10:
+                keywords.add(clean.lower())
+
+            # Proper nouns (capitalized mid-sentence)
+            if i > 0 and clean[0:1].isupper() and len(clean) > 2 and clean.isalpha():
+                keywords.add(clean.lower())
+
+    # Common emphasis words present in transcript
+    emphasis_always = {"never", "always", "best", "worst", "only", "first", "last",
+                       "million", "billion", "percent", "secret", "truth", "real"}
+    for seg in transcript:
+        seg_lower = seg.text.lower()
+        for w in emphasis_always:
+            if w in seg_lower:
+                keywords.add(w)
+
+    return set(list(keywords)[:max_keywords])
