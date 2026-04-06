@@ -252,6 +252,57 @@ async def _stage_timer(job_id: str, stage: str):
         elapsed = _time.monotonic() - t0
         logger.info("[%s] Stage '%s' finished in %.1fs", job_id, stage, elapsed)
 
+# ── Pipeline heartbeat — prevents >15s gaps in progress updates ──────
+class _PipelineHeartbeat:
+    """Emits keepalive messages when no real progress update has been sent."""
+
+    def __init__(self, job_id: str, interval: float = 15.0):
+        self.job_id = job_id
+        self.interval = interval
+        self.last_emit = _time.monotonic()
+        self.current_stage = ""
+        self.stage_start = _time.monotonic()
+        self._task: asyncio.Task | None = None
+
+    def touch(self, stage: str = ""):
+        """Call whenever a real progress event is emitted."""
+        self.last_emit = _time.monotonic()
+        if stage and stage != self.current_stage:
+            self.current_stage = stage
+            self.stage_start = _time.monotonic()
+
+    async def _run(self):
+        """Background loop that checks for staleness every 5 seconds."""
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                elapsed_since_emit = _time.monotonic() - self.last_emit
+                if elapsed_since_emit >= self.interval and self.current_stage:
+                    stage_elapsed = int(_time.monotonic() - self.stage_start)
+                    mins, secs = divmod(stage_elapsed, 60)
+                    msg = f"Still processing... ({self.current_stage} \u2014 {mins}m {secs}s elapsed)"
+                    # Only broadcast via WebSocket — don't update DB to avoid
+                    # overwriting real progress values with heartbeat messages.
+                    await broadcast_ws(self.job_id, {
+                        "type": "heartbeat",
+                        "message": msg,
+                    })
+                    self.last_emit = _time.monotonic()
+        except asyncio.CancelledError:
+            pass
+
+    def start(self):
+        self._task = asyncio.create_task(self._run())
+
+    def stop(self):
+        if self._task:
+            self._task.cancel()
+            self._task = None
+
+
+# Active heartbeats per job
+_heartbeats: dict[str, _PipelineHeartbeat] = {}
+
 # Semaphore to limit concurrent analyses
 _analysis_semaphore: asyncio.Semaphore | None = None
 
@@ -344,6 +395,19 @@ async def _update_progress(job_id: str, status: str, progress: int, message: str
         "progress": progress,
         "message": message,
     })
+    # Touch heartbeat so it knows we just emitted a real update.
+    # Use human-friendly stage names for heartbeat messages.
+    hb = _heartbeats.get(job_id)
+    if hb:
+        _stage_labels = {
+            "extracting_frames": "frame extraction",
+            "transcribing": "transcription",
+            "analyzing_scenes": "scene analysis",
+            "generating_summary": "summary generation",
+            "detecting_clips": "clip detection",
+        }
+        stage_label = _stage_labels.get(status, status) if isinstance(status, str) else str(status)
+        hb.touch(stage_label)
 
 
 async def _background_post_processing(job_id: str, transcript: list, orchestrator, job):
@@ -519,6 +583,10 @@ async def run_analysis(job_id: str):
     )
 
     async with sem:
+        # Start heartbeat for this job
+        hb = _PipelineHeartbeat(job_id, interval=15.0)
+        _heartbeats[job_id] = hb
+        hb.start()
         try:
             await _run_analysis_inner(job_id)
         except CancelledError:
@@ -550,6 +618,9 @@ async def run_analysis(job_id: str):
                 "message": f"Analysis failed: {str(e)}",
             })
         finally:
+            # Stop heartbeat and clean up
+            hb.stop()
+            _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
 
 
@@ -1029,13 +1100,22 @@ async def _run_analysis_inner(job_id: str):
             # Thread-safe progress callback for dense face detection
             _dense_loop = asyncio.get_event_loop()
 
-            def _dense_progress(stage, done, total):
+            def _dense_progress(stage, done, total, extra=None):
                 """Called from executor thread — schedules async progress update."""
-                if stage == "extracting_done":
+                if stage == "extracting_frames":
+                    pct_done = min(99, 100 * done // max(total, 1))
+                    msg = f"Extracting dense frames: {done}/{total} ({pct_done}%)..."
+                    pct = 15
+                elif stage == "extracting_done":
                     msg = f"Dense frames extracted ({done}/{total}) — running FaceMesh..."
                     pct = 15
                 elif stage == "facemesh_start":
                     msg = f"Running FaceMesh on {total} frames (detecting faces + lip aperture)..."
+                    pct = 15
+                elif stage == "facemesh_progress":
+                    pct_done = min(99, 100 * done // max(total, 1))
+                    faces_info = f" — {extra} frames with faces" if extra else ""
+                    msg = f"FaceMesh: {done}/{total} frames processed ({pct_done}%){faces_info}..."
                     pct = 15
                 elif stage == "facemesh_done":
                     faces_found = done  # done = len(results)
@@ -1287,6 +1367,13 @@ async def _run_analysis_inner(job_id: str):
             f"Transcribing audio ({lang_label}) — {device_label}")
 
         async def _transcribe_progress(info: dict):
+            # Handle phase-based progress from whisper worker (model loading, VAD, etc.)
+            phase = info.get("phase")
+            if phase and phase in ("model_loading", "model_loaded", "vad_start"):
+                msg = info.get("message", f"Whisper: {phase}...")
+                await _update_branch_progress("transcription", 3, JobStatus.TRANSCRIBING, msg)
+                return
+
             pct = info["pct"]
             lang_info = f" [{info['lang']}]" if info.get("lang") else ""
             pos = _fmt_time(info["position_sec"])

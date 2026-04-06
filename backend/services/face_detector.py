@@ -311,7 +311,7 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence, extract_embeddings=True
     return results
 
 
-def _detect_with_facemesh(frame_paths, min_confidence):
+def _detect_with_facemesh(frame_paths, min_confidence, progress_callback=None):
     """Detect faces using MediaPipe FaceMesh — provides lip landmarks for active speaker detection.
 
     FaceMesh gives 468 landmarks per face including lip points.
@@ -321,6 +321,7 @@ def _detect_with_facemesh(frame_paths, min_confidence):
     """
     import mediapipe as mp
     import cv2
+    import time as _time
 
     face_mesh_module = None
     if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
@@ -340,6 +341,8 @@ def _detect_with_facemesh(frame_paths, min_confidence):
     NOSE_TIP = 1
 
     results = []
+    total_frames = len(frame_paths)
+    _last_progress_emit = _time.monotonic()
 
     with face_mesh_module.FaceMesh(
         static_image_mode=True,
@@ -347,7 +350,7 @@ def _detect_with_facemesh(frame_paths, min_confidence):
         refine_landmarks=True,
         min_detection_confidence=min_confidence,
     ) as mesh:
-        for timestamp, path in frame_paths:
+        for frame_idx, (timestamp, path) in enumerate(frame_paths):
             img = cv2.imread(str(path))
             if img is None:
                 results.append(FrameFaces(timestamp=timestamp, frame_path=str(path)))
@@ -409,6 +412,17 @@ def _detect_with_facemesh(frame_paths, min_confidence):
                 timestamp=timestamp, frame_path=str(path),
                 faces=faces, primary_face_idx=primary,
             ))
+
+            # Emit per-frame progress every 50 frames or every 10 seconds
+            if progress_callback and total_frames > 60:
+                now = _time.monotonic()
+                if (frame_idx + 1) % 50 == 0 or now - _last_progress_emit >= 10:
+                    faces_so_far = sum(1 for r in results if r.faces)
+                    progress_callback(
+                        "facemesh_progress", frame_idx + 1, total_frames,
+                        faces_so_far,
+                    )
+                    _last_progress_emit = now
 
     return results
 
@@ -538,6 +552,7 @@ def _merge_detections(
 def detect_faces_batch(
     frame_paths: list[tuple[float, str]],
     min_confidence: float = 0.3,
+    progress_callback=None,
 ) -> list[FrameFaces]:
     """Detect faces in extracted frames.
 
@@ -552,7 +567,7 @@ def detect_faces_batch(
     # Try FaceMesh first (gives lip landmarks for active speaker detection)
     facemesh_results = None
     try:
-        facemesh_results = _detect_with_facemesh(frame_paths, min_confidence)
+        facemesh_results = _detect_with_facemesh(frame_paths, min_confidence, progress_callback=progress_callback)
         if facemesh_results is not None:
             elapsed = _t.monotonic() - t0
             logger.info("Face detection using MediaPipe FaceMesh (%.1fs for %d frames)", elapsed, len(frame_paths))
@@ -646,8 +661,10 @@ def detect_faces_dense(
     For a 30-second clip at 0.5s intervals = 60 frames.
     At ~10ms per frame (YuNet + SFace) = ~600ms total. Fast enough for export.
     """
+    import re as _re
     import subprocess
     import tempfile
+    import time as _time
 
     duration = end - start
     if duration <= 0:
@@ -676,20 +693,42 @@ def detect_faces_dense(
             duration, expected_frames, ffmpeg_timeout,
         )
         try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=ffmpeg_timeout)
-            if proc.returncode != 0:
+            # Use Popen to stream stderr and report frame extraction progress
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            _last_reported_frame = 0
+            _last_progress_time = _time.monotonic()
+            _frame_re = _re.compile(r'frame=\s*(\d+)')
+            try:
+                for line in proc.stderr:
+                    match = _frame_re.search(line)
+                    if match and progress_callback:
+                        current_frame = int(match.group(1))
+                        now = _time.monotonic()
+                        if (current_frame - _last_reported_frame >= 50
+                                or now - _last_progress_time >= 5):
+                            pct = min(99, 100 * current_frame // max(expected_frames, 1))
+                            progress_callback(
+                                "extracting_frames", current_frame, expected_frames)
+                            _last_reported_frame = current_frame
+                            _last_progress_time = now
+                proc.wait(timeout=ffmpeg_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
                 logger.warning(
-                    "[DenseFaces] FFmpeg extraction failed (rc=%d): %s",
-                    proc.returncode,
-                    proc.stderr[-500:].decode(errors='replace') if proc.stderr else 'no stderr',
+                    "[DenseFaces] FFmpeg extraction timed out after %ds for %.0fs video (%d expected frames)",
+                    ffmpeg_timeout, duration, expected_frames,
                 )
                 return []
-        except subprocess.TimeoutExpired:
-            logger.warning(
-                "[DenseFaces] FFmpeg extraction timed out after %ds for %.0fs video (%d expected frames)",
-                ffmpeg_timeout, duration, expected_frames,
-            )
-            return []
+            if proc.returncode != 0:
+                logger.warning(
+                    "[DenseFaces] FFmpeg extraction failed (rc=%d)",
+                    proc.returncode,
+                )
+                return []
         except FileNotFoundError:
             logger.warning("[DenseFaces] FFmpeg not found")
             return []
@@ -711,7 +750,10 @@ def detect_faces_dense(
         # Run face detection with FaceMesh
         if progress_callback:
             progress_callback("facemesh_start", 0, len(frame_paths))
-        results = detect_faces_batch(frame_paths, min_confidence=min_confidence)
+        results = detect_faces_batch(
+            frame_paths, min_confidence=min_confidence,
+            progress_callback=progress_callback,
+        )
         if progress_callback:
             progress_callback("facemesh_done", len(results), len(frame_paths))
 

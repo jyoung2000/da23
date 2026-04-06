@@ -195,6 +195,10 @@ def main():
             args.model, args.device, args.device_index, args.compute_type,
         )
 
+        # Emit progress so the frontend knows model loading has started
+        _device_label = f"GPU ({args.compute_type})" if args.device == "cuda" else f"CPU ({args.compute_type})"
+        print(f'PROGRESS:{json.dumps({"segments": 0, "pct": 0, "lang": "", "position_sec": 0, "eta_sec": 0, "last_text": "", "phase": "model_loading", "message": f"Loading Whisper model ({args.model}) into {_device_label}..."})}', file=sys.stderr, flush=True)
+
         _load_t0 = _time.monotonic()
         try:
             model = WhisperModel(args.model, **model_kwargs)
@@ -232,7 +236,9 @@ def main():
             else:
                 raise
         _load_ms = int((_time.monotonic() - _load_t0) * 1000)
-        logger.info("Whisper model loaded in %dms (device=%s)", _load_ms, model_kwargs.get("device", args.device))
+        _actual_device = model_kwargs.get("device", args.device)
+        logger.info("Whisper model loaded in %dms (device=%s)", _load_ms, _actual_device)
+        print(f'PROGRESS:{json.dumps({"segments": 0, "pct": 0, "lang": "", "position_sec": 0, "eta_sec": 0, "last_text": "", "phase": "model_loaded", "message": f"Whisper model loaded ({_load_ms}ms) — preprocessing audio..."})}', file=sys.stderr, flush=True)
 
         # ── Preflight mode: verify model loads then exit ──
         if args.preflight:
@@ -401,6 +407,10 @@ def main():
             args.repetition_penalty, compression_ratio,
             args.no_speech_threshold, args.cjk,
         )
+
+        # Emit progress: audio preprocessing done, starting VAD + transcription
+        _vad_label = "with VAD filtering" if args.vad_filter else "without VAD"
+        print(f'PROGRESS:{json.dumps({"segments": 0, "pct": 0, "lang": "", "position_sec": 0, "eta_sec": 0, "last_text": "", "phase": "vad_start", "message": f"Audio preprocessed — starting transcription {_vad_label}..."})}', file=sys.stderr, flush=True)
 
         segments_gen, info = model.transcribe(preprocessed_path, **transcribe_kwargs)
 

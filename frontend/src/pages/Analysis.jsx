@@ -715,6 +715,10 @@ export default function Analysis() {
             if (taskStatus === 'complete') {
               fetchJob();
             }
+          } else if (msg.type === 'heartbeat') {
+            // Pipeline heartbeat — shows the pipeline is still alive during
+            // long-running stages.  Log it and reset the stuck timer.
+            pushLog('info', String(msg.message || 'Still processing...'));
           } else {
             // Unknown message type — log but don't crash.  Coerce all fields.
             const safeType = String(msg.type || 'unknown');

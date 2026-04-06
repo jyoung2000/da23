@@ -1119,6 +1119,7 @@ async def transcribe_audio(
     task = asyncio.ensure_future(future)
     last_reported = 0
     last_segment_time = time.monotonic()
+    _last_progress_emit = time.monotonic()
 
     # Timeout: generous base + proportional to audio length
     # e.g. 10 min base + 3x audio duration (Whisper is typically ~1x real-time on CPU)
@@ -1151,7 +1152,9 @@ async def transcribe_audio(
                 )
                 break
 
-            # Report progress from the sync thread's shared state
+            # Report progress from the sync thread's shared state.
+            # Emit on new segments OR every 15 seconds (time-based) to
+            # prevent long gaps when Whisper is processing silently.
             if progress_callback:
                 with lock:
                     seg_count = progress_state["segments"]
@@ -1159,13 +1162,17 @@ async def transcribe_audio(
                     lang = progress_state["language"]
                     last_text = progress_state["last_text"]
                     start_time = progress_state["start_time"]
-                if seg_count > last_reported:
-                    last_reported = seg_count
+                _now = time.monotonic()
+                _new_segments = seg_count > last_reported
+                _time_elapsed = (_now - _last_progress_emit) >= 15 if seg_count > 0 else False
+                if _new_segments or _time_elapsed:
+                    if _new_segments:
+                        last_reported = seg_count
                     pct = min(99, int((latest_end / audio_duration) * 100)) if audio_duration > 0 else 0
                     # Calculate ETA
                     eta_sec = 0
                     if pct > 0 and start_time > 0:
-                        elapsed = time.monotonic() - start_time
+                        elapsed = _now - start_time
                         eta_sec = max(0, (elapsed / (pct / 100)) * (1 - pct / 100))
                     await progress_callback({
                         "segments": seg_count,
@@ -1175,6 +1182,7 @@ async def transcribe_audio(
                         "eta_sec": eta_sec,
                         "last_text": last_text,
                     })
+                    _last_progress_emit = _now
 
     if task.done():
         try:
