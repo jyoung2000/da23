@@ -875,7 +875,7 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     // After snapping to clusters, single-frame noise creates rapid oscillations
     // like [40, 65, 40] where the 65 holds for only 1-2 seconds. Merge brief
     // holds into the surrounding position.
-    const MIN_HOLD_SECONDS = 2.0;
+    const MIN_HOLD_SECONDS = isDenseData ? 1.0 : 2.0;
     if (deduped.length >= 3) {
       // Pass 1: remove brief blips where surrounding positions are the same
       let i = 1;
@@ -926,7 +926,7 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     const isStaticContent = Math.max(...clusterVariances) < 5;
     if (isStaticContent && deduped.length >= 3) {
       // STATIONARY MODE: extend minimum hold to 3s for rock-solid stability
-      const STATIC_MIN_HOLD = 3.0;
+      const STATIC_MIN_HOLD = isDenseData ? 1.5 : 3.0;
       let si = 1;
       while (si < deduped.length - 1) {
         const holdDuration = deduped[si + 1].t - deduped[si].t;
@@ -1028,6 +1028,14 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       for (const c of clusters) {
         // Collect px values from raw keyframes assigned to this cluster
         const memberPxValues = [];
+        // Guard radius: half the distance to nearest other cluster center
+        let guardRadius = 15;
+        for (const otherC of clusters) {
+          if (otherC !== c) {
+            const d = Math.abs(otherC.center - c.center);
+            guardRadius = Math.min(guardRadius, Math.max(5, Math.floor(d / 2)));
+          }
+        }
         for (const r of raw) {
           if (r.px === undefined) continue;
           // Assign to nearest cluster
@@ -1038,7 +1046,11 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
             if (d < nearestDist) { nearestDist = d; nearest = clusters[ci]; }
           }
           if (nearest === c) {
-            memberPxValues.push(r.px);
+            // Only include px values within guard radius of cluster center
+            // This filters out outlier face positions from noisy sparse AI scenes
+            if (Math.abs(r.px - c.center) <= guardRadius) {
+              memberPxValues.push(r.px);
+            }
           }
         }
         if (memberPxValues.length > 0) {
@@ -1047,6 +1059,7 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
           const medianPx = memberPxValues[Math.floor(memberPxValues.length / 2)];
           clusterPx.set(c.center, Math.max(range.min, Math.min(range.max, Math.round(medianPx))));
         }
+        // If no valid px values within guard radius, don't override — keep cluster center
       }
 
       // Apply per-cluster median px to all result keyframes
