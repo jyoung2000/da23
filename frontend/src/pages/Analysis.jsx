@@ -459,6 +459,18 @@ export default function Analysis() {
   const [inlinePresetName, setInlinePresetName] = useState('');
   const [inlineActivePreset, setInlineActivePreset] = useState('');
   const fullVideoExporting = encoding.tasks[`${jobId}_0`]?.status === 'encoding';
+  const [exportQualityMenuOpen, setExportQualityMenuOpen] = useState(false);
+  const exportQualityRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!exportQualityMenuOpen) return;
+    const handler = (e) => {
+      if (exportQualityRef.current && !exportQualityRef.current.contains(e.target)) {
+        setExportQualityMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [exportQualityMenuOpen]);
 
   // Staged aspect ratio: gate preview on tracking readiness
   const [trackingLoading, setTrackingLoading] = useState(false);
@@ -2155,17 +2167,63 @@ export default function Analysis() {
                 {fullVideoExporting ? (
                   <span style={{ fontSize: 11, color: 'var(--accent-cyan)', fontFamily: 'var(--font-mono)' }}>Exporting...</span>
                 ) : (
-                  <button onClick={handleExportFullVideo} style={{
-                    display: 'flex', alignItems: 'center', gap: 5,
-                    padding: '6px 14px', fontSize: 11, fontWeight: 700,
-                    background: 'var(--accent-cyan)', color: '#fff',
-                    border: 'none', borderRadius: 'var(--radius-sm)', cursor: 'pointer', whiteSpace: 'nowrap',
-                  }}>
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
-                    </svg>
-                    Export Full Video ({clipSettings?.exportQuality || '1080p'})
-                  </button>
+                  <div ref={exportQualityRef} style={{ position: 'relative', display: 'inline-flex' }}>
+                    <button onClick={handleExportFullVideo} style={{
+                      display: 'flex', alignItems: 'center', gap: 5,
+                      padding: '6px 14px', fontSize: 11, fontWeight: 700,
+                      background: 'var(--accent-cyan)', color: '#fff',
+                      border: 'none', borderRadius: 'var(--radius-sm) 0 0 var(--radius-sm)', cursor: 'pointer', whiteSpace: 'nowrap',
+                    }}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+                      </svg>
+                      Export Full Video ({clipSettings?.exportQuality || '1080p'})
+                    </button>
+                    <button
+                      onClick={() => setExportQualityMenuOpen(v => !v)}
+                      style={{
+                        display: 'flex', alignItems: 'center', padding: '6px 6px',
+                        background: 'var(--accent-cyan)', color: '#fff',
+                        border: 'none', borderLeft: '1px solid rgba(255,255,255,0.25)',
+                        borderRadius: '0 var(--radius-sm) var(--radius-sm) 0', cursor: 'pointer',
+                      }}
+                    >
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                    </button>
+                    {exportQualityMenuOpen && (
+                      <div style={{
+                        position: 'absolute', top: '100%', right: 0, marginTop: 2,
+                        background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                        borderRadius: 'var(--radius-sm)', zIndex: 50, overflow: 'hidden',
+                        minWidth: 150, boxShadow: 'var(--shadow-sm)',
+                      }}>
+                        <div style={{ padding: '6px 10px', fontSize: 10, color: 'var(--text-muted)', borderBottom: '1px solid var(--border)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                          Export Quality
+                        </div>
+                        {['720p', '1080p', '4k'].map((q) => (
+                          <button
+                            key={q}
+                            onClick={() => {
+                              setClipSettings(prev => ({ ...prev, exportQuality: q }));
+                              setExportQualityMenuOpen(false);
+                            }}
+                            style={{
+                              display: 'block', width: '100%', padding: '6px 10px',
+                              background: q === (clipSettings?.exportQuality || '1080p') ? 'var(--accent-cyan)' : 'transparent',
+                              color: q === (clipSettings?.exportQuality || '1080p') ? '#fff' : 'var(--text-primary)',
+                              border: 'none', fontSize: 12, textAlign: 'left', cursor: 'pointer',
+                            }}
+                            onMouseEnter={e => { if (q !== (clipSettings?.exportQuality || '1080p')) e.target.style.background = 'var(--bg-hover)'; }}
+                            onMouseLeave={e => { if (q !== (clipSettings?.exportQuality || '1080p')) e.target.style.background = 'transparent'; }}
+                          >
+                            {q === '720p' ? '720p (Smaller)' : q === '1080p' ? '1080p (Default)' : '4K (Best)'}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
                 <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 4px' }} />
               </>
@@ -3111,6 +3169,31 @@ export default function Analysis() {
                     Export the entire video with the clip settings above applied — aspect ratio, subtitles{job.scenes?.length > 0 ? ', and Intelligent Dynamic Subject Tracking' : ''}.
                   </p>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 50 }}>Quality</span>
+                      <div style={{ display: 'flex', gap: 0, borderRadius: 'var(--radius-sm)', overflow: 'hidden', border: '1px solid var(--border)' }}>
+                        {[
+                          { value: '720p', label: '720p' },
+                          { value: '1080p', label: '1080p' },
+                          { value: '4k', label: '4K' },
+                        ].map((q) => (
+                          <button
+                            key={q.value}
+                            onClick={() => setClipSettings(prev => ({ ...prev, exportQuality: q.value }))}
+                            style={{
+                              padding: '4px 12px', fontSize: 11, fontWeight: 600,
+                              background: (clipSettings?.exportQuality || '1080p') === q.value ? 'var(--accent-amber)' : 'transparent',
+                              color: (clipSettings?.exportQuality || '1080p') === q.value ? 'var(--bg-base)' : 'var(--text-secondary)',
+                              border: 'none', cursor: 'pointer',
+                              borderRight: q.value !== '4k' ? '1px solid var(--border)' : 'none',
+                              transition: 'background 0.15s, color 0.15s',
+                            }}
+                          >
+                            {q.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                     <div style={{ display: 'flex', gap: 8 }}>
                       <button
                         onClick={() => {
