@@ -17,6 +17,7 @@ const TRACK_COLORS = {
   subtitle: '#8B5CF6',
   text: '#EC4899',
   shape: '#F97316',
+  crop: '#06B6D4',
 };
 
 const TRACK_ICONS = {
@@ -26,7 +27,17 @@ const TRACK_ICONS = {
   subtitle: '\uD83D\uDCAC',
   text: 'T',
   shape: '\u25A1',
+  crop: '\u2702',
 };
+
+// Crop segment cluster colors
+const CROP_CLUSTER_COLORS = [
+  '#3B82F6', // blue — speaker 0
+  '#10B981', // green — speaker 1
+  '#F59E0B', // amber — speaker 2
+  '#EC4899', // pink — speaker 3
+  '#8B5CF6', // purple — manual override / unknown
+];
 
 function formatTime(s) {
   if (!s || isNaN(s) || s < 0) return '0:00';
@@ -85,6 +96,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
 
   const tracks = useTimelineStore((s) => s.tracks);
   const items = useTimelineStore((s) => s.items);
+  const cropSegments = useTimelineStore((s) => s.cropSegments);
+  const selectedCropSegmentId = useTimelineStore((s) => s.selectedCropSegmentId);
+  const selectCropSegment = useTimelineStore((s) => s.selectCropSegment);
   const playhead = useTimelineStore((s) => s.playhead);
   const duration = useTimelineStore((s) => s.duration);
   const zoom = useTimelineStore((s) => s.zoom);
@@ -331,6 +345,53 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         }
       }
     });
+
+    // ── Crop segments (on the crop track) ──
+    if (cropSegments && cropSegments.length > 0) {
+      const cropTrackIdx = tracks.findIndex((t) => t.type === 'crop');
+      if (cropTrackIdx >= 0) {
+        const cropTrack = tracks[cropTrackIdx];
+        if (cropTrack.visible !== false) {
+          const cy = RULER_HEIGHT + cropTrackIdx * (TRACK_HEIGHT + TRACK_GAP);
+          cropSegments.forEach((seg) => {
+            const cx1 = contentLeft + seg.startTime * pps - sx;
+            const cx2 = contentLeft + seg.endTime * pps - sx;
+            const cw = cx2 - cx1;
+            if (cx2 < contentLeft || cx1 > canvasW) return;
+            const clipCX = Math.max(cx1, contentLeft);
+            const clipCW = Math.min(cw, canvasW - clipCX);
+
+            // Color by cluster or manual override
+            const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
+            const baseColor = CROP_CLUSTER_COLORS[clrIdx % CROP_CLUSTER_COLORS.length];
+            const isSelCrop = seg.id === selectedCropSegmentId;
+            ctx.fillStyle = isSelCrop ? baseColor + 'DD' : baseColor + '88';
+            ctx.beginPath();
+            ctx.roundRect(clipCX, cy + 3, clipCW, TRACK_HEIGHT - 6, 3);
+            ctx.fill();
+
+            // Selection border
+            if (isSelCrop) {
+              ctx.strokeStyle = '#FFFFFF';
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.roundRect(clipCX, cy + 3, clipCW, TRACK_HEIGHT - 6, 3);
+              ctx.stroke();
+              ctx.lineWidth = 1;
+            }
+
+            // Label
+            if (cw > 30) {
+              ctx.fillStyle = '#fff';
+              ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+              ctx.textAlign = 'left';
+              const lbl = seg.label || `${seg.cropX}%`;
+              ctx.fillText(lbl, Math.max(cx1 + 6, contentLeft + 4), cy + TRACK_HEIGHT / 2 + 3, cw - 12);
+            }
+          });
+        }
+      }
+    }
 
     // ── Segment boundaries ──
     if (segments && segments.length > 0) {
@@ -693,8 +754,22 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         });
       }
     } else {
-      // No item hit — check if near playhead line for grab, otherwise seek
+      // No item hit — check crop track click, then playhead, then seek
       const time = getTimeFromX(e.clientX);
+
+      // Check if click is on the crop track
+      const cropTrackIdx = tracks.findIndex((t) => t.type === 'crop');
+      const clickTrackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
+      if (cropTrackIdx >= 0 && clickTrackIdx === cropTrackIdx) {
+        const { cropSegments: segs } = useTimelineStore.getState();
+        const hitSeg = segs.find(s => time >= s.startTime && time < s.endTime);
+        if (hitSeg) {
+          selectCropSegment(hitSeg.id);
+          setSelectedItemId(null);
+          return;
+        }
+      }
+
       if (!isInRuler && distToPlayhead <= Math.max(PLAYHEAD_GRAB_WIDTH / 2, 8)) {
         // Grab the playhead line directly
         setPlayhead(time);
@@ -705,6 +780,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         // Click on empty area: seek + deselect
         setPlayhead(time);
         setSelectedItemId(null);
+        selectCropSegment(null);
         onSeek?.(time);
         setIsDragging(true);
         setDragInfo({ type: 'scrub', startX: e.clientX });

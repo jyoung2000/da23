@@ -1583,3 +1583,62 @@ export function computeLayoutAtTime(t, layoutTimeline, srcW, srcH, targetAspect,
 
   return { mode: 'single' };
 }
+
+
+/**
+ * Convert subject tracking keyframes into crop segments for the timeline.
+ *
+ * Each segment represents a continuous period at a fixed crop X position.
+ * Consecutive keyframes with the same x value are merged into one segment.
+ *
+ * @param {Array<{t: number, x: number}>} keyframes - Processed keyframes
+ * @param {number} duration - Total clip duration in seconds
+ * @param {Array<{center: number, count: number}>|null} clusters - Detected speaker clusters
+ * @returns {Array<{id: string, startTime: number, endTime: number, cropX: number, clusterId: number, isManualOverride: boolean, label: string, originalCropX: number}>}
+ */
+export function keyframesToCropSegments(keyframes, duration, clusters) {
+  if (!keyframes?.length || !duration) return [];
+
+  // Build a lookup: x → closest cluster index
+  const clusterLookup = (x) => {
+    if (!clusters?.length) return -1;
+    let bestIdx = 0;
+    let bestDist = Math.abs(x - clusters[0].center);
+    for (let i = 1; i < clusters.length; i++) {
+      const d = Math.abs(x - clusters[i].center);
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    return bestDist <= 15 ? bestIdx : -1;
+  };
+
+  const segments = [];
+  let segStart = keyframes[0].t;
+  let segX = keyframes[0].x;
+
+  for (let i = 1; i < keyframes.length; i++) {
+    const kf = keyframes[i];
+    if (kf.x !== segX) {
+      // End current segment, start new one
+      segments.push({ startTime: segStart, endTime: kf.t, cropX: segX });
+      segStart = kf.t;
+      segX = kf.x;
+    }
+  }
+  // Final segment to end of clip
+  segments.push({ startTime: segStart, endTime: duration, cropX: segX });
+
+  // Annotate with IDs, cluster info, and labels
+  return segments.map((seg, i) => {
+    const cId = clusterLookup(seg.cropX);
+    return {
+      id: `crop-${i}`,
+      startTime: seg.startTime,
+      endTime: seg.endTime,
+      cropX: seg.cropX,
+      originalCropX: seg.cropX,
+      clusterId: cId,
+      isManualOverride: false,
+      label: cId >= 0 ? `Speaker ${cId + 1}` : `${seg.cropX}%`,
+    };
+  });
+}

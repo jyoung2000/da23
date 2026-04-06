@@ -605,7 +605,99 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
     return null;
   }, [item, itemTrack]);
 
+  // ── Crop segment properties ──
+  const cropSegments = useTimelineStore((s) => s.cropSegments);
+  const selectedCropSegmentId = useTimelineStore((s) => s.selectedCropSegmentId);
+  const updateCropSegment = useTimelineStore((s) => s.updateCropSegment);
+  const splitCropSegment = useTimelineStore((s) => s.splitCropSegment);
+  const mergeCropWithNext = useTimelineStore((s) => s.mergeCropWithNext);
+  const resetCropSegment = useTimelineStore((s) => s.resetCropSegment);
+  const playhead = useTimelineStore((s) => s.playhead);
+
+  const selectedCropSeg = useMemo(
+    () => selectedCropSegmentId ? cropSegments.find(s => s.id === selectedCropSegmentId) : null,
+    [cropSegments, selectedCropSegmentId],
+  );
+
   if (!item) {
+    if (selectedCropSeg) {
+      return (
+        <div className={`ve-properties${compact ? ' ve-properties--compact' : ''}`}>
+          <div className="ve-properties__header">
+            <span className="ve-properties__type-badge" data-type="crop" style={{ background: '#06B6D4', color: '#fff', padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600 }}>
+              Crop
+            </span>
+          </div>
+
+          {/* Position slider */}
+          <div style={{ padding: '8px 12px' }}>
+            <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>Horizontal Position</label>
+            <input
+              type="range"
+              min={0} max={100} step={1}
+              value={selectedCropSeg.cropX}
+              onChange={e => updateCropSegment({ ...selectedCropSeg, cropX: Number(e.target.value) })}
+              style={{ width: '100%', accentColor: '#06B6D4' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' }}>
+              <span>Left</span>
+              <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>{selectedCropSeg.cropX}%</span>
+              <span>Right</span>
+            </div>
+          </div>
+
+          {/* Timing */}
+          <div style={{ padding: '4px 12px', display: 'flex', gap: 8 }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>Start</label>
+              <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>{selectedCropSeg.startTime.toFixed(1)}s</span>
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>End</label>
+              <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>{selectedCropSeg.endTime.toFixed(1)}s</span>
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>Duration</label>
+              <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>{(selectedCropSeg.endTime - selectedCropSeg.startTime).toFixed(1)}s</span>
+            </div>
+          </div>
+
+          {/* Label */}
+          <div style={{ padding: '4px 12px' }}>
+            <label style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>Segment</label>
+            <span style={{ fontSize: 12 }}>
+              {selectedCropSeg.label}
+              {selectedCropSeg.isManualOverride && <span style={{ fontSize: 10, color: '#8B5CF6', marginLeft: 6 }}>(manual)</span>}
+            </span>
+          </div>
+
+          {/* Actions */}
+          <div style={{ padding: '8px 12px', display: 'flex', gap: 6, flexWrap: 'wrap', borderTop: '1px solid var(--border)' }}>
+            <button
+              onClick={() => splitCropSegment(selectedCropSeg.id, playhead)}
+              style={{ padding: '4px 10px', fontSize: 11, background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer' }}
+            >
+              Split at Playhead
+            </button>
+            <button
+              onClick={() => mergeCropWithNext(selectedCropSeg.id)}
+              style={{ padding: '4px 10px', fontSize: 11, background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer' }}
+            >
+              Merge with Next
+            </button>
+            {selectedCropSeg.isManualOverride && (
+              <button
+                onClick={() => resetCropSegment(selectedCropSeg.id, selectedCropSeg.originalCropX)}
+                style={{ padding: '4px 10px', fontSize: 11, background: 'var(--bg-elevated)', color: '#06B6D4', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer' }}
+              >
+                Reset to Auto
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="ve-properties ve-properties--empty">
         <span className="ve-properties__placeholder">

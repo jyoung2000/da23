@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes } from '../utils/subjectTracking';
-import useResponsive from '../hooks/useResponsive';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes, keyframesToCropSegments } from '../utils/subjectTracking';
 import useTimelineStore from '../stores/timelineStore';
+import useResponsive from '../hooks/useResponsive';
 import useTimelinePersistence from '../hooks/useTimelinePersistence';
 import useKeyboardShortcuts from '../hooks/useKeyboardShortcuts';
 import useEncodingManager from '../hooks/useEncodingManager';
@@ -896,6 +896,21 @@ export default function VideoEditor({
   useEffect(() => {
     if (onSubjectKeyframes) onSubjectKeyframes(subjectKeyframes);
   }, [subjectKeyframes]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Populate crop segments on timeline when keyframes change
+  useEffect(() => {
+    const setCropSegments = useTimelineStore.getState().setCropSegments;
+    if (!isCrop || !subjectKeyframes?.length) {
+      setCropSegments([]);
+      return;
+    }
+    const dur = clipEnd - clipStart;
+    const clusters = detectPositionClusters(
+      subjectKeyframes.map(kf => [kf.t, kf.x])
+    );
+    const segments = keyframesToCropSegments(subjectKeyframes, dur, clusters);
+    setCropSegments(segments);
+  }, [subjectKeyframes, isCrop, clipStart, clipEnd]);
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),

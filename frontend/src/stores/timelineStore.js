@@ -6,6 +6,7 @@ import { temporal } from 'zundo';
 const createDefaultTracks = () => [
   { id: 't1', type: 'subtitle', name: 'Subtitles', muted: false, locked: false, visible: true },
   { id: 'v2', type: 'overlay', name: 'Overlay', muted: false, locked: false, visible: true },
+  { id: 'c1', type: 'crop', name: 'Crop', muted: false, locked: false, visible: true },
   { id: 'v1', type: 'video', name: 'Video', muted: false, locked: false, visible: true },
   { id: 'a2', type: 'audio', name: 'Music', muted: false, locked: false, visible: true },
   { id: 'a1', type: 'audio', name: 'Audio', muted: false, locked: false, visible: true },
@@ -16,6 +17,7 @@ const createDefaultTracks = () => [
 export const TRACK_ALLOWED_TYPES = {
   video: ['video'],
   overlay: ['text', 'shape', 'image', 'overlay'],
+  crop: ['crop'],
   audio: ['audio'],
   subtitle: ['subtitle'],
 };
@@ -225,6 +227,10 @@ const useTimelineStore = create(
 
       // ── Original subtitle timings (snapshot from initFromClip for reset) ──
       _originalSubtitles: [],
+
+      // ── Crop segments (subject tracking keyframes as editable segments) ──
+      cropSegments: [],          // [{id, startTime, endTime, cropX, clusterId, isManualOverride, label}]
+      selectedCropSegmentId: null,
 
       // ── Playback state (not tracked by undo) ──
       playhead: 0,
@@ -887,6 +893,8 @@ const useTimelineStore = create(
           items,
           mediaLibrary,
           _originalSubtitles: originalSubtitles,
+          cropSegments: [],
+          selectedCropSegmentId: null,
           playhead: 0,
           duration,
           zoom: 1.0,
@@ -897,6 +905,39 @@ const useTimelineStore = create(
           activeTool: 'select',
         });
       },
+
+      // ── Crop segment actions ──
+      setCropSegments: (segments) => set({ cropSegments: segments, selectedCropSegmentId: null }),
+      selectCropSegment: (id) => set({ selectedCropSegmentId: id }),
+      updateCropSegment: (updated) => set((state) => ({
+        cropSegments: state.cropSegments.map(s => s.id === updated.id ? { ...updated, isManualOverride: true } : s),
+      })),
+      splitCropSegment: (segmentId, splitTime) => set((state) => {
+        const seg = state.cropSegments.find(s => s.id === segmentId);
+        if (!seg || splitTime <= seg.startTime || splitTime >= seg.endTime) return {};
+        return {
+          cropSegments: state.cropSegments.flatMap(s => {
+            if (s.id !== segmentId) return [s];
+            return [
+              { ...s, id: `${s.id}-a`, endTime: splitTime },
+              { ...s, id: `${s.id}-b`, startTime: splitTime },
+            ];
+          }),
+        };
+      }),
+      mergeCropWithNext: (segmentId) => set((state) => {
+        const idx = state.cropSegments.findIndex(s => s.id === segmentId);
+        if (idx < 0 || idx >= state.cropSegments.length - 1) return {};
+        const merged = { ...state.cropSegments[idx], endTime: state.cropSegments[idx + 1].endTime };
+        const segs = [...state.cropSegments];
+        segs.splice(idx, 2, merged);
+        return { cropSegments: segs };
+      }),
+      resetCropSegment: (segmentId, originalX) => set((state) => ({
+        cropSegments: state.cropSegments.map(s =>
+          s.id === segmentId ? { ...s, cropX: originalX, isManualOverride: false } : s
+        ),
+      })),
 
       // Reset to defaults
       reset: () => {

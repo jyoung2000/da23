@@ -961,12 +961,21 @@ export default function Analysis() {
       timelineItems_types: [...new Set(timelineItems.map(it => it.type))],
     }));
 
-    // Include preview player's exact subject tracking keyframes for export parity
-    if (editorSubjectKeyframes?.length > 0 && exportBody.aspect_ratio) {
-      exportBody.subject_keyframes = editorSubjectKeyframes.map(kf => ({
-        time: +kf.t.toFixed(3),
-        x: kf.x,
-      }));
+    // Include subject tracking keyframes for export parity.
+    // Prefer crop segments from timeline (may have user edits) over raw keyframes.
+    if (exportBody.aspect_ratio) {
+      const { cropSegments } = useTimelineStore.getState();
+      if (cropSegments?.length > 0) {
+        exportBody.subject_keyframes = cropSegments.map(seg => ({
+          time: +seg.startTime.toFixed(3),
+          x: seg.cropX,
+        }));
+      } else if (editorSubjectKeyframes?.length > 0) {
+        exportBody.subject_keyframes = editorSubjectKeyframes.map(kf => ({
+          time: +kf.t.toFixed(3),
+          x: kf.x,
+        }));
+      }
     }
 
     encoding.startExport(jobId, clip.id, clip.title || `Clip ${clip.id}`, exportBody);
@@ -1048,12 +1057,20 @@ export default function Analysis() {
       body.edited_subtitle_segments = fvSubtitleItems;
     }
 
-    // Include preview player's exact subject tracking keyframes for export parity
-    if (editorSubjectKeyframes?.length > 0 && body.aspect_ratio) {
-      body.subject_keyframes = editorSubjectKeyframes.map(kf => ({
-        time: +kf.t.toFixed(3),
-        x: kf.x,
-      }));
+    // Include subject tracking keyframes — prefer crop segments (may have user edits)
+    if (body.aspect_ratio) {
+      const { cropSegments } = useTimelineStore.getState();
+      if (cropSegments?.length > 0) {
+        body.subject_keyframes = cropSegments.map(seg => ({
+          time: +seg.startTime.toFixed(3),
+          x: seg.cropX,
+        }));
+      } else if (editorSubjectKeyframes?.length > 0) {
+        body.subject_keyframes = editorSubjectKeyframes.map(kf => ({
+          time: +kf.t.toFixed(3),
+          x: kf.x,
+        }));
+      }
     }
 
     encoding.startExport(jobId, 0, job.filename || 'Full Video', body, {
