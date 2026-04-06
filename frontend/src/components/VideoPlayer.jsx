@@ -212,43 +212,26 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     [isCrop, subjectKeyframes],
   );
 
-  // Update objectPosition dynamically via rAF for smooth ~60fps updates
+  // Update objectPosition dynamically via rAF for instant ~60fps snaps
   const lastAppliedPctRef = useRef(null);
-  const transitionStartRef = useRef(null);
-  const TRANSITION_DURATION = 0.3; // 300ms for aspect ratio transitions
   useEffect(() => {
     if (!hasDynamicSubject) return;
     const video = videoRef.current;
     if (!video) return;
-    // If we have a previous position, start a smooth transition
-    if (lastAppliedPctRef.current !== null) {
-      transitionStartRef.current = performance.now();
-    }
     // Apply initial position synchronously to eliminate 1-2 frame gap
     {
       const initRel = video.currentTime - (clipStart || 0);
       const initSx = interpolateSubjectX(subjectKeyframes, initRel);
       const initPct = subjectXToCenterPct(initSx, srcRatio, targetRatio);
       video.style.objectPosition = `${initPct}% 50%`;
-      if (lastAppliedPctRef.current === null) lastAppliedPctRef.current = initPct;
+      lastAppliedPctRef.current = initPct;
     }
     let animId;
     let lastPct = null;
     const tick = () => {
       const relTime = video.currentTime - (clipStart || 0);
       const sx = interpolateSubjectX(subjectKeyframes, relTime);
-      let centerPct = subjectXToCenterPct(sx, srcRatio, targetRatio);
-      // Smooth transition when aspect ratio just changed
-      if (transitionStartRef.current !== null && lastAppliedPctRef.current !== null) {
-        const elapsed = (performance.now() - transitionStartRef.current) / 1000;
-        if (elapsed < TRANSITION_DURATION) {
-          const t = elapsed / TRANSITION_DURATION;
-          const eased = t * t * (3 - 2 * t); // smoothstep
-          centerPct = lastAppliedPctRef.current + (centerPct - lastAppliedPctRef.current) * eased;
-        } else {
-          transitionStartRef.current = null;
-        }
-      }
+      const centerPct = subjectXToCenterPct(sx, srcRatio, targetRatio);
       // Only update DOM if value actually changed (avoid layout thrashing)
       const rounded = Math.round(centerPct * 10000) / 10000;
       if (rounded !== lastPct) {

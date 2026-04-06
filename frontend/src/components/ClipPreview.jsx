@@ -628,11 +628,9 @@ export default function ClipPreview({
     return () => cancelAnimationFrame(animId);
   }, [subtitlesEnabled, clipSegments, clipStart, activeWordEnabled, speakerRates]);
 
-  // --- Dynamic subject tracking: update objectPosition via rAF for smooth ~60fps updates ---
+  // --- Dynamic subject tracking: update objectPosition via rAF for instant ~60fps snaps ---
   const srcRatio = sourceWidth / sourceHeight;
   const lastAppliedPctRef = useRef(null);
-  const transitionStartRef = useRef(null);
-  const TRANSITION_DURATION = 0.3; // 300ms for aspect ratio transitions
   useEffect(() => {
     if (!hasDynamicSubject) return;
     const video = fgVideoRef.current;
@@ -644,10 +642,6 @@ export default function ClipPreview({
       `[SubjectTracking] DYNAMIC mode active (rAF): R=${R.toFixed(3)} (src=${srcRatio.toFixed(3)}, target=${targetRatio.toFixed(3)}), ` +
       `${subjectKeyframes.length} keyframes`
     );
-    // If we have a previous position, start a smooth transition
-    if (lastAppliedPctRef.current !== null) {
-      transitionStartRef.current = performance.now();
-    }
     // Apply initial position synchronously to eliminate 1-2 frame gap
     // between effect cleanup and first rAF tick
     {
@@ -655,29 +649,14 @@ export default function ClipPreview({
       const initSx = interpolateSubjectX(subjectKeyframes, initRel);
       const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
       video.style.objectPosition = `${initPct}% ${yPositionPct}%`;
-      if (lastAppliedPctRef.current === null) {
-        lastAppliedPctRef.current = initPct;
-      }
+      lastAppliedPctRef.current = initPct;
     }
     let animId;
     const tick = () => {
       const relTime = video.currentTime - clipStart;
       const sx = interpolateSubjectX(subjectKeyframes, relTime);
-      let centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
-      // Smooth transition when aspect ratio just changed
-      if (transitionStartRef.current !== null && lastAppliedPctRef.current !== null) {
-        const elapsed = (performance.now() - transitionStartRef.current) / 1000;
-        if (elapsed < TRANSITION_DURATION) {
-          const t = elapsed / TRANSITION_DURATION;
-          const eased = t * t * (3 - 2 * t); // smoothstep
-          centerPct = lastAppliedPctRef.current + (centerPct - lastAppliedPctRef.current) * eased;
-        } else {
-          transitionStartRef.current = null;
-        }
-      }
+      const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
       // Only update DOM if value actually changed (avoid layout thrashing)
-      // Use higher precision — 4 decimal places eliminates visible stepping
-      // while still preventing unnecessary DOM updates
       const rounded = Math.round(centerPct * 10000) / 10000;
       if (rounded !== lastPct) {
         video.style.objectPosition = `${centerPct}% ${yPositionPct}%`;

@@ -1289,21 +1289,17 @@ export function interpolateSubjectX(keyframes, t) {
   if (t <= keyframes[0].t) return keyframes[0].x;
   if (t >= keyframes[keyframes.length - 1].t) return keyframes[keyframes.length - 1].x;
 
-  // Find surrounding keyframes via linear scan (keyframes are typically < 30 entries)
-  for (let i = 0; i < keyframes.length - 1; i++) {
-    const k0 = keyframes[i];
-    const k1 = keyframes[i + 1];
-    if (t >= k0.t && t < k1.t) {
-      const dt = k1.t - k0.t;
-      if (dt <= 0) return k0.x;
-      const frac = (t - k0.t) / dt;
-      // Smoothstep easing: 3t^2 - 2t^3 (zero velocity at both endpoints)
-      const easedFrac = frac * frac * (3 - 2 * frac);
-      return k0.x + (k1.x - k0.x) * easedFrac;
+  // Step function: hold the current keyframe's x value until the next
+  // keyframe. No interpolation, no smoothstep — speaker changes are
+  // instant hard cuts (the keyframes already have 1ms transition pairs
+  // from handleSceneCuts for speaker changes).
+  for (let i = keyframes.length - 1; i >= 0; i--) {
+    if (keyframes[i].t <= t) {
+      return keyframes[i].x;
     }
   }
 
-  return keyframes[keyframes.length - 1].x;
+  return keyframes[0].x;
 }
 
 // Keep old smoothKeyframes export for backward compatibility (unused but safe)
