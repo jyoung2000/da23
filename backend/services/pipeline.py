@@ -2528,26 +2528,35 @@ async def _run_analysis_inner(job_id: str):
                 synth_scenes = [s for s in scenes if s.description == "[dense face tracking]"]
                 synth_scenes.sort(key=lambda s: s.timestamp)
 
-                MIN_HOLD_SECONDS = 2.0
+                MIN_HOLD_SECONDS = 2.5
                 smoothed = 0
-                i = 1
-                while i < len(synth_scenes) - 1:
-                    prev_sx = synth_scenes[i - 1].subject_x
-                    curr_sx = synth_scenes[i].subject_x
-                    next_sx = synth_scenes[i + 1].subject_x
+                # Multi-pass: repeat until stable (cascading blips get
+                # caught in subsequent passes)
+                for _pass in range(3):
+                    changed_this_pass = 0
+                    i = 1
+                    while i < len(synth_scenes) - 1:
+                        prev_sx = synth_scenes[i - 1].subject_x
+                        curr_sx = synth_scenes[i].subject_x
+                        next_sx = synth_scenes[i + 1].subject_x
 
-                    dt = synth_scenes[i + 1].timestamp - synth_scenes[i].timestamp
-                    if dt < MIN_HOLD_SECONDS and abs(curr_sx - prev_sx) > 10 and abs(curr_sx - next_sx) > 10:
-                        synth_scenes[i].subject_x = prev_sx
-                        if synth_scenes[i].active_speaker_x is not None:
-                            synth_scenes[i].active_speaker_x = prev_sx
-                        smoothed += 1
-                    i += 1
+                        dt = synth_scenes[i + 1].timestamp - synth_scenes[i].timestamp
+                        if dt < MIN_HOLD_SECONDS and abs(curr_sx - prev_sx) > 10 and abs(curr_sx - next_sx) > 10:
+                            synth_scenes[i].subject_x = prev_sx
+                            if synth_scenes[i].active_speaker_x is not None:
+                                synth_scenes[i].active_speaker_x = prev_sx
+                            if synth_scenes[i].precise_x is not None:
+                                synth_scenes[i].precise_x = prev_sx
+                            changed_this_pass += 1
+                        i += 1
+                    smoothed += changed_this_pass
+                    if changed_this_pass == 0:
+                        break
 
                 if smoothed > 0:
                     logger.info(
-                        "[%s] Temporal hold: smoothed %d brief speaker blips (<%ss)",
-                        job_id, smoothed, MIN_HOLD_SECONDS,
+                        "[%s] Temporal hold: smoothed %d brief speaker blips (<%ss, %d passes)",
+                        job_id, smoothed, MIN_HOLD_SECONDS, _pass + 1,
                     )
 
             if synthetic_count > 0:

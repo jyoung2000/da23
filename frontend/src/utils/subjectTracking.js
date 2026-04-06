@@ -850,6 +850,17 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   );
 
   if (clusters && clusters.length >= 2) {
+    // Clamp cluster centers to the safe range for the target aspect ratio
+    // so that snapToClusters produces values already within bounds.
+    // Without this, a cluster center at 24 might be snapped to, but then
+    // bounds enforcement shifts it to 21 — misaligning with the face.
+    if (srcRatio && targetRatio) {
+      const safeRange = computeSafeRange(srcRatio, targetRatio);
+      for (const c of clusters) {
+        c.center = Math.max(safeRange.min, Math.min(safeRange.max, c.center));
+      }
+    }
+
     // Multi-position mode: snap to cluster centers, then use scene cuts for instant jumps.
     // NO smoothing — speaker/position changes must be instant snaps, not pans.
     // Dense data from backend slot-center-snapping benefits from cluster snap too:
@@ -989,6 +1000,44 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }));
     }
 
+    // ── Post-bounds minimum hold filter ──
+    // After scene cuts and bounds enforcement, remove any remaining sub-threshold
+    // holds that create visible micro-jumps. handleSceneCuts may have inserted
+    // 1ms transition pairs — those are fine. This targets real holds < 1.5s.
+    if (result.length >= 3) {
+      const POST_MIN_HOLD = isDenseData ? 1.5 : 2.0;
+      let beforeCount = result.length;
+      // Pass 1: remove blips surrounded by same position
+      let ri = 1;
+      while (ri < result.length - 1) {
+        const hold = result[ri + 1].t - result[ri].t;
+        if (hold > 0.01 && hold < POST_MIN_HOLD && result[ri - 1].x === result[ri + 1].x) {
+          result.splice(ri, 1);
+        } else {
+          ri++;
+        }
+      }
+      // Pass 2: merge remaining short holds into previous
+      ri = 1;
+      while (ri < result.length - 1) {
+        const hold = result[ri + 1].t - result[ri].t;
+        if (hold > 0.01 && hold < POST_MIN_HOLD) {
+          result[ri].x = result[ri - 1].x;
+          // Deduplicate if now matches previous
+          if (result[ri].x === result[ri - 1].x) {
+            result.splice(ri, 1);
+          } else {
+            ri++;
+          }
+        } else {
+          ri++;
+        }
+      }
+      if (result.length < beforeCount) {
+        console.log(`[SubjectTracking] Post-bounds filter: ${beforeCount} → ${result.length} keyframes (removed ${beforeCount - result.length} blips < ${POST_MIN_HOLD}s)`);
+      }
+    }
+
     // ── Fix leading center keyframes after bounds enforcement ──
     // SKIP for dense data — center values are real speaker positions, not noise.
     if (!isDenseData && result.length > 0) {
@@ -1025,6 +1074,29 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       // Log cluster positions for debugging (no override applied)
       console.log('[SubjectTracking] Dense data: using cluster centers directly (no px override)',
         clusters.map(c => c.center));
+    }
+
+    // ── Snap keyframe timestamps to dense sample boundaries ──
+    // Dense face data has ~1s intervals. Align transition keyframes to the
+    // nearest raw sample time so the crop changes at the exact moment the
+    // speaker changes, not 1-2 frames before or after.
+    if (isDenseData && result.length >= 2) {
+      for (let ki = 1; ki < result.length; ki++) {
+        // Skip the first keyframe (t=0) and 1ms transition pairs
+        if (result[ki].t <= 0.01) continue;
+        if (ki > 0 && result[ki].t - result[ki - 1].t <= 0.01) continue;
+        // Find nearest raw keyframe timestamp
+        let bestRaw = raw[0];
+        let bestDist = Math.abs(result[ki].t - raw[0].t);
+        for (const r of raw) {
+          const d = Math.abs(result[ki].t - r.t);
+          if (d < bestDist) { bestDist = d; bestRaw = r; }
+        }
+        // Only snap if within 1s of a raw sample (don't move far)
+        if (bestDist > 0 && bestDist <= 1.0) {
+          result[ki].t = bestRaw.t;
+        }
+      }
     }
 
     // ── QA validation: fix extended center holds and missing instant cuts ──
