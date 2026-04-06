@@ -5524,6 +5524,7 @@ async def export_clip(
     face_registry_data: dict | None = None,
     layout_timeline_data: list | None = None,
     hook_text: str = "",
+    frontend_subject_keyframes: list[dict] | None = None,
 ) -> str:
     """Export a clip from video using FFmpeg.
 
@@ -6068,7 +6069,33 @@ async def export_clip(
                     clip_id,
                 )
 
-            if subject_scenes and aspect_ratio and not all_tracking_off:
+            # ── Frontend keyframe override: use preview player's exact keyframes ──
+            if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
+                keyframes = [
+                    (round(kf.get("time", 0), 3), int(round(kf.get("x", 50))))
+                    for kf in frontend_subject_keyframes
+                ]
+                keyframes.sort()
+                logger.info(
+                    "[SubjectTracking] clip %s: Using %d frontend keyframes for crop (preview-export parity)",
+                    clip_id, len(keyframes),
+                )
+                for kf_t, kf_x in keyframes[:5]:
+                    logger.info("  t=%.1fs x=%d%%", kf_t, kf_x)
+                if len(keyframes) > 5:
+                    logger.info("  ... (%d more)", len(keyframes) - 5)
+
+                # Check if all keyframes converge to single value → use static crop
+                unique_x = set(kf[1] for kf in keyframes)
+                if len(unique_x) <= 1:
+                    subject_x = keyframes[0][1]
+                    keyframes = None
+                    logger.info(
+                        "[SubjectTracking] clip %s: frontend keyframes all sx=%d — static crop",
+                        clip_id, subject_x,
+                    )
+
+            elif subject_scenes and aspect_ratio and not all_tracking_off:
                 # ── PHASE 0: Build raw keyframes ──
                 raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
 

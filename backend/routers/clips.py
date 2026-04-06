@@ -370,6 +370,7 @@ async def export_clip_endpoint(
                 face_registry_data=getattr(job, 'face_registry_data', None),
                 layout_timeline_data=getattr(job, 'layout_timeline', None),
                 hook_text=req.hook_text,
+                frontend_subject_keyframes=req.subject_keyframes,
             )
 
             elapsed = int(time.monotonic() - export_start)
@@ -548,6 +549,7 @@ async def export_full_video_endpoint(job_id: str, req: FullVideoExportRequest):
                 image_overlays=[i.model_dump() for i in req.image_overlays] if req.image_overlays else None,
                 shape_overlays=[s.model_dump() for s in req.shape_overlays] if hasattr(req, 'shape_overlays') and req.shape_overlays else None,
                 audio_overlays=[a.model_dump() for a in req.audio_overlays] if hasattr(req, 'audio_overlays') and req.audio_overlays else None,
+                frontend_subject_keyframes=req.subject_keyframes,
             )
 
             elapsed = int(time.monotonic() - export_start)

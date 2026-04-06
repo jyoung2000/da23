@@ -725,7 +725,7 @@ const useTimelineStore = create(
 
       // Initialize timeline with clip data (backward compat)
       initFromClip: (clipData) => {
-        const { src, clipStart, clipEnd, subtitleSegments } = clipData;
+        const { src, clipStart, clipEnd, subtitleSegments, hookText } = clipData;
         const duration = clipEnd - clipStart;
 
         const baseMediaId = nextMediaId();
@@ -834,6 +834,43 @@ const useTimelineStore = create(
                 transcriptIndex: segIdx,
               });
             }
+          });
+        }
+
+        // Add CTA/hook text overlay item if provided
+        if (hookText && hookText.length > 3) {
+          items.push({
+            id: nextItemId(),
+            trackId: 'v2',
+            type: 'text',
+            mediaRef: null,
+            start: 0,
+            end: Math.min(3.0, duration),
+            trimStart: 0,
+            trimEnd: null,
+            volume: 1.0,
+            speed: 1.0,
+            opacity: 1.0,
+            position: { x: 50, y: 40 },
+            size: { w: 80, h: 20 },
+            transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 },
+            effects: {},
+            fadeIn: 0.3,
+            fadeOut: 0.5,
+            transition: null,
+            textContent: hookText,
+            textStyle: {
+              fontSize: 28,
+              fontWeight: 700,
+              fontFamily: 'sans-serif',
+              color: '#FFFFFF',
+              textAlign: 'center',
+              backgroundColor: 'rgba(0,0,0,0.7)',
+              padding: 8,
+              borderRadius: 8,
+              outlineWidth: 0,
+              outlineColor: '#000000',
+            },
           });
         }
 

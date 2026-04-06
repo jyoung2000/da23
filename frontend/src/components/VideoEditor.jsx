@@ -224,6 +224,8 @@ export default function VideoEditor({
   isProcessing = false,
   // Expose internal video element to parent via callback
   onVideoRef,
+  // Expose computed subject keyframes to parent for export parity
+  onSubjectKeyframes,
 }) {
   const { isMobile } = useResponsive();
 
@@ -889,6 +891,11 @@ export default function VideoEditor({
     );
     return result;
   }, [scenes, clipStart, clipEnd, isCrop, srcRatio, targetRatio, transcript, sceneCuts]);
+
+  // Expose keyframes to parent for export parity
+  useEffect(() => {
+    if (onSubjectKeyframes) onSubjectKeyframes(subjectKeyframes);
+  }, [subjectKeyframes]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),

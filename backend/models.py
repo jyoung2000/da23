@@ -337,6 +337,7 @@ class ExportRequest(BaseModel):
     pip_position: str = "bottom_right"  # For PIP mode
     pip_size_pct: float = 25.0          # For PIP mode
     hook_text: str = ""  # Text overlay for the opening frame
+    subject_keyframes: Optional[list[dict]] = None  # Frontend-computed [{time, x}] for export crop parity
 
 
 class FullVideoExportRequest(BaseModel):
@@ -357,6 +358,7 @@ class FullVideoExportRequest(BaseModel):
     image_overlays: list[ImageOverlay] = []
     shape_overlays: list[ShapeOverlay] = []
     edited_subtitle_segments: Optional[list[TranscriptSegment]] = None  # User-edited subtitle timing from timeline
+    subject_keyframes: Optional[list[dict]] = None  # Frontend-computed [{time, x}] for export crop parity
 
 
 class UpdateClipTitleRequest(BaseModel):

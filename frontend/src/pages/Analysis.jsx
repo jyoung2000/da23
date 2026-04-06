@@ -345,6 +345,7 @@ export default function Analysis() {
 
   // VideoEditor state for export params
   const [editorTrim, setEditorTrim] = useState({ trimStart: 0, trimEnd: 0 });
+  const [editorSubjectKeyframes, setEditorSubjectKeyframes] = useState(null);
   const [editorVolume, setEditorVolume] = useState(1.0);
   const [editorSpeed, setEditorSpeed] = useState(1.0);
   const [editorSegments, setEditorSegments] = useState([]);
@@ -843,6 +844,7 @@ export default function Analysis() {
       clipStart: clip.start_time,
       clipEnd: clip.end_time,
       subtitleSegments: fullTranscript,
+      hookText: clip.hook_text || clip.title || '',
     });
 
     setClipPreview(clip);
@@ -959,6 +961,14 @@ export default function Analysis() {
       timelineItems_types: [...new Set(timelineItems.map(it => it.type))],
     }));
 
+    // Include preview player's exact subject tracking keyframes for export parity
+    if (editorSubjectKeyframes?.length > 0 && exportBody.aspect_ratio) {
+      exportBody.subject_keyframes = editorSubjectKeyframes.map(kf => ({
+        time: +kf.t.toFixed(3),
+        x: kf.x,
+      }));
+    }
+
     encoding.startExport(jobId, clip.id, clip.title || `Clip ${clip.id}`, exportBody);
     showToast(`Exporting "${clip.title || `Clip ${clip.id}`}" at ${quality}...`, 'info');
   };
@@ -1036,6 +1046,14 @@ export default function Analysis() {
       }));
     if (fvSubtitleItems.length > 0) {
       body.edited_subtitle_segments = fvSubtitleItems;
+    }
+
+    // Include preview player's exact subject tracking keyframes for export parity
+    if (editorSubjectKeyframes?.length > 0 && body.aspect_ratio) {
+      body.subject_keyframes = editorSubjectKeyframes.map(kf => ({
+        time: +kf.t.toFixed(3),
+        x: kf.x,
+      }));
     }
 
     encoding.startExport(jobId, 0, job.filename || 'Full Video', body, {
@@ -2042,6 +2060,7 @@ export default function Analysis() {
               transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
+              onSubjectKeyframes={setEditorSubjectKeyframes}
               onClose={() => {
                 if (clipPreview) {
                   clipSegmentsMapRef.current[clipPreview.id] = editorSegments;
@@ -2145,6 +2164,7 @@ export default function Analysis() {
               transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
+              onSubjectKeyframes={setEditorSubjectKeyframes}
               subtitleOverlay={
                 <SubtitleOverlay
                   currentTime={videoCurrentTime}
