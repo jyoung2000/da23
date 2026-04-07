@@ -541,6 +541,24 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     return () => cancelAnimationFrame(rafId);
   }, [isPlaying, draw]);
 
+  // Auto-scroll timeline to keep playhead visible during playback
+  useEffect(() => {
+    if (!isPlaying) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const visibleWidth = canvas.getBoundingClientRect().width - LABEL_WIDTH;
+    if (visibleWidth <= 0) return;
+    const playheadPx = playhead * pps;
+    const viewStart = scrollX;
+    const viewEnd = scrollX + visibleWidth;
+    // When playhead moves past 80% of the visible area, scroll to keep it at 20%
+    if (playheadPx > viewEnd - visibleWidth * 0.2) {
+      setScrollX(Math.max(0, playheadPx - visibleWidth * 0.2));
+    } else if (playheadPx < viewStart) {
+      setScrollX(Math.max(0, playheadPx - visibleWidth * 0.1));
+    }
+  }, [isPlaying, playhead, pps, scrollX, setScrollX]);
+
   // Redraw on state changes
   useEffect(() => { draw(); }, [draw]);
 
@@ -766,6 +784,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         if (hitSeg) {
           selectCropSegment(hitSeg.id);
           setSelectedItemId(null);
+          onItemSelect?.(null); // Open properties panel for crop segment
           return;
         }
       }
