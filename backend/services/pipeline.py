@@ -624,6 +624,56 @@ async def run_analysis(job_id: str):
             _cancel_events.pop(job_id, None)
 
 
+def _select_dominant_face(faces, last_x=None):
+    """Pick the most prominent face from a list of FaceInfo objects.
+
+    Scoring:
+      - 35% face size (larger = closer to camera = more important)
+      - 25% lip motion (speaking subject is usually the focus)
+      - 15% centeredness (cinematographers frame subjects near center)
+      - 25% continuity (prefer tracking the same subject as last frame)
+
+    Returns the winning FaceInfo, or None if faces is empty.
+    """
+    if not faces:
+        return None
+    if len(faces) == 1:
+        return faces[0]
+
+    best = None
+    best_score = -1.0
+    for f in faces:
+        # Size score — larger face area = more prominent (max at 5% of frame)
+        area = f.width * f.height / 10000.0  # normalize: 100*100=10000
+        size_score = min(1.0, area / 0.05)
+
+        # Lip motion score — speaking subjects are the focus
+        lip_score = min(1.0, f.lip_aperture / 0.05) if f.lip_aperture > 0 else 0.0
+
+        # Centeredness — subjects near frame center are typically the focus
+        center_dist = abs(f.nose_x - 50) / 50.0
+        center_score = 1.0 - center_dist
+
+        # Continuity — prefer the subject we were already tracking
+        continuity_score = 0.0
+        if last_x is not None:
+            x_dist = abs(f.nose_x - last_x)
+            if x_dist < 15:
+                continuity_score = 1.0 - (x_dist / 15.0)
+
+        total = (
+            0.35 * size_score
+            + 0.25 * lip_score
+            + 0.15 * center_score
+            + 0.25 * continuity_score
+        )
+        if total > best_score:
+            best_score = total
+            best = f
+
+    return best
+
+
 async def _run_analysis_inner(job_id: str):
     job = await database.load_job(job_id)
     if not job:
@@ -2175,14 +2225,11 @@ async def _run_analysis_inner(job_id: str):
                 is_closeup = (len(best_dfr.faces) == 1 and best_dfr.faces[0].width > 12.0)
 
                 if _is_continuous or is_closeup:
-                    # Continuous motion or closeup: use raw position
-                    best_face = best_dfr.faces[0] if is_closeup else (
-                        max(best_dfr.faces, key=lambda f: f.width * (f.height if hasattr(f, 'height') else f.width))
-                        if best_dfr.faces else None
-                    )
-                    if best_face:
+                    # Dominant-subject / closeup: use raw face position (no slot snap)
+                    dominant = _select_dominant_face(best_dfr.faces)
+                    if dominant:
                         old_sx = scene.subject_x
-                        scene.subject_x = int(round(best_face.nose_x))
+                        scene.subject_x = int(round(dominant.nose_x))
                         if abs(old_sx - scene.subject_x) > 5:
                             enriched += 1
                 elif face_registry and face_registry.multi_speaker:
@@ -2376,6 +2423,11 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
 
+    # Classify tracking mode — available to all subsequent code paths
+    _is_continuous = face_registry.is_continuous_motion if face_registry else False
+    if _is_continuous:
+        logger.info("[%s] [SubjectTracking] Dominant-subject tracking (continuous motion detected)", job_id)
+
     # ── Per-second scene synthesis from dense face + speaker data ──
     # The AI vision model produces ~59 scenes (1 per 10s). Dense face detection
     # has 606 data points (1 per second). Create synthetic scene descriptions at
@@ -2431,6 +2483,7 @@ async def _run_analysis_inner(job_id: str):
                 return -1, 'none'
 
             synthetic_count = 0
+            _last_dominant_x = None  # For dominant-subject continuity tracking
             source_counts = {'transcript': 0, 'lip': 0, 'lip-override': 0, 'none': 0}
             for dfr in dense_face_results:
                 # Skip timestamps that already have a real scene
@@ -2476,8 +2529,16 @@ async def _run_analysis_inner(job_id: str):
                 if chosen_face:
                     is_closeup = (len(dfr.faces) == 1 and chosen_face.width > 12.0)
 
-                    if _is_continuous or is_closeup:
-                        # Continuous motion or closeup: use raw face position
+                    if _is_continuous:
+                        # Dominant-subject tracking: pick the most prominent face
+                        # using size + lip motion + centeredness + continuity scoring.
+                        # Uses raw nose_x — no slot snapping.
+                        dominant = _select_dominant_face(dfr.faces, last_x=_last_dominant_x)
+                        if dominant:
+                            chosen_face = dominant
+                            _last_dominant_x = dominant.nose_x
+                        sx_val = int(round(chosen_face.nose_x))
+                    elif is_closeup:
                         sx_val = int(round(chosen_face.nose_x))
                     elif slot_id >= 0 and face_registry and identity_matched:
                         # Multi-speaker: identity matched — use assigned slot center (stable)
