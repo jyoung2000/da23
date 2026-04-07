@@ -101,25 +101,46 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
     return -1;
   }, [currentTime, filtered, transcript]);
 
-  // Auto-scroll to keep the active segment centered in the transcript view
+  // Auto-scroll to keep the active segment centered in the transcript view.
+  // Uses per-frame lerp (exponential ease-out) instead of CSS smooth scroll
+  // to avoid choppiness when segments change rapidly during playback.
+  const scrollAnimRef = useRef(null);
   useEffect(() => {
     if (activeOriginalIdx < 0) return;
     const el = activeSegRef.current;
     const container = scrollContainerRef.current;
     if (!el || !container) return;
-    // Scroll so the active segment is centered in the container
-    const elRect = el.getBoundingClientRect();
-    const cRect = container.getBoundingClientRect();
-    const elCenter = elRect.top + elRect.height / 2;
-    const cCenter = cRect.top + cRect.height / 2;
-    const offset = elCenter - cCenter;
-    // Scroll if the element is not near the center (within 20% of container height)
-    if (Math.abs(offset) > cRect.height * 0.2) {
-      container.scrollTo({
-        top: container.scrollTop + offset,
-        behavior: 'smooth',
-      });
+
+    // Cancel any running animation
+    if (scrollAnimRef.current) {
+      cancelAnimationFrame(scrollAnimRef.current);
+      scrollAnimRef.current = null;
     }
+
+    // Target: center the active segment in the container
+    const targetTop = el.offsetTop - container.clientHeight / 2 + el.offsetHeight / 2;
+
+    const animate = () => {
+      const diff = targetTop - container.scrollTop;
+      // If close enough, snap and stop
+      if (Math.abs(diff) < 1) {
+        container.scrollTop = targetTop;
+        scrollAnimRef.current = null;
+        return;
+      }
+      // Lerp: move 15% of remaining distance each frame (~60fps)
+      // This gives smooth exponential ease-out without fighting CSS transitions
+      container.scrollTop += diff * 0.15;
+      scrollAnimRef.current = requestAnimationFrame(animate);
+    };
+    scrollAnimRef.current = requestAnimationFrame(animate);
+
+    return () => {
+      if (scrollAnimRef.current) {
+        cancelAnimationFrame(scrollAnimRef.current);
+        scrollAnimRef.current = null;
+      }
+    };
   }, [activeOriginalIdx]);
 
   const download = (content, filename) => {
