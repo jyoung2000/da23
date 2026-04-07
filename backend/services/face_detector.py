@@ -830,3 +830,140 @@ def _log_summary(results: list[FrameFaces]):
             sum(all_lars) / len(all_lars),
             sum(1 for l in all_lars if l > 0.03),
         )
+
+
+# ── Gameplay Content Detection ───────────────────────────────────────────────
+
+
+def detect_crosshair_persistence(sample_frame_paths: list[str]) -> float:
+    """Look for a small high-contrast element at the exact center of frames.
+
+    FPS games have a crosshair that stays fixed at the center while the
+    background behind it changes.  We detect this by comparing temporal
+    variance of the center 4×4 pixels vs the periphery of a 40×40 patch.
+
+    Returns a score 0–1 indicating crosshair presence confidence.
+    """
+    import cv2
+    import numpy as np
+
+    if not sample_frame_paths:
+        return 0.0
+
+    center_patches = []
+    for frame_path in sample_frame_paths[:30]:
+        img = cv2.imread(str(frame_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        h, w = img.shape
+        cy, cx = h // 2, w // 2
+        patch = img[cy - 20:cy + 20, cx - 20:cx + 20]
+        if patch.shape == (40, 40):
+            center_patches.append(patch)
+
+    if len(center_patches) < 5:
+        return 0.0
+
+    # Center 4×4 should be stable (crosshair), periphery should vary (world moves)
+    centers = np.stack([p[18:22, 18:22] for p in center_patches])
+    center_temporal_var = np.var(centers, axis=0).mean()
+
+    peripheries = np.stack([
+        np.concatenate([p[:5, :].flatten(), p[-5:, :].flatten()])
+        for p in center_patches
+    ])
+    periphery_temporal_var = np.var(peripheries, axis=0).mean()
+
+    if periphery_temporal_var > 0:
+        ratio = 1.0 - (center_temporal_var / periphery_temporal_var)
+        return max(0.0, min(1.0, ratio))
+
+    return 0.0
+
+
+def detect_hud_corner_brightness(sample_frame_paths: list[str]) -> float:
+    """Detect persistent high-saturation HUD elements in frame corners.
+
+    Real-world footage has roughly uniform colour distribution.  Gameplay
+    HUDs have brightly coloured, high-saturation overlays in fixed corner
+    regions (top-right killfeed, bottom-center abilities, etc.).
+
+    Returns a score 0–1 indicating HUD presence confidence.
+    """
+    import cv2
+    import numpy as np
+
+    if not sample_frame_paths:
+        return 0.0
+
+    corner_saturations: dict[str, list[float]] = {
+        "tl": [], "tr": [], "bl": [], "br": [], "bc": [],
+    }
+
+    for frame_path in sample_frame_paths[:30]:
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1].astype(np.float32)
+
+        ch, cw = h // 10, w // 10
+        corner_saturations["tl"].append(float(sat[:ch, :cw].mean()))
+        corner_saturations["tr"].append(float(sat[:ch, -cw:].mean()))
+        corner_saturations["bl"].append(float(sat[-ch:, :cw].mean()))
+        corner_saturations["br"].append(float(sat[-ch:, -cw:].mean()))
+        corner_saturations["bc"].append(float(sat[-ch:, w // 2 - cw:w // 2 + cw].mean()))
+
+    max_corner_score = 0.0
+    for vals in corner_saturations.values():
+        if vals:
+            mean_sat = float(np.mean(vals))
+            if mean_sat > 100:
+                max_corner_score = max(max_corner_score, mean_sat / 255.0)
+
+    return max_corner_score
+
+
+def classify_gameplay_content(
+    dense_face_data: list,
+    total_frames: int,
+    sample_frame_paths: list[str],
+) -> str:
+    """Classify whether video content is gameplay footage.
+
+    Uses three signals:
+      1. Face rarity — fewer than 5% of frames have a face
+      2. Crosshair persistence — stable center element across frames
+      3. HUD corner brightness — high saturation in corner regions
+
+    Returns: 'gameplay' | 'unknown' | 'not_gameplay'
+    """
+    # Signal 1: face rarity
+    frames_with_face = sum(
+        1 for f in dense_face_data
+        if hasattr(f, 'faces') and f.faces
+    )
+    face_ratio = frames_with_face / max(1, total_frames)
+
+    if face_ratio > 0.30:
+        return "not_gameplay"
+
+    # Signal 2: crosshair detection
+    crosshair_score = detect_crosshair_persistence(sample_frame_paths)
+
+    # Signal 3: HUD edge density
+    hud_score = detect_hud_corner_brightness(sample_frame_paths)
+
+    logger.info(
+        "Gameplay classification: face_ratio=%.2f, crosshair=%.2f, hud=%.2f",
+        face_ratio, crosshair_score, hud_score,
+    )
+
+    if crosshair_score > 0.6 or (hud_score > 0.5 and face_ratio < 0.10):
+        return "gameplay"
+
+    if face_ratio < 0.05:
+        return "unknown"
+
+    return "not_gameplay"

@@ -52,6 +52,8 @@ class InitRequest(BaseModel):
     file_size: int
     language: str = ""
     subtitle_language: str = ""  # Target language for subtitles
+    content_type_override: str = ""  # "auto" | "gameplay" | "podcast" | "movie"
+    game_type: str = ""  # "overwatch" | "valorant" | "apex_legends" | "marvel_rivals" | "fortnite" | "generic_fps"
     chunk_size: Optional[int] = None
 
 
@@ -185,6 +187,8 @@ async def init_upload(req: InitRequest):
         "file_size": req.file_size,
         "language": req.language,
         "subtitle_language": req.subtitle_language,
+        "content_type_override": req.content_type_override,
+        "game_type": req.game_type,
         "ext": ext,
         "chunk_size": chunk_size,
         "total_chunks": total_chunks,
@@ -518,6 +522,8 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
     filename = info["filename"]
     lang = info["language"].strip().lower()
     subtitle_lang = info.get("subtitle_language", "").strip().lower()
+    ct_override = info.get("content_type_override", "").strip().lower()
+    gt = info.get("game_type", "").strip().lower()
 
     logger.info("[%s] Upload complete: %s → %s (%.1f MB, QA: %s)",
                 upload_id, filename, video_path, file_size_mb,
@@ -531,6 +537,8 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
         file_size_mb=file_size_mb,
         language=lang,
         subtitle_language=subtitle_lang,
+        content_type_override=ct_override,
+        game_type=gt,
         status=JobStatus.QUEUED,
         progress=0,
         progress_message="Uploaded, waiting for analysis",

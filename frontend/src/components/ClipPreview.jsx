@@ -274,6 +274,7 @@ export default function ClipPreview({
   layoutTimeline = null,
   faceRegistry = null,
   defaultLayoutMode = 'single',
+  trackingMode = null,
 }) {
   const { isMobile } = useResponsive();
   const fgVideoRef = useRef(null);
@@ -292,18 +293,18 @@ export default function ClipPreview({
       const _srcRatio = sourceWidth / sourceHeight;
       const _targetRatio = (aspectRatio && ASPECT_RATIO_VALUES[aspectRatio]) ? ASPECT_RATIO_VALUES[aspectRatio] : _srcRatio;
       const _isCrop = Math.abs(_srcRatio - _targetRatio) > 0.01;
-      const processed = processKeyframes(scenes, clipStart, clipEnd, _isCrop ? _srcRatio : null, _isCrop ? _targetRatio : null, transcript || null, sceneCuts || null);
+      const processed = processKeyframes(scenes, clipStart, clipEnd, _isCrop ? _srcRatio : null, _isCrop ? _targetRatio : null, transcript || null, sceneCuts || null, trackingMode);
       const dynamic = processed && isDynamic(processed);
       console.log(
         `[SubjectTracking] ClipPreview: ${processed?.length || 0} keyframes (pipeline: build→compress→deadzone→cuts→smooth→holds) ` +
         `(${clipStart.toFixed(1)}s-${clipEnd.toFixed(1)}s), ` +
-        `mode=${dynamic ? 'DYNAMIC' : 'STATIC'}, ` +
+        `mode=${trackingMode === 'gameplay' ? 'GAMEPLAY' : (dynamic ? 'DYNAMIC' : 'STATIC')}, ` +
         `sx range: [${Math.min(...(processed || []).map(k=>k.x))}-${Math.max(...(processed || []).map(k=>k.x))}], ` +
         `keyframes: ${JSON.stringify(processed?.map(k => ({t: +k.t.toFixed(2), x: k.x})))}`
       );
       return processed;
     },
-    [scenes, clipStart, clipEnd, aspectRatio, sourceWidth, sourceHeight, transcript, sceneCuts],
+    [scenes, clipStart, clipEnd, aspectRatio, sourceWidth, sourceHeight, transcript, sceneCuts, trackingMode],
   );
   const hasDynamicSubject = useMemo(
     () => subjectKeyframes && isDynamic(subjectKeyframes),

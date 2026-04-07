@@ -1948,6 +1948,7 @@ export default function ViralClips() {
               jobs.find(j => j.job_id === previewClip?.jobId)?.default_layout_mode ||
               'single'
             }
+            trackingMode={jobs.find(j => j.job_id === previewClip?.jobId)?.tracking_mode || null}
             onClose={() => { setPreviewClip(null); setCenterSubjectState('idle'); setTrackingApplied(false); }}
           />
           {/* Tracking-applied indicator — flashes when subject tracking updates */}

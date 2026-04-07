@@ -282,6 +282,8 @@ export default function Upload() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [language, setLanguage] = useState('');
   const [subtitleLanguage, setSubtitleLanguage] = useState('');
+  const [contentTypeOverride, setContentTypeOverride] = useState('');
+  const [gameType, setGameType] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadDone, setUploadDone] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -436,6 +438,8 @@ export default function Upload() {
             file_size: file.size,
             language,
             subtitle_language: subtitleLanguage,
+            content_type_override: contentTypeOverride,
+            game_type: gameType,
             chunk_size: CHUNK_SIZE,
           }),
         });
@@ -856,6 +860,79 @@ export default function Upload() {
               Subtitles will be automatically translated to {LANGUAGES.find(l => l.code === subtitleLanguage)?.label || subtitleLanguage} after transcription
             </p>
           )}
+        </div>
+      )}
+
+      {/* Content type selector */}
+      {selectedFile && !uploading && (
+        <div style={{ marginTop: 12 }}>
+          <label
+            htmlFor="content-type-select"
+            style={{ display: 'block', fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}
+          >
+            Content type (helps tracking accuracy)
+          </label>
+          <select
+            id="content-type-select"
+            value={contentTypeOverride}
+            onChange={(e) => {
+              setContentTypeOverride(e.target.value);
+              if (e.target.value !== 'gameplay') setGameType('');
+            }}
+            style={{
+              width: '100%',
+              padding: '10px 12px',
+              background: 'var(--bg-panel)',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border)',
+              fontSize: 14,
+              borderRadius: 'var(--radius-sm)',
+              outline: 'none',
+            }}
+          >
+            <option value="">Auto-detect</option>
+            <option value="gameplay">Gameplay (FPS / Hero Shooter)</option>
+            <option value="podcast">Interview / Podcast</option>
+            <option value="movie">Movie / TV</option>
+          </select>
+        </div>
+      )}
+
+      {/* Game selector (shown when Gameplay is selected) */}
+      {selectedFile && !uploading && contentTypeOverride === 'gameplay' && (
+        <div style={{ marginTop: 12 }}>
+          <label
+            htmlFor="game-type-select"
+            style={{ display: 'block', fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}
+          >
+            Game (for HUD layout)
+          </label>
+          <select
+            id="game-type-select"
+            value={gameType}
+            onChange={(e) => setGameType(e.target.value)}
+            style={{
+              width: '100%',
+              padding: '10px 12px',
+              background: 'var(--bg-panel)',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border)',
+              fontSize: 14,
+              borderRadius: 'var(--radius-sm)',
+              outline: 'none',
+            }}
+          >
+            <option value="">Auto / Generic FPS</option>
+            <option value="overwatch">Overwatch / Overwatch 2</option>
+            <option value="marvel_rivals">Marvel Rivals</option>
+            <option value="valorant">Valorant</option>
+            <option value="apex_legends">Apex Legends</option>
+            <option value="fortnite">Fortnite</option>
+            <option value="generic_fps">Other FPS</option>
+          </select>
+          <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+            Selecting the game enables HUD-aware vertical cropping (killfeed, health, abilities preserved in 9:16)
+          </p>
         </div>
       )}
 

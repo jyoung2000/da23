@@ -828,7 +828,14 @@ export function mergeHolds(keyframes, tolerance = 3) {
  * @param {number|null} targetRatio - Target crop aspect ratio (optional)
  * @returns {Array<{t: number, x: number}>} Fully processed keyframes
  */
-export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null, transcript = null, sceneCuts = null) {
+export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, targetRatio = null, transcript = null, sceneCuts = null, trackingMode = null) {
+  // Gameplay mode: static center crop — crosshair is always at frame center in FPS games.
+  // Skip all face-based tracking, clustering, and smoothing.
+  if (trackingMode === 'gameplay') {
+    console.log('[SubjectTracking] Gameplay mode — static center crop (subject_x=50)');
+    return [{ t: 0, x: 50 }];
+  }
+
   // ── PHASE 0: Build raw keyframes ──
   const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
   if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];

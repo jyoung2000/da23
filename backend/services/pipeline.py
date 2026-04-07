@@ -1206,10 +1206,49 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Dense face detection failed (non-fatal): %s", job_id, e)
 
+    # ── Gameplay content detection ──
+    # Check if content is FPS / hero shooter before spending effort on face tracking.
+    # If the user declared "gameplay" via content_type_override we trust that immediately.
+    # Otherwise we auto-detect using crosshair persistence, HUD corners, and face rarity.
+    _is_gameplay = False
+    _job_data = await database.get_job(job_id)
+    _content_override = getattr(_job_data, "content_type_override", "") if _job_data else ""
+    _game_type = getattr(_job_data, "game_type", "") if _job_data else ""
+
+    if _content_override == "gameplay":
+        _is_gameplay = True
+        logger.info("[%s] Content type override = gameplay (user-declared)", job_id)
+    elif _content_override not in ("podcast", "movie"):
+        # Auto-detect: only if user didn't declare a non-gameplay type
+        try:
+            from backend.services.face_detector import classify_gameplay_content
+            _dense_or_sparse = dense_face_results or face_results
+            _sample_paths = [f.path for f in frames[:30]] if frames else []
+            _gp_result = classify_gameplay_content(
+                _dense_or_sparse, len(_dense_or_sparse), _sample_paths,
+            )
+            if _gp_result == "gameplay":
+                _is_gameplay = True
+                logger.info("[%s] Auto-detected gameplay content", job_id)
+            else:
+                logger.info("[%s] Gameplay auto-detection result: %s", job_id, _gp_result)
+        except Exception as e:
+            logger.warning("[%s] Gameplay detection failed (non-fatal): %s", job_id, e)
+
+    if _is_gameplay:
+        # Set tracking mode to gameplay — skip face-based tracking entirely.
+        # Scene subject_x values will be overridden to 50 later when scenes are available.
+        await database.update_job_status(job_id, tracking_mode="gameplay")
+        await _update_progress(
+            job_id, JobStatus.EXTRACTING_FRAMES, 15,
+            "Gameplay content detected — using center-crop tracking with HUD compositing",
+        )
+        logger.info("[%s] Gameplay mode: will set all scene subject_x=50 (crosshair-centered)", job_id)
+
     # ── Build face registry ──
     # Prefer dense data with embeddings for identity-based clustering.
     # Falls back to sparse position-based clustering if dense unavailable.
-    if settings.SUBJECT_TRACKING_ENABLED and (face_results or dense_face_results):
+    if settings.SUBJECT_TRACKING_ENABLED and (face_results or dense_face_results) and not _is_gameplay:
         try:
             await _update_progress(
                 job_id, JobStatus.EXTRACTING_FRAMES, 15,
@@ -1763,7 +1802,7 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] [SubjectTracking] Continuous motion detected — skipping slot snap (preserving raw positions)",
                 job_id,
             )
-        if face_registry and face_registry.slots and scenes_result and not _is_continuous:
+        if face_registry and face_registry.slots and scenes_result and not _is_continuous and not _is_gameplay:
             slot_centers = [s.x_center for s in face_registry.slots]
             corrected = 0
             # For single-speaker, use a tighter threshold — any value far from
@@ -1819,6 +1858,12 @@ async def _run_analysis_inner(job_id: str):
                     "[%s] Center-default inheritance: fixed %d scenes with temporal neighbors",
                     job_id, fixed_center,
                 )
+
+        # Gameplay mode: override all scene subject_x to 50 (crosshair-centered)
+        if _is_gameplay and scenes_result:
+            for scene in scenes_result:
+                scene.subject_x = 50
+            logger.info("[%s] Gameplay mode: set %d scene subject_x=50", job_id, len(scenes_result))
 
         await database.update_job_status(
             job_id,
@@ -2192,8 +2237,9 @@ async def _run_analysis_inner(job_id: str):
     # Override AI vision model's subject_x with actual face positions from
     # dense detection. Dense data is pixel-accurate; AI estimates are guesses.
     # Classify tracking mode BEFORE any merge/synthesis that references it.
+    # SKIP for gameplay content — crosshair is always at center, face data is noise.
     _is_continuous = face_registry.is_continuous_motion if face_registry else False
-    if dense_face_results and scenes:
+    if dense_face_results and scenes and not _is_gameplay:
         dense_map = {}
         for dfr in dense_face_results:
             dense_map[round(dfr.timestamp, 2)] = dfr
@@ -2638,7 +2684,7 @@ async def _run_analysis_inner(job_id: str):
                 # CRITICAL: Persist the expanded scene list (648 scenes) back to the database
                 # so the frontend API receives ALL per-second tracking data, not just the 59 AI scenes.
                 # Without this, the frontend only gets 59 scenes and isDense=false, breaking tracking.
-                _tracking_mode = "continuous" if _is_continuous else "multi_cluster"
+                _tracking_mode = "gameplay" if _is_gameplay else ("continuous" if _is_continuous else "multi_cluster")
                 await database.update_job_status(
                     job_id, scenes=list(scenes), tracking_mode=_tracking_mode,
                 )

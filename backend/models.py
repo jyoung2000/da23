@@ -159,7 +159,9 @@ class JobResult(BaseModel):
     layout_timeline: list[dict] = []            # [{start, end, layout_mode, face_positions}]
     default_layout_mode: str = "single"         # Overall recommended layout for the video
     dense_tracking_summary: Optional[dict] = None  # {total_frames, frames_with_faces, sample_rate, ...}
-    tracking_mode: str = ""  # "continuous" | "multi_cluster" — set by pipeline after face analysis
+    tracking_mode: str = ""  # "continuous" | "multi_cluster" | "gameplay" — set by pipeline after face analysis
+    content_type_override: str = ""  # "auto" | "gameplay" | "podcast" | "movie" — user override from upload UI
+    game_type: str = ""  # "overwatch" | "valorant" | "apex_legends" | "marvel_rivals" | "fortnite" | "generic_fps" | "auto"
     filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
     emphasis_keywords: list[str] = []  # Words to highlight in captions
 

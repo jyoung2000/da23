@@ -21,6 +21,7 @@ except Exception:
     pass
 
 from backend.config import settings as app_settings
+from backend import database
 from backend.models import TranscriptSegment
 from backend.services.ass_generator import (
     generate_ass,
@@ -3842,6 +3843,120 @@ def _build_screenshare_filter(
     )
 
 
+def _build_gameplay_composite_filter(
+    src_w: int,
+    src_h: int,
+    target_w: int,
+    target_h: int,
+    hud_layout: dict,
+) -> str:
+    """Build FFmpeg filtergraph for gameplay composite layout (9:16 from 16:9).
+
+    Top 65%: center crop of the action area (crosshair-centered)
+    Bottom 35%: HUD strip composited from killfeed, health, abilities etc.
+    """
+    action_h = int(target_h * 0.65)
+    action_h = action_h - (action_h % 2)
+    action_w = target_w
+
+    # Center crop of source for action area
+    action_aspect = action_w / action_h
+    crop_w = int(src_h * action_aspect)
+    crop_w = min(crop_w, src_w)
+    crop_w = crop_w - (crop_w % 2)
+    crop_x = (src_w - crop_w) // 2
+
+    hud_h = target_h - action_h
+    hud_h = hud_h - (hud_h % 2)
+    hud_w = target_w
+
+    # Count how many splits we need: 1 (action) + number of HUD elements
+    hud_elements = {k: v for k, v in hud_layout.items() if k != "name" and isinstance(v, dict)}
+    num_splits = 1 + len(hud_elements)  # action + each HUD crop
+
+    parts = []
+
+    if num_splits <= 1 or not hud_elements:
+        # No HUD elements — just action crop + black bar
+        parts.append(
+            f"split=2[action_src][_dummy];"
+            f"[action_src]crop={crop_w}:{src_h}:{crop_x}:0,scale={action_w}:{action_h}[action];"
+            f"[_dummy]nullsink;"
+            f"color=c=black:s={hud_w}x{hud_h}:d=999[hud_bg];"
+            f"[action][hud_bg]vstack=inputs=2[v]"
+        )
+        return ";".join(parts)
+
+    # Split input for action + each HUD element
+    split_labels = ["[action_src]"] + [f"[hud_src_{i}]" for i in range(len(hud_elements))]
+    parts.append(f"split={num_splits}{''.join(split_labels)}")
+
+    # Action area
+    parts.append(f"[action_src]crop={crop_w}:{src_h}:{crop_x}:0,scale={action_w}:{action_h}[action]")
+
+    # Black background for HUD strip
+    parts.append(f"color=c=black:s={hud_w}x{hud_h}:d=999[hud_bg]")
+
+    # Extract and position each HUD element
+    hud_overlay_chain = []
+    for i, (elem_name, elem) in enumerate(hud_elements.items()):
+        src_label = f"hud_src_{i}"
+        out_label = f"hud_{elem_name}"
+
+        # Source crop coordinates
+        ex = int((elem["x_pct"] / 100) * src_w)
+        ey = int((elem["y_pct"] / 100) * src_h)
+        ew = int((elem["w_pct"] / 100) * src_w)
+        eh = int((elem["h_pct"] / 100) * src_h)
+        ew = max(2, ew - (ew % 2))
+        eh = max(2, eh - (eh % 2))
+        ex = min(ex, src_w - ew)
+        ey = min(ey, src_h - eh)
+
+        # Scale to fit HUD strip — each element gets proportional width
+        target_elem_w = int(hud_w * 0.45)
+        target_elem_h = int(target_elem_w * (eh / max(ew, 1)))
+        target_elem_w = max(2, target_elem_w - (target_elem_w % 2))
+        target_elem_h = max(2, min(target_elem_h, hud_h - 10))
+        target_elem_h = target_elem_h - (target_elem_h % 2)
+
+        parts.append(
+            f"[{src_label}]crop={ew}:{eh}:{ex}:{ey},"
+            f"scale={target_elem_w}:{target_elem_h}[{out_label}]"
+        )
+
+        # Position in HUD strip — distribute elements horizontally
+        if "killfeed" in elem_name:
+            pos_x = hud_w - target_elem_w - 10
+            pos_y = 5
+        elif "minimap" in elem_name:
+            pos_x = 10
+            pos_y = 5
+        elif "health" in elem_name:
+            pos_x = 10
+            pos_y = hud_h - target_elem_h - 5
+        elif "abilities" in elem_name or "ultimate" in elem_name:
+            pos_x = (hud_w - target_elem_w) // 2
+            pos_y = hud_h - target_elem_h - 5
+        else:
+            pos_x = 10 + i * (target_elem_w + 10)
+            pos_y = 5
+
+        hud_overlay_chain.append((out_label, pos_x, pos_y))
+
+    # Build overlay chain onto hud_bg
+    last_layer = "hud_bg"
+    for idx, (name, x, y) in enumerate(hud_overlay_chain):
+        next_layer = f"hud_step{idx}"
+        parts.append(f"[{last_layer}][{name}]overlay={x}:{y}:shortest=1[{next_layer}]")
+        last_layer = next_layer
+
+    # Stack action on top of HUD strip
+    parts.append(f"[action][{last_layer}]vstack=inputs=2[v]")
+
+    return ";".join(parts)
+
+
 def _build_layout_filter_chain(
     layout_timeline,
     src_w: int,
@@ -6579,11 +6694,45 @@ async def export_clip(
                 except Exception as e:
                     logger.warning("[Layout] Layout filter chain failed (non-fatal), falling back to single: %s", e)
 
+            # ── Gameplay composite ──
+            # If tracking_mode is gameplay and we're doing a vertical crop,
+            # use the HUD composite layout instead of simple center crop.
+            _gameplay_used = False
+            if not _layout_used and aspect_ratio in ("9:16", "4:5"):
+                try:
+                    # Check if this job is gameplay by reading tracking_mode from scenes
+                    _job_for_gp = await database.get_job(job_id) if job_id else None
+                    _gp_tracking = getattr(_job_for_gp, "tracking_mode", "") if _job_for_gp else ""
+                    _gp_game_type = getattr(_job_for_gp, "game_type", "") if _job_for_gp else ""
+                    if _gp_tracking == "gameplay":
+                        from backend.services.game_layouts import get_hud_layout
+                        _gp_layout = get_hud_layout(_gp_game_type or "generic_fps")
+                        dims_t = ASPECT_RATIO_DIMS_BY_QUALITY.get(export_quality, ASPECT_RATIO_DIMS)
+                        _gp_out_w, _gp_out_h = dims_t.get(aspect_ratio, (1080, 1920))
+                        _gp_out_w = _gp_out_w - (_gp_out_w % 2)
+                        _gp_out_h = _gp_out_h - (_gp_out_h % 2)
+                        vf = _build_gameplay_composite_filter(
+                            video_width, video_height,
+                            _gp_out_w, _gp_out_h,
+                            _gp_layout,
+                        )
+                        is_complex = True
+                        _subtitle_vf = ""
+                        _gameplay_used = True
+                        logger.info(
+                            "[Gameplay] Using composite filter for clip %s (game=%s, output=%dx%d)",
+                            clip_id, _gp_game_type or "generic_fps", _gp_out_w, _gp_out_h,
+                        )
+                except Exception as e:
+                    logger.warning("[Gameplay] Composite filter failed (non-fatal), falling back: %s", e)
+
             # Build filter chain and re-encode
             if _layout_used:
                 vf = _layout_vf
                 is_complex = True
                 _subtitle_vf = _layout_sub
+            elif _gameplay_used:
+                pass  # vf already set above
             else:
                 vf, is_complex, _subtitle_vf = _build_filter_chain(
                     aspect_ratio, video_width, video_height, ass_path,
