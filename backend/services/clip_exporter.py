@@ -6701,7 +6701,7 @@ async def export_clip(
             if not _layout_used and aspect_ratio in ("9:16", "4:5"):
                 try:
                     # Check if this job is gameplay by reading tracking_mode from scenes
-                    _job_for_gp = await database.get_job(job_id) if job_id else None
+                    _job_for_gp = await database.load_job(job_id) if job_id else None
                     _gp_tracking = getattr(_job_for_gp, "tracking_mode", "") if _job_for_gp else ""
                     _gp_game_type = getattr(_job_for_gp, "game_type", "") if _job_for_gp else ""
                     if _gp_tracking == "gameplay":

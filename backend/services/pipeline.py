@@ -1211,7 +1211,7 @@ async def _run_analysis_inner(job_id: str):
     # If the user declared "gameplay" via content_type_override we trust that immediately.
     # Otherwise we auto-detect using crosshair persistence, HUD corners, and face rarity.
     _is_gameplay = False
-    _job_data = await database.get_job(job_id)
+    _job_data = await database.load_job(job_id)
     _content_override = getattr(_job_data, "content_type_override", "") if _job_data else ""
     _game_type = getattr(_job_data, "game_type", "") if _job_data else ""
 
