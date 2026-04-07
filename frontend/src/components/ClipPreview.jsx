@@ -1,5 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
+import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
 import useResponsive from '../hooks/useResponsive';
 
@@ -642,11 +643,25 @@ export default function ClipPreview({
       `[SubjectTracking] DYNAMIC mode active (rAF): R=${R.toFixed(3)} (src=${srcRatio.toFixed(3)}, target=${targetRatio.toFixed(3)}), ` +
       `${subjectKeyframes.length} keyframes`
     );
+
+    // Look up cropX from editable crop segments (user may have adjusted).
+    // Falls back to interpolateSubjectX from the original keyframes.
+    const getCropXAtTime = (relTime) => {
+      const { cropSegments } = useTimelineStore.getState();
+      if (cropSegments?.length > 0) {
+        const seg = cropSegments.find(s => relTime >= s.startTime && relTime < s.endTime);
+        if (seg) return seg.cropX;
+        const last = cropSegments[cropSegments.length - 1];
+        if (relTime >= last.endTime) return last.cropX;
+      }
+      return interpolateSubjectX(subjectKeyframes, relTime);
+    };
+
     // Apply initial position synchronously to eliminate 1-2 frame gap
     // between effect cleanup and first rAF tick
     {
       const initRel = video.currentTime - clipStart;
-      const initSx = interpolateSubjectX(subjectKeyframes, initRel);
+      const initSx = getCropXAtTime(initRel);
       const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
       video.style.objectPosition = `${initPct}% ${yPositionPct}%`;
       lastAppliedPctRef.current = initPct;
@@ -654,7 +669,7 @@ export default function ClipPreview({
     let animId;
     const tick = () => {
       const relTime = video.currentTime - clipStart;
-      const sx = interpolateSubjectX(subjectKeyframes, relTime);
+      const sx = getCropXAtTime(relTime);
       const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
       // Only update DOM if value actually changed (avoid layout thrashing)
       const rounded = Math.round(centerPct * 10000) / 10000;

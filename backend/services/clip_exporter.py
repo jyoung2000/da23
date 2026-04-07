@@ -3201,13 +3201,14 @@ def _build_crop_x_expr(
     max_offset: int,
     src_w: int = 0,
     crop_w: int = 0,
+    step_mode: bool = False,
 ) -> str:
     """Build an FFmpeg expression for time-varying horizontal crop offset.
 
-    Uses piecewise smoothstep (cubic Hermite: 3p^2 - 2p^3) interpolation
-    between keyframes for human-feeling ease-in/ease-out movement.  The
-    FFmpeg crop filter evaluates the expression per-frame using the ``t``
-    time variable.
+    Two modes:
+    - step_mode=False (default): Piecewise smoothstep (3p²-2p³) interpolation.
+    - step_mode=True: Step function — instant snap at each keyframe, matching
+      the frontend's interpolateSubjectX() hold-until-next behavior exactly.
 
     Each keyframe's subject_x is converted to a centering offset so the
     subject ends up at the horizontal center of the cropped frame.
@@ -3215,13 +3216,12 @@ def _build_crop_x_expr(
     If all keyframes share the same subject_x (or there's only one), returns
     a plain integer string for a static crop — no expression overhead.
 
-    Matches frontend interpolateSubjectX() smoothstep exactly for parity.
-
     Args:
         keyframes: sorted list of (time_seconds, subject_x_0_to_100)
         max_offset: maximum x_offset in pixels (src_w - crop_w)
         src_w: source video width in pixels (for centering calculation)
         crop_w: crop window width in pixels (for centering calculation)
+        step_mode: if True, use instant-snap (step) instead of smoothstep
 
     Returns:
         FFmpeg expression string for the x parameter of the crop filter.
@@ -3255,16 +3255,12 @@ def _build_crop_x_expr(
         )
         return str(offset)
 
-    # Build piecewise smoothstep interpolation expression
-    # For each segment [ti, ti+1]:
-    #   p = (t - t0) / dt   (normalized progress 0..1)
-    #   smoothstep(p) = p*p*(3-2*p)
-    #   offset = off0 + d_off * p*p*(3-2*p)
     offsets = [(t, _sx_to_offset(sx)) for t, sx in keyframes]
 
+    interp_label = "step" if step_mode else "smoothstep"
     logger.info(
-        "[SubjectTracking] _build_crop_x_expr: dynamic (smoothstep) — %d keyframes, offsets=%s (src_w=%d, crop_w=%d, max_offset=%d)",
-        len(offsets),
+        "[SubjectTracking] _build_crop_x_expr: dynamic (%s) — %d keyframes, offsets=%s (src_w=%d, crop_w=%d, max_offset=%d)",
+        interp_label, len(offsets),
         [(f"t={t:.2f}→{off}px") for t, off in offsets],
         src_w, crop_w, max_offset,
     )
@@ -3273,21 +3269,26 @@ def _build_crop_x_expr(
     # Final fallback: last offset
     expr = str(offsets[-1][1])
 
-    for i in range(len(offsets) - 2, -1, -1):
-        t0, off0 = offsets[i]
-        t1, off1 = offsets[i + 1]
-        dt = t1 - t0
-        if dt <= 0 or off0 == off1:
-            # Same offset or zero-length segment → just use off0
-            segment = str(off0)
-        else:
-            d_off = off1 - off0
-            # Smoothstep: off0 + d_off * p*p*(3-2*p) where p=(t-t0)/dt
-            # Use st(0,p)/ld(0) to compute p once and avoid floating-point
-            # rounding differences from multiple evaluations of the same expr.
-            p_expr = f"(t-{t0:.3f})/{dt:.3f}"
-            segment = f"{off0}+{d_off}*st(0\\,{p_expr})*ld(0)*(3-2*ld(0))"
-        expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
+    if step_mode:
+        # Step function: hold each offset until the next keyframe (matches
+        # frontend interpolateSubjectX() exactly — instant snap, no easing)
+        for i in range(len(offsets) - 2, -1, -1):
+            t1 = offsets[i + 1][0]
+            off0 = offsets[i][1]
+            expr = f"if(lt(t\\,{t1:.3f})\\,{off0}\\,{expr})"
+    else:
+        # Smoothstep: piecewise cubic Hermite interpolation between keyframes
+        for i in range(len(offsets) - 2, -1, -1):
+            t0, off0 = offsets[i]
+            t1, off1 = offsets[i + 1]
+            dt = t1 - t0
+            if dt <= 0 or off0 == off1:
+                segment = str(off0)
+            else:
+                d_off = off1 - off0
+                p_expr = f"(t-{t0:.3f})/{dt:.3f}"
+                segment = f"{off0}+{d_off}*st(0\\,{p_expr})*ld(0)*(3-2*ld(0))"
+            expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
 
     # Clamp to valid range
     final_expr = f"clip({expr}\\,0\\,{max_offset})"
@@ -3916,6 +3917,7 @@ def _build_filter_chain(
     clip_duration: float = 0,
     face_y_center: float = 50.0,
     face_width_pct: float = 0.0,
+    use_step_interpolation: bool = False,
 ) -> tuple[str | None, bool]:
     """Build FFmpeg video filter chain.
 
@@ -4054,14 +4056,22 @@ def _build_filter_chain(
                 unique_sx = set(kf[1] for kf in subject_keyframes)
                 if len(unique_sx) > 1:
                     # Dynamic crop: time-varying x offset
-                    # Insert hold-then-snap transitions for large jumps
-                    # so they don't produce slow 10-second pans
-                    _snapped_kf = _insert_snap_transitions(subject_keyframes)
-                    x_expr = _build_crop_x_expr(_snapped_kf, max_x_offset, src_w, crop_w)
+                    if use_step_interpolation:
+                        # Step mode (frontend keyframes): instant snap, no transitions
+                        _final_kf = subject_keyframes
+                    else:
+                        # Smoothstep mode (backend keyframes): insert snap transitions
+                        # for large jumps so they don't produce slow pans
+                        _final_kf = _insert_snap_transitions(subject_keyframes)
+                    x_expr = _build_crop_x_expr(
+                        _final_kf, max_x_offset, src_w, crop_w,
+                        step_mode=use_step_interpolation,
+                    )
                     filters.append(f"crop={crop_w}:{crop_h}:{x_expr}:{y_offset}")
                     logger.info(
-                        "[SubjectTracking] DYNAMIC CROP: %d keyframes, %d unique sx values, "
+                        "[SubjectTracking] DYNAMIC CROP (%s): %d keyframes, %d unique sx values, "
                         "crop=%dx%d, y_offset=%d",
+                        "step" if use_step_interpolation else "smoothstep",
                         len(subject_keyframes), len(unique_sx), crop_w, crop_h, y_offset,
                     )
                 else:
@@ -6070,7 +6080,9 @@ async def export_clip(
                 )
 
             # ── Frontend keyframe override: use preview player's exact keyframes ──
+            _using_frontend_keyframes = False
             if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
+                _using_frontend_keyframes = True
                 _avg_face_y = 50.0
                 _avg_face_w = 0.0
                 keyframes = [
@@ -6517,6 +6529,7 @@ async def export_clip(
                     clip_duration=end - start,
                     face_y_center=_avg_face_y,
                     face_width_pct=_avg_face_w,
+                    use_step_interpolation=_using_frontend_keyframes,
                 )
 
             # Append text overlay drawtext filters.
