@@ -2191,6 +2191,8 @@ async def _run_analysis_inner(job_id: str):
     # ── Merge dense face data into scene descriptions ──
     # Override AI vision model's subject_x with actual face positions from
     # dense detection. Dense data is pixel-accurate; AI estimates are guesses.
+    # Classify tracking mode BEFORE any merge/synthesis that references it.
+    _is_continuous = face_registry.is_continuous_motion if face_registry else False
     if dense_face_results and scenes:
         dense_map = {}
         for dfr in dense_face_results:
@@ -2422,11 +2424,6 @@ async def _run_analysis_inner(job_id: str):
                 )
         except Exception as e:
             logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
-
-    # Classify tracking mode — available to all subsequent code paths
-    _is_continuous = face_registry.is_continuous_motion if face_registry else False
-    if _is_continuous:
-        logger.info("[%s] [SubjectTracking] Dominant-subject tracking (continuous motion detected)", job_id)
 
     # ── Per-second scene synthesis from dense face + speaker data ──
     # The AI vision model produces ~59 scenes (1 per 10s). Dense face detection
