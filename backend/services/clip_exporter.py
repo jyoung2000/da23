@@ -3257,11 +3257,52 @@ def _build_crop_x_expr(
 
     offsets = [(t, _sx_to_offset(sx)) for t, sx in keyframes]
 
+    # Collapse consecutive identical offsets — many keyframes may map to
+    # the same pixel offset (e.g., cluster-snapped positions).  Keeping
+    # only the first of each run halves expression nesting in practice.
+    collapsed: list[tuple[float, int]] = [offsets[0]]
+    for i in range(1, len(offsets)):
+        if offsets[i][1] != collapsed[-1][1]:
+            collapsed.append(offsets[i])
+    if collapsed[-1] != offsets[-1]:
+        collapsed.append(offsets[-1])  # ensure final time is present
+    if len(collapsed) < len(offsets):
+        logger.info(
+            "[SubjectTracking] _build_crop_x_expr: collapsed %d → %d offsets (removed consecutive duplicates)",
+            len(offsets), len(collapsed),
+        )
+    offsets = collapsed
+
+    # FFmpeg nested if() expressions have a depth limit (~100-200 depending
+    # on build).  If we still have too many offsets, downsample to stay safe.
+    MAX_EXPR_DEPTH = 80
+    if len(offsets) > MAX_EXPR_DEPTH:
+        # Keep first, last, and evenly spaced keyframes
+        step = max(1, (len(offsets) - 2) // (MAX_EXPR_DEPTH - 2))
+        sampled = [offsets[0]]
+        for i in range(step, len(offsets) - 1, step):
+            sampled.append(offsets[i])
+        sampled.append(offsets[-1])
+        logger.warning(
+            "[SubjectTracking] _build_crop_x_expr: downsampled %d → %d offsets (FFmpeg expression depth limit)",
+            len(offsets), len(sampled),
+        )
+        offsets = sampled
+
+    # Force step mode for high keyframe counts — smoothstep triples nesting
+    # depth (hold + transition + hold per segment) which can exceed limits
+    if not step_mode and len(offsets) > 40:
+        step_mode = True
+        logger.info(
+            "[SubjectTracking] _build_crop_x_expr: forcing step mode (%d offsets — smoothstep would exceed nesting limit)",
+            len(offsets),
+        )
+
     interp_label = "step" if step_mode else "smoothstep"
     logger.info(
         "[SubjectTracking] _build_crop_x_expr: dynamic (%s) — %d keyframes, offsets=%s (src_w=%d, crop_w=%d, max_offset=%d)",
         interp_label, len(offsets),
-        [(f"t={t:.2f}→{off}px") for t, off in offsets],
+        [(f"t={t:.2f}→{off}px") for t, off in offsets[:20]],
         src_w, crop_w, max_offset,
     )
 
