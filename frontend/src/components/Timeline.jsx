@@ -884,7 +884,8 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             (itemType === 'video' && trackType === 'video') ||
             (itemType === 'audio' && trackType === 'audio') ||
             ((itemType === 'text' || itemType === 'shape' || itemType === 'image' || itemType === 'overlay') && trackType === 'overlay') ||
-            (itemType === 'subtitle' && trackType === 'subtitle');
+            (itemType === 'subtitle' && trackType === 'subtitle') ||
+            (itemType === 'crop' && trackType === 'crop');
           if (compatible && !track.locked) primaryTrackId = track.id;
         }
 
