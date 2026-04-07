@@ -1461,10 +1461,25 @@ export default function VideoEditor({
     if (!hasDynamicSubject) return;
     const video = videoRef.current;
     if (!video) return;
+
+    // Helper: look up cropX from editable crop segments at a given relative time.
+    // Falls back to interpolateSubjectX from the original keyframes.
+    const getCropXAtTime = (relTime) => {
+      const { cropSegments } = useTimelineStore.getState();
+      if (cropSegments?.length > 0) {
+        const seg = cropSegments.find(s => relTime >= s.startTime && relTime < s.endTime);
+        if (seg) return seg.cropX;
+        // Past end — use last segment
+        const last = cropSegments[cropSegments.length - 1];
+        if (relTime >= last.endTime) return last.cropX;
+      }
+      return interpolateSubjectX(subjectKeyframes, relTime);
+    };
+
     // Apply initial position synchronously to eliminate 1-2 frame gap
     {
       const initRel = video.currentTime - (clipStart || 0);
-      const initSx = interpolateSubjectX(subjectKeyframes, initRel);
+      const initSx = getCropXAtTime(initRel);
       const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
       video.style.objectPosition = `${initPct}% 50%`;
       lastAppliedPctRef.current = initPct;
@@ -1478,7 +1493,7 @@ export default function VideoEditor({
       const activeSeg = segments.find(s => absTime >= s.start && absTime < s.end);
       const trackingOn = !activeSeg || activeSeg.subjectTrackingEnabled !== false;
       const sx = trackingOn
-        ? interpolateSubjectX(subjectKeyframes, relTime)
+        ? getCropXAtTime(relTime)
         : (safeSubjectX ? safeSubjectX(subjectX, srcRatio, targetRatio) : subjectX);
       const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
       const rounded = Math.round(centerPct * 10000) / 10000;
