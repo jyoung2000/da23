@@ -6144,6 +6144,22 @@ async def export_clip(
                     for kf in frontend_subject_keyframes
                 ]
                 keyframes.sort()
+
+                # Compute face Y from scene data for vertical positioning
+                # (matters for 1:1, 4:5 crops where vertical offset is needed)
+                if subject_scenes:
+                    _face_ys = []
+                    for s in subject_scenes:
+                        if hasattr(s, 'face_positions') and s.face_positions:
+                            for fp in s.face_positions:
+                                y = fp.get('y', 0)
+                                if 10 < y < 90:
+                                    _face_ys.append(y)
+                        elif hasattr(s, 'precise_y') and s.precise_y and 10 < s.precise_y < 90:
+                            _face_ys.append(s.precise_y)
+                    if _face_ys:
+                        _avg_face_y = sum(_face_ys) / len(_face_ys)
+
                 logger.info(
                     "[SubjectTracking] clip %s: Using %d frontend keyframes for crop (preview-export parity)",
                     clip_id, len(keyframes),
