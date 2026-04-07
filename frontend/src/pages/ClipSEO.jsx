@@ -421,6 +421,16 @@ export default function ClipSEO() {
     return { w: 1920, h: 1080 };
   }, [job?.resolution]);
 
+  // Stable references for VideoEditor props — prevents re-mount loops
+  // caused by new array/object identity on every render.
+  const stableScenes = useMemo(() => job?.scenes || [], [job?.scenes]);
+  const stableTranscript = useMemo(
+    () => job?.translated_transcript?.length ? job.translated_transcript : (job?.transcript || []),
+    [job?.translated_transcript, job?.transcript],
+  );
+  const stableSpeakerNames = useMemo(() => job?.speaker_names || {}, [job?.speaker_names]);
+  const stableSceneCuts = useMemo(() => job?.scene_cut_timestamps || null, [job?.scene_cut_timestamps]);
+
   // Output dimensions based on aspect ratio (matches clip_exporter.py)
   const outputDims = useMemo(() => {
     if (aspectRatio && ASPECT_RATIO_DIMS[aspectRatio]) {
@@ -950,7 +960,8 @@ export default function ClipSEO() {
               sourceWidth={sourceDims.w}
               sourceHeight={sourceDims.h}
               subjectX={clipSubjectX}
-              scenes={job.scenes || []}
+              scenes={stableScenes}
+              sceneCuts={stableSceneCuts}
               initialVolume={playbackVolume}
               initialSpeed={playbackSpeed}
               onTimeUpdate={setCurrentTime}
@@ -961,18 +972,18 @@ export default function ClipSEO() {
               initialSegments={editorSegments}
               settings={clipSettings}
               speakers={speakers}
-              speakerNames={job.speaker_names}
+              speakerNames={stableSpeakerNames}
               onSettingsChange={setClipSettings}
               jobId={jobId}
               clipId={clipId}
-              transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+              transcript={stableTranscript}
               onTranscriptUpdated={fetchJob}
               onVideoRef={handleVideoRef}
               onAspectRatioChange={(ar) => setClipSettings((prev) => ({ ...prev, aspectRatio: ar }))}
               subtitleOverlay={
                 <SubtitleOverlay
                   currentTime={currentTime}
-                  transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+                  transcript={stableTranscript}
                   clipStart={startTime ?? clip.start_time}
                   clipEnd={endTime ?? clip.end_time}
                   settings={clipSettings}
@@ -1179,7 +1190,8 @@ export default function ClipSEO() {
               sourceWidth={sourceDims.w}
               sourceHeight={sourceDims.h}
               subjectX={clipSubjectX}
-              scenes={job.scenes || []}
+              scenes={stableScenes}
+              sceneCuts={stableSceneCuts}
               initialVolume={playbackVolume}
               initialSpeed={playbackSpeed}
               onTimeUpdate={setCurrentTime}
@@ -1190,18 +1202,18 @@ export default function ClipSEO() {
               initialSegments={editorSegments}
               settings={clipSettings}
               speakers={speakers}
-              speakerNames={job.speaker_names}
+              speakerNames={stableSpeakerNames}
               onSettingsChange={setClipSettings}
               jobId={jobId}
               clipId={clipId}
-              transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+              transcript={stableTranscript}
               onTranscriptUpdated={fetchJob}
               onVideoRef={handleVideoRef}
               onAspectRatioChange={(ar) => setClipSettings((prev) => ({ ...prev, aspectRatio: ar }))}
               subtitleOverlay={
                 <SubtitleOverlay
                   currentTime={currentTime}
-                  transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+                  transcript={stableTranscript}
                   clipStart={startTime ?? clip.start_time}
                   clipEnd={endTime ?? clip.end_time}
                   settings={clipSettings}
