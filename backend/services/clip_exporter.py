@@ -6108,6 +6108,8 @@ async def export_clip(
         if needs_filters:
             # Build subject keyframes for dynamic crop tracking
             keyframes = None
+            _avg_face_y = 50.0
+            _avg_face_w = 0.0
             logger.info(
                 "═══════════════════════════════════════════════════════════════════════════",
             )
@@ -6137,8 +6139,6 @@ async def export_clip(
             _using_frontend_keyframes = False
             if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
                 _using_frontend_keyframes = True
-                _avg_face_y = 50.0
-                _avg_face_w = 0.0
                 keyframes = [
                     (round(kf.get("time", 0), 3), int(round(kf.get("x", 50))))
                     for kf in frontend_subject_keyframes
@@ -6171,8 +6171,6 @@ async def export_clip(
                 # Full-video analysis gives ~3 face samples per 30s clip.
                 # Dense detection extracts frames at 0.5s intervals for the clip
                 # and runs speaker-aware face detection, giving 60+ accurate positions.
-                _avg_face_y = 50.0
-                _avg_face_w = 0.0
                 try:
                     from backend.services.face_detector import detect_faces_dense as _dense_detect
                     _dense_results = _dense_detect(
