@@ -3238,8 +3238,21 @@ def _build_crop_x_expr(
     # However, we don't have src_h here. Since the keyframes are already
     # clamped by the pipeline, just pass the values through with centering.
     def _sx_to_offset(sx: int) -> int:
-        """Convert subject_x to a centering crop offset with safety clamping."""
+        """Convert subject_x to a centering crop offset.
+
+        In step_mode (frontend keyframes), use _center_crop_offset directly —
+        this is mathematically equivalent to the CSS objectPosition formula:
+          objectPosition% = (R*sx - 50) / (R - 1)
+          crop_x = objectPosition% / 100 * max_offset
+        which simplifies to: sx * src_w / 100 - crop_w / 2
+
+        Without step_mode (backend keyframes), use _verify_face_centering
+        which may adjust the offset for better centering.
+        """
         if src_w > 0 and crop_w > 0:
+            if step_mode:
+                # Exact CSS parity — no adjustment
+                return _center_crop_offset(sx, src_w, crop_w)
             return _verify_face_centering(sx, src_w, crop_w)
         # Fallback to proportional if dimensions not provided
         return max(0, min(max_offset, int(max_offset * sx / 100)))
