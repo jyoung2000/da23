@@ -1705,10 +1705,15 @@ async def _run_analysis_inner(job_id: str):
         # After AI + face fusion produces subject_x values, validate every
         # value against the face registry and snap outliers to the nearest
         # known face position. For multi-speaker, this eliminates dead-zone
-        # values between speakers. For single-speaker, this corrects AI
-        # estimates on frames where face detection found no face data (the
-        # AI's spatial reasoning is unreliable, returning 50 or random values).
-        if face_registry and face_registry.slots and scenes_result:
+        # values between speakers. SKIPPED for continuous-motion content
+        # (cartoons, sports) where snapping destroys real position data.
+        _is_continuous = face_registry.is_continuous_motion if face_registry else False
+        if _is_continuous:
+            logger.info(
+                "[%s] [SubjectTracking] Continuous motion detected — skipping slot snap (preserving raw positions)",
+                job_id,
+            )
+        if face_registry and face_registry.slots and scenes_result and not _is_continuous:
             slot_centers = [s.x_center for s in face_registry.slots]
             corrected = 0
             # For single-speaker, use a tighter threshold — any value far from
@@ -2169,14 +2174,19 @@ async def _run_analysis_inner(job_id: str):
                 # 3. Fallback → largest face with slot center snapping
                 is_closeup = (len(best_dfr.faces) == 1 and best_dfr.faces[0].width > 12.0)
 
-                if is_closeup:
-                    best_face = best_dfr.faces[0]
-                    old_sx = scene.subject_x
-                    scene.subject_x = int(round(best_face.nose_x))
-                    if abs(old_sx - scene.subject_x) > 5:
-                        enriched += 1
+                if _is_continuous or is_closeup:
+                    # Continuous motion or closeup: use raw position
+                    best_face = best_dfr.faces[0] if is_closeup else (
+                        max(best_dfr.faces, key=lambda f: f.width * (f.height if hasattr(f, 'height') else f.width))
+                        if best_dfr.faces else None
+                    )
+                    if best_face:
+                        old_sx = scene.subject_x
+                        scene.subject_x = int(round(best_face.nose_x))
+                        if abs(old_sx - scene.subject_x) > 5:
+                            enriched += 1
                 elif face_registry and face_registry.multi_speaker:
-                    # Prefer active speaker (lip aperture proxy)
+                    # Multi-speaker: prefer active speaker, snap to slot center
                     speaking = [f for f in best_dfr.faces if f.lip_aperture > 0.03]
                     target_face = None
                     if speaking:
@@ -2466,17 +2476,18 @@ async def _run_analysis_inner(job_id: str):
                 if chosen_face:
                     is_closeup = (len(dfr.faces) == 1 and chosen_face.width > 12.0)
 
-                    if is_closeup:
+                    if _is_continuous or is_closeup:
+                        # Continuous motion or closeup: use raw face position
                         sx_val = int(round(chosen_face.nose_x))
                     elif slot_id >= 0 and face_registry and identity_matched:
-                        # Identity matched — use the assigned slot center (stable)
+                        # Multi-speaker: identity matched — use assigned slot center (stable)
                         slot = face_registry.slot_by_id(slot_id)
                         if slot:
                             sx_val = int(round(slot.x_center))
                         else:
                             sx_val = int(round(chosen_face.nose_x))
                     elif face_registry and face_registry.multi_speaker:
-                        # Identity NOT matched — use the face's OWN slot center
+                        # Multi-speaker: identity NOT matched — use nearest slot center
                         slot = face_registry.nearest_slot(chosen_face.nose_x)
                         if slot:
                             sx_val = int(round(slot.x_center))
@@ -2569,10 +2580,13 @@ async def _run_analysis_inner(job_id: str):
                 # CRITICAL: Persist the expanded scene list (648 scenes) back to the database
                 # so the frontend API receives ALL per-second tracking data, not just the 59 AI scenes.
                 # Without this, the frontend only gets 59 scenes and isDense=false, breaking tracking.
-                await database.update_job_status(job_id, scenes=list(scenes))
+                _tracking_mode = "continuous" if _is_continuous else "multi_cluster"
+                await database.update_job_status(
+                    job_id, scenes=list(scenes), tracking_mode=_tracking_mode,
+                )
                 logger.info(
-                    "[%s] *** SAVED %d scenes to database (was 59 AI-only, now includes %d dense tracking scenes) ***",
-                    job_id, len(scenes), synthetic_count,
+                    "[%s] *** SAVED %d scenes to database (was 59 AI-only, now includes %d dense tracking scenes, mode=%s) ***",
+                    job_id, len(scenes), synthetic_count, _tracking_mode,
                 )
                 await _update_progress(
                     job_id, JobStatus.DETECTING_CLIPS, 67,

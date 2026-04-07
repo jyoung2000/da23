@@ -843,13 +843,18 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
   // not noisy AI defaults. A speaker at 53% is real, not center noise.
   const clusters = detectPositionClusters(raw, 10, 2, isDenseData);
 
+  // Detect continuous motion: if dense data has many unique x values (>10),
+  // the backend classified this as continuous (not slot-snapped). Skip clustering
+  // to preserve the raw face positions for smooth tracking.
+  const uniqueX = new Set(raw.map(k => k.x));
+  const isContinuousMotion = isDenseData && uniqueX.size > 10;
+
   console.log(
-    `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}, isDense=${isDenseData}`,
+    `[SubjectTracking] PHASE 1: raw=${raw.length} keyframes, clusters=${clusters ? clusters.length : 'null'}, isDense=${isDenseData}, continuous=${isContinuousMotion}, uniqueX=${uniqueX.size}`,
     clusters ? clusters.map(c => `center=${c.center} count=${c.count}`).join(', ') : 'none',
-    isDenseData ? '(dense face data — slot-center-snapped by backend)' : `raw_x_unique=[${[...new Set(raw.map(k=>k.x))].sort((a,b)=>a-b).join(',')}]`
   );
 
-  if (clusters && clusters.length >= 2) {
+  if (clusters && clusters.length >= 2 && !isContinuousMotion) {
     // Clamp cluster centers to the safe range for the target aspect ratio
     // so that snapToClusters produces values already within bounds.
     // Without this, a cluster center at 24 might be snapped to, but then

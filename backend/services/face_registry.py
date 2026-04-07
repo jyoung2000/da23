@@ -47,6 +47,40 @@ class FaceRegistry:
     def multi_speaker(self) -> bool:
         return len(self.slots) >= 2
 
+    @property
+    def is_continuous_motion(self) -> bool:
+        """Detect if face positions represent continuous motion rather than fixed speakers.
+
+        Returns True when faces move freely across the frame (cartoons, sports,
+        single-person vlogs) rather than sitting in fixed panel positions
+        (podcasts, interviews).
+
+        Heuristics:
+        - Single slot with wide x_range (face moves within the "slot")
+        - No slot has >80% of frames (no dominant fixed position)
+        - Average slot x_range exceeds 15% (faces aren't stationary)
+        """
+        if not self.slots:
+            return True  # No data → default to continuous (safer)
+        if len(self.slots) == 1:
+            slot = self.slots[0]
+            # If the single slot spans a wide range, it's a moving subject
+            return (slot.x_max - slot.x_min) > 15
+        # Multiple slots: check if any single slot dominates AND has wide range
+        total_frames = sum(s.frame_count for s in self.slots)
+        if total_frames == 0:
+            return True
+        avg_range = sum(s.x_max - s.x_min for s in self.slots) / len(self.slots)
+        dominant = max(self.slots, key=lambda s: s.frame_count)
+        dominant_pct = dominant.frame_count / total_frames
+        # If the dominant slot has wide range, it's moving even within its cluster
+        if dominant_pct > 0.6 and (dominant.x_max - dominant.x_min) > 20:
+            return True
+        # If average slot range is high, faces aren't stationary
+        if avg_range > 15:
+            return True
+        return False
+
     def nearest_slot(self, x: float) -> FaceSlot | None:
         """Find the slot closest to the given x position."""
         if not self.slots:
