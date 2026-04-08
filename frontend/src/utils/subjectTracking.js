@@ -836,6 +836,52 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
     return [{ t: 0, x: 50 }];
   }
 
+  // ── Reframe-segment mode: backend produced motivated editorial segments ──
+  // If the backend returned reframe-segment data (descriptions start with "[reframe:"),
+  // skip ALL frontend smoothing/clustering — honor the segments as-is.
+  if (scenes?.length > 0) {
+    const reframeScenes = scenes.filter(s =>
+      s.description && s.description.startsWith('[reframe:')
+    );
+    if (reframeScenes.length > 0) {
+      const clipDur = clipEnd - clipStart;
+      const sorted = [...reframeScenes]
+        .sort((a, b) => a.timestamp - b.timestamp);
+      const keyframes = [];
+      for (const s of sorted) {
+        const t = s.timestamp - clipStart;
+        if (t < -0.5 || t > clipDur + 0.5) continue;
+        const sx = s.active_speaker_x ?? s.subject_x ?? 50;
+        const safeSx = safeSubjectX(sx, srcRatio, targetRatio);
+        // Parse reason and ease_in_ms from description: [reframe:reason:easeMs]
+        const match = s.description.match(/\[reframe:(\w+):?(\d+)?\]/);
+        const reason = match?.[1] || 'hold';
+        const easeMs = match?.[2] ? parseInt(match[2], 10) : 0;
+        keyframes.push({ t: Math.max(0, Math.min(clipDur, t)), x: safeSx, reason, easeMs });
+      }
+      // Deduplicate: remove consecutive same-x entries (keep first and last of each run)
+      const deduped = keyframes.length > 0 ? [keyframes[0]] : [];
+      for (let i = 1; i < keyframes.length; i++) {
+        if (keyframes[i].x !== deduped[deduped.length - 1].x) {
+          deduped.push(keyframes[i]);
+        }
+      }
+      // Ensure we have at least start and end keyframes
+      if (deduped.length > 0 && deduped[0].t > 0) {
+        deduped.unshift({ t: 0, x: deduped[0].x });
+      }
+      if (deduped.length > 0 && deduped[deduped.length - 1].t < clipDur) {
+        deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x });
+      }
+      const uniqueX = new Set(deduped.map(k => k.x));
+      console.log(
+        `[SubjectTracking] PHASE 1: reframe-segment mode, ${reframeScenes.length} segments, unique_x=${uniqueX.size}`,
+        `(values: ${[...uniqueX].join(', ')})`
+      );
+      return deduped.length > 0 ? deduped : [{ t: 0, x: 50 }];
+    }
+  }
+
   // ── PHASE 0: Build raw keyframes ──
   const raw = buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio, targetRatio);
   if (!raw || raw.length === 0) return [{ t: 0, x: 50 }];

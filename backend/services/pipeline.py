@@ -2471,13 +2471,82 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
 
-    # ── Per-second scene synthesis from dense face + speaker data ──
+    # ── Reframe Segmenter (replaces per-second synthesis when enabled) ──
+    _reframe_segments_used = False
+    _has_speaker_data = active_speaker_events or transcript_speaker_events
+    if dense_face_results and face_registry and scenes and _has_speaker_data:
+        try:
+            from backend.services.reframe_segmenter import USE_REFRAME_SEGMENTER, build_reframe_segments
+            if USE_REFRAME_SEGMENTER and not _is_gameplay and not _is_continuous:
+                _video_dur = metadata.get("duration", 0)
+                _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
+                reframe_segments = build_reframe_segments(
+                    shot_cuts=_shot_cuts,
+                    face_registry=face_registry,
+                    active_speaker_events=active_speaker_events,
+                    dense_faces=dense_face_results,
+                    transcript_segments=transcript,
+                    speaker_to_slot=speaker_slot_map,
+                    video_duration=_video_dur,
+                    job_id=job_id,
+                )
+                if reframe_segments:
+                    # Replace scenes with one scene per reframe segment
+                    from backend.models import SceneDescription
+                    # Keep original AI scenes (non-dense) for other pipeline stages
+                    ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
+                    for seg in reframe_segments:
+                        _desc = f"[reframe:{seg.reason}:{seg.ease_in_ms}]"
+                        ai_scenes.append(SceneDescription(
+                            timestamp=float(seg.start),
+                            description=_desc,
+                            importance_score=5,
+                            thumbnail_path="",
+                            subject_x=seg.subject_x,
+                            active_speaker_x=seg.subject_x if seg.active_slot is not None else None,
+                            layout_mode=seg.layout,
+                            precise_x=float(seg.subject_x),
+                            precise_y=float(seg.subject_y),
+                            face_count=len(face_registry.slots) if face_registry else 0,
+                            face_positions=[],
+                        ))
+                        # Add end-marker scene so frontend knows segment duration
+                        if seg.end < _video_dur:
+                            ai_scenes.append(SceneDescription(
+                                timestamp=float(seg.end - 0.001),
+                                description=_desc,
+                                importance_score=5,
+                                thumbnail_path="",
+                                subject_x=seg.subject_x,
+                                active_speaker_x=seg.subject_x if seg.active_slot is not None else None,
+                                layout_mode=seg.layout,
+                                precise_x=float(seg.subject_x),
+                                precise_y=float(seg.subject_y),
+                                face_count=len(face_registry.slots) if face_registry else 0,
+                                face_positions=[],
+                            ))
+                    ai_scenes.sort(key=lambda s: s.timestamp)
+                    scenes = ai_scenes
+                    _tracking_mode = "multi_cluster"
+                    await database.update_job_status(
+                        job_id, scenes=list(scenes), tracking_mode=_tracking_mode,
+                    )
+                    logger.info(
+                        "[%s] *** ReframeSegmenter: %d segments → %d scenes saved (was %d per-second) ***",
+                        job_id, len(reframe_segments), len(scenes),
+                        len(dense_face_results),
+                    )
+                    _reframe_segments_used = True
+        except Exception as e:
+            logger.warning("[%s] ReframeSegmenter failed (falling back to per-second): %s", job_id, e)
+
+    # ── Per-second scene synthesis from dense face + speaker data (legacy) ──
+    # Only used when ReframeSegmenter is disabled or failed.
     # The AI vision model produces ~59 scenes (1 per 10s). Dense face detection
     # has 606 data points (1 per second). Create synthetic scene descriptions at
     # 1-second intervals using the ACTIVE SPEAKER's face position, so the
     # tracking pipeline gets 600+ keyframes instead of 59.
-    _has_speaker_data = active_speaker_events or transcript_speaker_events
-    if dense_face_results and face_registry and scenes and _has_speaker_data:
+    if not _reframe_segments_used and dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
             await _update_progress(
                 job_id, JobStatus.DETECTING_CLIPS, 66,

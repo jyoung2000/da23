@@ -633,6 +633,11 @@ export default function ClipPreview({
   // --- Dynamic subject tracking: update objectPosition via rAF for instant ~60fps snaps ---
   const srcRatio = sourceWidth / sourceHeight;
   const lastAppliedPctRef = useRef(null);
+  // Detect reframe-segment mode: keyframes from ReframeSegmenter have easeMs field
+  const isReframeSegmentMode = useMemo(
+    () => subjectKeyframes?.some(k => k.easeMs !== undefined),
+    [subjectKeyframes],
+  );
   useEffect(() => {
     if (!hasDynamicSubject) return;
     const video = fgVideoRef.current;
@@ -642,7 +647,8 @@ export default function ClipPreview({
     let lastPct = null;
     console.log(
       `[SubjectTracking] DYNAMIC mode active (rAF): R=${R.toFixed(3)} (src=${srcRatio.toFixed(3)}, target=${targetRatio.toFixed(3)}), ` +
-      `${subjectKeyframes.length} keyframes`
+      `${subjectKeyframes.length} keyframes` +
+      (isReframeSegmentMode ? ' [reframe-segment mode]' : '')
     );
 
     // Look up cropX from editable crop segments (user may have adjusted).
@@ -658,12 +664,29 @@ export default function ClipPreview({
       return interpolateSubjectX(subjectKeyframes, relTime);
     };
 
+    // For reframe-segment mode: find the active keyframe at a given time
+    // and return its ease duration for CSS transition
+    const getEaseMsAtTime = (relTime) => {
+      if (!isReframeSegmentMode) return 0;
+      // Find the keyframe that just started
+      let active = subjectKeyframes[0];
+      for (let i = 1; i < subjectKeyframes.length; i++) {
+        if (subjectKeyframes[i].t <= relTime) {
+          active = subjectKeyframes[i];
+        } else {
+          break;
+        }
+      }
+      return active?.easeMs || 0;
+    };
+
     // Apply initial position synchronously to eliminate 1-2 frame gap
     // between effect cleanup and first rAF tick
     {
       const initRel = video.currentTime - clipStart;
       const initSx = getCropXAtTime(initRel);
       const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
+      video.style.transition = '';
       video.style.objectPosition = `${initPct}% ${yPositionPct}%`;
       lastAppliedPctRef.current = initPct;
     }
@@ -675,6 +698,15 @@ export default function ClipPreview({
       // Only update DOM if value actually changed (avoid layout thrashing)
       const rounded = Math.round(centerPct * 10000) / 10000;
       if (rounded !== lastPct) {
+        // In reframe-segment mode, use CSS transition for motivated eases
+        if (isReframeSegmentMode) {
+          const easeMs = getEaseMsAtTime(relTime);
+          if (easeMs > 0) {
+            video.style.transition = `object-position ${easeMs}ms cubic-bezier(0.4, 0, 0.2, 1)`;
+          } else {
+            video.style.transition = '';
+          }
+        }
         video.style.objectPosition = `${centerPct}% ${yPositionPct}%`;
         lastPct = rounded;
         lastAppliedPctRef.current = centerPct;
@@ -694,8 +726,10 @@ export default function ClipPreview({
       // Do NOT clear video.style.objectPosition here — the cleanup runs
       // after React's DOM commit, so clearing would overwrite the correct
       // static objectPosition that React just applied.
+      // But DO clear the transition to avoid stale eases
+      if (video) video.style.transition = '';
     };
-  }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio, yPositionPct]);
+  }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio, yPositionPct, isReframeSegmentMode]);
 
   // When switching from dynamic to static mode (e.g. after "Reset Subject to
   // Center"), ensure the video's objectPosition is set to the correct static
