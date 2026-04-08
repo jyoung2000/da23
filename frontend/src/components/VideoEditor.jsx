@@ -905,9 +905,7 @@ export default function VideoEditor({
       return;
     }
     const dur = clipEnd - clipStart;
-    const clusters = detectPositionClusters(
-      subjectKeyframes.map(kf => [kf.t, kf.x])
-    );
+    const clusters = detectPositionClusters(subjectKeyframes);
     const segments = keyframesToCropSegments(subjectKeyframes, dur, clusters);
     setCropSegments(segments);
   }, [subjectKeyframes, isCrop, clipStart, clipEnd]);

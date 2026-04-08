@@ -271,7 +271,7 @@ export default function ClipSEO() {
   const [editorVolume, setEditorVolume] = useState(1.0);
   const [editorSpeed, setEditorSpeed] = useState(1.0);
 
-  // ── Segment persistence via localStorage ──
+  // ── Segment persistence via localStorage + server ──
   const segStorageKey = `clipai_segments_${jobId}_${clipId}`;
   const [editorSegments, setEditorSegments] = useState(() => {
     try {
@@ -286,6 +286,50 @@ export default function ClipSEO() {
       else localStorage.removeItem(segStorageKey);
     } catch {}
   }, [segStorageKey]);
+
+  // ── Editor state persistence to server (shared with Analysis page) ──
+  const editorStateSaveTimerRef = useRef(null);
+  const editorStateLoadedRef = useRef(false);
+  useEffect(() => () => { if (editorStateSaveTimerRef.current) clearTimeout(editorStateSaveTimerRef.current); }, []);
+
+  // Load editor state from server on mount
+  useEffect(() => {
+    if (!jobId || !clipId) return;
+    fetch(`/api/jobs/${jobId}/clips/${clipId}/editor-state`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.state) {
+          const s = data.state;
+          if (s.trim) setEditorTrim(s.trim);
+          if (s.volume != null) setEditorVolume(s.volume);
+          if (s.speed != null) setEditorSpeed(s.speed);
+          if (s.segments?.length > 0 && editorSegments.length === 0) {
+            setEditorSegments(s.segments);
+            try { localStorage.setItem(segStorageKey, JSON.stringify(s.segments)); } catch {}
+          }
+        }
+        editorStateLoadedRef.current = true;
+      })
+      .catch(() => { editorStateLoadedRef.current = true; });
+  }, [jobId, clipId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Save editor state to server (debounced) when trim/volume/speed/segments change
+  useEffect(() => {
+    if (!editorStateLoadedRef.current || !jobId || !clipId) return;
+    if (editorStateSaveTimerRef.current) clearTimeout(editorStateSaveTimerRef.current);
+    editorStateSaveTimerRef.current = setTimeout(() => {
+      fetch(`/api/jobs/${jobId}/clips/${clipId}/editor-state`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          trim: editorTrim,
+          volume: editorVolume,
+          speed: editorSpeed,
+          segments: editorSegments,
+        }),
+      }).catch(() => {});
+    }, 1000);
+  }, [editorTrim, editorVolume, editorSpeed, editorSegments, jobId, clipId]);
   const [showInlineSubSettings, setShowInlineSubSettings] = useState(false);
 
   // Layout mode: 'editor' = full-width NLE above, 'sidebyside' = player left + transcript right

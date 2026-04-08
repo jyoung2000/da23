@@ -381,6 +381,45 @@ export default function Analysis() {
     if (saved.length > 0) setEditorSegments(saved);
   }, [jobId, loadSegmentsFromStorage]);
 
+  // ── Editor state persistence to server (shared with ClipSEO page) ──
+  const editorStateSaveTimerRef = useRef(null);
+  useEffect(() => () => { if (editorStateSaveTimerRef.current) clearTimeout(editorStateSaveTimerRef.current); }, []);
+
+  const saveEditorStateToServer = useCallback((cId, state) => {
+    if (!jobId || !cId) return;
+    fetch(`/api/jobs/${jobId}/clips/${cId}/editor-state`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(state),
+    }).catch(() => {});
+  }, [jobId]);
+
+  const loadEditorStateFromServer = useCallback(async (cId) => {
+    if (!jobId || !cId) return null;
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/clips/${cId}/editor-state`);
+      if (res.ok) {
+        const data = await res.json();
+        return data?.state || null;
+      }
+    } catch {}
+    return null;
+  }, [jobId]);
+
+  // Debounced save of clip editor state to server when editing a clip preview
+  useEffect(() => {
+    if (!clipPreview?.id || !jobId) return;
+    if (editorStateSaveTimerRef.current) clearTimeout(editorStateSaveTimerRef.current);
+    editorStateSaveTimerRef.current = setTimeout(() => {
+      saveEditorStateToServer(clipPreview.id, {
+        trim: editorTrim,
+        volume: editorVolume,
+        speed: editorSpeed,
+        segments: editorSegments,
+      });
+    }, 1500);
+  }, [editorTrim, editorVolume, editorSpeed, editorSegments, clipPreview?.id, jobId, saveEditorStateToServer]);
+
   // Track applied trim ranges so the trimmed region becomes the full video
   const [fullVideoRange, setFullVideoRange] = useState(null); // { start, end } for full video editor
   const [showInlineSubSettings, setShowInlineSubSettings] = useState(false);
@@ -833,15 +872,37 @@ export default function Analysis() {
   }, [tab]);
 
   const handleClipPreview = (clip) => {
-    // Save current clip's segments before switching
+    // Save current clip's editor state before switching
     if (clipPreview) {
       clipSegmentsMapRef.current[clipPreview.id] = editorSegments;
       saveSegmentsToStorage(clipPreview.id, editorSegments);
+      saveEditorStateToServer(clipPreview.id, {
+        trim: editorTrim,
+        volume: editorVolume,
+        speed: editorSpeed,
+        segments: editorSegments,
+      });
     }
     // Restore segments for the new clip: in-memory cache first, then localStorage
     const savedSegments = clipSegmentsMapRef.current[clip.id] || loadSegmentsFromStorage(clip.id);
     clipSegmentsMapRef.current[clip.id] = savedSegments;
     setEditorSegments(savedSegments);
+    // Reset editor state defaults — server state loaded async below
+    setEditorTrim({ trimStart: 0, trimEnd: 0 });
+    setEditorVolume(1.0);
+    setEditorSpeed(1.0);
+    // Load persisted editor state from server (async)
+    loadEditorStateFromServer(clip.id).then(state => {
+      if (state) {
+        if (state.trim) setEditorTrim(state.trim);
+        if (state.volume != null) setEditorVolume(state.volume);
+        if (state.speed != null) setEditorSpeed(state.speed);
+        if (state.segments?.length > 0 && !clipSegmentsMapRef.current[clip.id]?.length) {
+          setEditorSegments(state.segments);
+          clipSegmentsMapRef.current[clip.id] = state.segments;
+        }
+      }
+    });
 
     // ── Eagerly populate timeline store with clip-filtered subtitles ──
     // The timeline store is a global singleton. Before React re-renders,
