@@ -8,6 +8,14 @@ const SPEAKER_COLORS_LIST = [
   '#A78BFA',
 ];
 
+// Must match the palette in VideoEditor / SubtitleOverlay / ClipPreview
+const DEFAULT_SPEAKER_PALETTE = [
+  '#00D9FF', '#F59E0B', '#10B981', '#A78BFA', '#EF4444', '#EC4899',
+  '#06B6D4', '#8B5CF6', '#F97316', '#14B8A6', '#E879F9', '#84CC16',
+  '#FB7185', '#38BDF8', '#FBBF24', '#34D399', '#C084FC', '#F472B6',
+  '#22D3EE', '#A3E635', '#FB923C', '#2DD4BF', '#818CF8', '#F87171',
+];
+
 function formatTime(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
@@ -34,7 +42,7 @@ function toTXT(segments) {
   return segments.map((seg) => `[${formatTime(seg.start)}] ${seg.speaker}: ${seg.text}`).join('\n');
 }
 
-export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, timeRange, currentTime, maxHeight }) {
+export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight }) {
   const { isMobile } = useResponsive();
   const scrollContainerRef = useRef(null);
   const activeSegRef = useRef(null);
@@ -50,6 +58,10 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   const [selectedIndices, setSelectedIndices] = useState(new Set());
   const lastClickedIdx = useRef(null);
   const [bulkSaving, setBulkSaving] = useState(false);
+
+  // Add speaker state
+  const [addingSpeaker, setAddingSpeaker] = useState(false);
+  const [newSpeakerName, setNewSpeakerName] = useState('');
 
   // Insert segment state
   const [insertAfterIdx, setInsertAfterIdx] = useState(null);
@@ -68,13 +80,15 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
     return seen;
   }, [transcript]);
 
-  // Map speaker name -> color by index in the ordered list
+  // Map speaker name -> color: use subtitle speakerColors if provided (matches subtitles),
+  // otherwise fall back to DEFAULT_SPEAKER_PALETTE, then SPEAKER_COLORS_LIST
   const speakerColor = useCallback(
     (name) => {
+      if (speakerColors?.[name]) return speakerColors[name];
       const idx = speakers.indexOf(name);
-      return SPEAKER_COLORS_LIST[idx % SPEAKER_COLORS_LIST.length] || 'var(--text-secondary)';
+      return DEFAULT_SPEAKER_PALETTE[idx % DEFAULT_SPEAKER_PALETTE.length] || SPEAKER_COLORS_LIST[idx % SPEAKER_COLORS_LIST.length] || 'var(--text-secondary)';
     },
-    [speakers]
+    [speakers, speakerColors]
   );
 
   const timeFiltered = useMemo(() => {
@@ -182,6 +196,10 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
         body: JSON.stringify({ speaker_names: { [editingSpeaker]: newName } }),
       });
       if (res.ok) {
+        // Transfer the old speaker's subtitle color to the new name
+        if (onSpeakerColorChanged && speakerColors?.[editingSpeaker]) {
+          onSpeakerColorChanged(newName, speakerColors[editingSpeaker], editingSpeaker);
+        }
         cancelEditing();
         if (onSpeakerRenamed) onSpeakerRenamed();
       }
@@ -527,7 +545,52 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
             </div>
           );
         })}
-        {speakers.length > 0 && (
+        {/* Add speaker inline */}
+        {addingSpeaker ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <input
+              autoFocus
+              value={newSpeakerName}
+              onChange={(e) => setNewSpeakerName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && newSpeakerName.trim()) {
+                  const name = newSpeakerName.trim();
+                  // Assign the next palette color
+                  const nextColor = DEFAULT_SPEAKER_PALETTE[speakers.length % DEFAULT_SPEAKER_PALETTE.length];
+                  if (onSpeakerAdded) onSpeakerAdded(name, nextColor);
+                  setAddingSpeaker(false);
+                  setNewSpeakerName('');
+                } else if (e.key === 'Escape') {
+                  setAddingSpeaker(false);
+                  setNewSpeakerName('');
+                }
+              }}
+              onBlur={() => { setAddingSpeaker(false); setNewSpeakerName(''); }}
+              placeholder="Speaker name"
+              style={{
+                fontSize: 12, padding: '2px 6px', width: 120,
+                background: 'var(--bg-base)', border: '1px solid var(--accent-cyan)',
+                borderRadius: 3, color: 'var(--text-primary)', outline: 'none',
+              }}
+            />
+          </div>
+        ) : (
+          <button
+            onClick={() => setAddingSpeaker(true)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: 3,
+              padding: '2px 8px', fontSize: 11, fontWeight: 600,
+              background: 'transparent', color: 'var(--text-muted)',
+              border: '1px dashed var(--border)', borderRadius: 3,
+              cursor: 'pointer',
+            }}
+            title="Add a new speaker"
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+            Add Speaker
+          </button>
+        )}
+        {speakers.length > 0 && !addingSpeaker && (
           <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 4 }}>
             click name to rename
           </span>

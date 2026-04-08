@@ -365,6 +365,33 @@ export default function ClipSEO() {
     if (seg.speaker && !speakers.includes(seg.speaker)) speakers.push(seg.speaker);
   });
 
+  // Handle speaker color change from transcript viewer (keeps subtitle colors in sync)
+  const handleSpeakerColorChanged = useCallback((newName, color, oldName) => {
+    setClipSettings(prev => {
+      const colors = { ...prev.speakerColors };
+      if (oldName && colors[oldName]) delete colors[oldName];
+      colors[newName] = color;
+      return { ...prev, speakerColors: colors };
+    });
+  }, []);
+
+  // Handle new speaker added from transcript viewer
+  const handleSpeakerAdded = useCallback((name, color) => {
+    setClipSettings(prev => {
+      const colors = { ...prev.speakerColors };
+      colors[name] = color;
+      return { ...prev, speakerColors: colors };
+    });
+    // Also register the speaker name on the server
+    if (jobId) {
+      fetch(`/api/jobs/${jobId}/speakers`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speaker_names: { [name]: name } }),
+      }).catch(() => {});
+    }
+  }, [jobId]);
+
   // Destructure clipSettings so existing references work seamlessly
   const {
     aspectRatio = null,
@@ -1296,6 +1323,9 @@ export default function ClipSEO() {
                       timeRange={clipTimeRange}
                       currentTime={currentTime}
                       maxHeight={600}
+                      speakerColors={speakerColors}
+                      onSpeakerColorChanged={handleSpeakerColorChanged}
+                      onSpeakerAdded={handleSpeakerAdded}
                       onSeek={(time) => {
                         const video = videoRef.current;
                         if (video) {
@@ -1558,6 +1588,9 @@ export default function ClipSEO() {
                   timeRange={clipTimeRange}
                   currentTime={currentTime}
                   maxHeight={400}
+                  speakerColors={speakerColors}
+                  onSpeakerColorChanged={handleSpeakerColorChanged}
+                  onSpeakerAdded={handleSpeakerAdded}
                   onSeek={(time) => {
                     const video = videoRef.current;
                     if (video) {

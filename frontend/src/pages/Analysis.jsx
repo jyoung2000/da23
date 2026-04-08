@@ -1323,6 +1323,33 @@ export default function Analysis() {
     });
   }, [speakers]);
 
+  // Handle speaker color change from transcript viewer (keeps subtitle colors in sync)
+  const handleSpeakerColorChanged = useCallback((newName, color, oldName) => {
+    setClipSettings(prev => {
+      const colors = { ...prev.speakerColors };
+      if (oldName && colors[oldName]) delete colors[oldName];
+      colors[newName] = color;
+      return { ...prev, speakerColors: colors };
+    });
+  }, []);
+
+  // Handle new speaker added from transcript viewer
+  const handleSpeakerAdded = useCallback((name, color) => {
+    setClipSettings(prev => {
+      const colors = { ...prev.speakerColors };
+      colors[name] = color;
+      return { ...prev, speakerColors: colors };
+    });
+    // Also register the speaker name on the server
+    if (jobId) {
+      fetch(`/api/jobs/${jobId}/speakers`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speaker_names: { [name]: name } }),
+      }).catch(() => {});
+    }
+  }, [jobId]);
+
   // --- Auto-trigger subject tracking when clip or aspect ratio changes ---
   // --- Per-clip subject tracking: staged AR pattern ---
   // Uses pendingAR (clipSettings.aspectRatio) vs activeAspectRatio.
@@ -2905,6 +2932,9 @@ export default function Analysis() {
                 <TranscriptViewer
                   transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
                   currentTime={videoCurrentTime}
+                  speakerColors={clipSettings?.speakerColors}
+                  onSpeakerColorChanged={handleSpeakerColorChanged}
+                  onSpeakerAdded={handleSpeakerAdded}
                   onSeek={handleSeek}
                   jobId={jobId}
                   onSpeakerRenamed={fetchJob}
