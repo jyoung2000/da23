@@ -297,10 +297,15 @@ export default function Analysis() {
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
 
   // ── Server is source of truth for subtitle settings ──
-  // When the job loads from the backend, apply server-stored settings (ignoring
-  // potentially-stale localStorage).  This runs every time `job` changes.
+  // On initial load this is handled in fetchJob (same batch as setJob) to avoid
+  // a flash. This effect only handles subsequent changes (e.g., refreshes).
+  const initialSettingsApplied = useRef(false);
   useEffect(() => {
     if (!job) return;
+    if (!initialSettingsApplied.current) {
+      initialSettingsApplied.current = true;
+      return;
+    }
     if (job.subtitle_settings && Object.keys(job.subtitle_settings).length > 0) {
       // Server has canonical settings — use them, merged over defaults
       skipNextServerSave.current = true; // Don't echo back to server
@@ -535,6 +540,14 @@ export default function Analysis() {
         // Sync generating state from job status (handles page refresh mid-generation)
         if (data.status === 'detecting_clips') {
           setIsGeneratingClips((prev) => prev || true);
+        }
+        // ── Apply server subtitle settings in the same batch as setJob ──
+        // Prevents flash where component renders with default settings
+        // (subtitles off, no speaker colors) before the settings effect fires.
+        if (!clipSettingsLoadedFromServer.current && data.subtitle_settings && Object.keys(data.subtitle_settings).length > 0) {
+          skipNextServerSave.current = true;
+          setClipSettings(prev => ({ ...prev, ...sanitizeSubtitleSettings(data.subtitle_settings) }));
+          clipSettingsLoadedFromServer.current = true;
         }
       } else if (res.status === 404 && fetchJobRetryRef.current < 10) {
         // Job may still be initializing (pipeline writes job.json async).

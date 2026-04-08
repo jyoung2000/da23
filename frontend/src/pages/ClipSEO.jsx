@@ -216,8 +216,17 @@ export default function ClipSEO() {
   const skipNextServerSave = useRef(false);
 
   // ── Server is source of truth for subtitle settings ──
+  // On initial load this is handled in the fetch callback (same batch as setJob)
+  // to avoid a flash. This effect only handles subsequent changes (e.g., fetchJob
+  // refreshes after transcript edit, or hot-reload during dev).
+  const initialSettingsApplied = useRef(false);
   useEffect(() => {
     if (!job) return;
+    // Skip the first run — settings were already applied in the fetch callback
+    if (!initialSettingsApplied.current) {
+      initialSettingsApplied.current = true;
+      return;
+    }
     if (job.subtitle_settings && Object.keys(job.subtitle_settings).length > 0) {
       skipNextServerSave.current = true;
       setClipSettings({ ...CLIP_SETTINGS_DEFAULTS, ...job.subtitle_settings });
@@ -371,6 +380,20 @@ export default function ClipSEO() {
             }
             if (found.shorts_description) setShortsDesc(found.shorts_description);
             if (found.longform_description) setLongFormDesc(found.longform_description);
+          }
+          // ── Apply server subtitle settings in the same batch as setJob ──
+          // This prevents a flash where the component renders with default
+          // settings (subtitles off, no speaker colors) before the useEffect
+          // for job.subtitle_settings fires on the next tick.
+          if (data.subtitle_settings && Object.keys(data.subtitle_settings).length > 0) {
+            skipNextServerSave.current = true;
+            setClipSettings(prev => ({ ...prev, ...data.subtitle_settings }));
+            clipSettingsLoadedFromServer.current = true;
+          } else if (!clipSettingsLoadedFromServer.current) {
+            try {
+              const saved = localStorage.getItem('clipai_clip_settings');
+              if (saved) setClipSettings(prev => ({ ...prev, ...JSON.parse(saved) }));
+            } catch {}
           }
         }
       })
