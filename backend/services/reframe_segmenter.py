@@ -5,6 +5,9 @@ reframe timeline that mimics how a human editor cuts vertical reframes.
 Eliminates jitter by making reframes *motivated editorial events* rather
 than face-detection outputs.
 
+Content-aware mode (gated by ContentProfile) applies different editorial
+strategies per content type: narrative, podcast, gaming, vlog, sports.
+
 Consumes shot cuts, face registry, active speaker events, dense faces,
 transcript segments, and speaker-to-slot mapping. Produces a list of
 ReframeSegment objects that the pipeline emits as scenes.
@@ -18,18 +21,19 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Feature flag ──
+# ── Feature flags ──
 USE_REFRAME_SEGMENTER = os.environ.get("USE_REFRAME_SEGMENTER", "true").lower() in ("true", "1", "yes")
+USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "false").lower() in ("true", "1", "yes")
 
-# ── Tunables ──
+# ── Default tunables (used when no content profile is provided) ──
 MIN_HOLD_SECONDS = 1.2
 ANTICIPATION_MS = 200
 SPEAKER_CONFIDENCE_THRESHOLD = 0.6
-SPEAKER_COVERAGE_THRESHOLD = 0.60  # transcript speaker must cover 60% of segment
-DENSE_DOMINANCE_THRESHOLD = 0.70   # face must be in 70% of dense frames
-MULTI_SPEAKER_THRESHOLD = 0.20     # 3+ slots each in 20%+ → wide
+SPEAKER_COVERAGE_THRESHOLD = 0.60
+DENSE_DOMINANCE_THRESHOLD = 0.70
+MULTI_SPEAKER_THRESHOLD = 0.20
 WIDE_MASTER_X = 50
-SUBJECT_Y_DEFAULT = 40             # rule of thirds: eyes upper third
+SUBJECT_Y_DEFAULT = 40
 EASE_SHOT_CUT_MS = 0
 EASE_SPEAKER_TURN_MS = 500
 EASE_SUBJECT_WALK_MS = 600
@@ -38,14 +42,20 @@ EASE_SUBJECT_WALK_MS = 600
 @dataclass
 class ReframeSegment:
     start: float              # seconds
-    end: float                # seconds, end - start >= MIN_HOLD (1.2s)
+    end: float                # seconds, end - start >= MIN_HOLD
     subject_x: int            # 0-100, snapped to a face slot OR 50 for wide
     subject_y: int            # 0-100, default 40 (rule of thirds, eyes upper third)
-    layout: str               # "single" | "split" | "triple" | "wide_master"
+    layout: str               # "single" | "split" | "triple" | "wide_master" | "blur_fill" | "stacked_gameplay" | "grid"
     active_slot: Optional[int]  # which face registry slot, or None for wide
     confidence: float         # 0..1
-    reason: str               # "speaker_turn" | "shot_cut" | "subject_walk" | "wide_fallback" | "hold"
+    reason: str               # "speaker_turn" | "shot_cut" | "subject_walk" | "wide_fallback" | "hold" | "action_sequence" | "split_overlap"
     ease_in_ms: int           # 0 for snap, 400-600 for motivated in-shot move
+    # ── Content-aware fields (populated when content profile is provided) ──
+    strategy: str = "stationary"  # ReframeStrategy value
+    content_type: str = "unknown"
+    lead_room_direction: Optional[str] = None  # "left" | "right" | None
+    motion_path: Optional[list] = None  # [(t, x, y), ...] for tracking/panning
+    hard_constraints: Optional[list] = None  # [(x, y, w, h), ...] HUD rects
 
 
 def build_reframe_segments(
@@ -57,6 +67,8 @@ def build_reframe_segments(
     speaker_to_slot: dict[str, int],
     video_duration: float,
     job_id: str = "",
+    content_profile=None,
+    persistent_regions=None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -69,18 +81,43 @@ def build_reframe_segments(
         speaker_to_slot: Mapping from speaker label to face slot id.
         video_duration: Total video duration in seconds.
         job_id: For logging correlation.
+        content_profile: ContentProfile from content_classifier (optional).
+        persistent_regions: RegionDetectionResult from persistent_region_detector (optional).
 
     Returns:
         List of ReframeSegment covering [0, video_duration].
     """
     _log = lambda msg, *a: logger.info("[%s] ReframeSegmenter: " + msg, job_id, *a)
 
+    # ── Load content-type config ──
+    ct = "unknown"
+    cfg = None
+    if content_profile and USE_CONTENT_AWARE_REFRAME:
+        ct = getattr(content_profile, 'content_type', 'unknown') or 'unknown'
+        try:
+            from backend.services.content_type_config import get_config
+            cfg = get_config(ct)
+        except ImportError:
+            cfg = None
+
+    # Use content-type-specific tunables or fall back to module defaults
+    _min_hold = cfg.get("min_hold_seconds", MIN_HOLD_SECONDS) if cfg else MIN_HOLD_SECONDS
+    _anticipation_ms = cfg.get("anticipation_ms", ANTICIPATION_MS) if cfg else ANTICIPATION_MS
+    _speaker_conf_thresh = cfg.get("speaker_confidence_threshold", SPEAKER_CONFIDENCE_THRESHOLD) if cfg else SPEAKER_CONFIDENCE_THRESHOLD
+    _speaker_cov_thresh = cfg.get("speaker_coverage_threshold", SPEAKER_COVERAGE_THRESHOLD) if cfg else SPEAKER_COVERAGE_THRESHOLD
+    _ease_speaker_ms = cfg.get("ease_speaker_turn_ms", EASE_SPEAKER_TURN_MS) if cfg else EASE_SPEAKER_TURN_MS
+    _ease_cut_ms = cfg.get("ease_shot_cut_ms", EASE_SHOT_CUT_MS) if cfg else EASE_SHOT_CUT_MS
+    _ease_walk_ms = cfg.get("ease_subject_walk_ms", EASE_SUBJECT_WALK_MS) if cfg else EASE_SUBJECT_WALK_MS
+    _wide_on_multi = cfg.get("wide_master_on_multi_face", True) if cfg else True
+    _use_split_on_overlap = cfg.get("use_split_screen_on_overlap", False) if cfg else False
+    _apply_lead_room = cfg.get("apply_lead_room", False) if cfg else False
+
     n_scenes = len(dense_faces) if dense_faces else 0
     n_cuts = len(shot_cuts)
     n_as = len(active_speaker_events) if active_speaker_events else 0
     n_ts = len(transcript_segments) if transcript_segments else 0
-    _log("input=%d scenes, %d shot cuts, %d AS events, %d transcript segs",
-         n_scenes, n_cuts, n_as, n_ts)
+    _log("input=%d scenes, %d shot cuts, %d AS events, %d transcript segs, content_type=%s",
+         n_scenes, n_cuts, n_as, n_ts, ct)
 
     # ── Stage 1: Candidate boundary collection ──
     boundaries = set()
@@ -100,7 +137,7 @@ def build_reframe_segments(
             conf = getattr(seg, 'confidence', None)
             if conf is None:
                 conf = 1.0
-            if prev_speaker is not None and speaker != prev_speaker and conf > SPEAKER_CONFIDENCE_THRESHOLD:
+            if prev_speaker is not None and speaker != prev_speaker and conf > _speaker_conf_thresh:
                 t = seg.start
                 if 0 < t < video_duration:
                     # Don't overwrite shot_cut with speaker_turn
@@ -117,7 +154,7 @@ def build_reframe_segments(
             if curr_ev.slot_id != prev_ev.slot_id:
                 # Check if the new slot holds long enough
                 hold_dur = curr_ev.end - curr_ev.start
-                if hold_dur >= MIN_HOLD_SECONDS:
+                if hold_dur >= _min_hold:
                     t = curr_ev.start
                     if 0 < t < video_duration and t not in boundary_reasons:
                         boundaries.add(t)
@@ -157,9 +194,11 @@ def build_reframe_segments(
             confidence=confidence,
             reason=reason,
             ease_in_ms=0,
+            strategy="stationary",
+            content_type=ct,
         ))
 
-    # ── Merge short segments (< MIN_HOLD) ──
+    # ── Merge short segments (< min_hold) ──
     merged_count = 0
     changed = True
     while changed:
@@ -168,7 +207,7 @@ def build_reframe_segments(
         while i < len(raw_segments):
             seg = raw_segments[i]
             dur = seg.end - seg.start
-            if dur < MIN_HOLD_SECONDS and len(raw_segments) > 1:
+            if dur < _min_hold and len(raw_segments) > 1:
                 # Find best neighbor to merge into
                 merged_into = _merge_short_segment(raw_segments, i)
                 if merged_into is not None:
@@ -178,14 +217,43 @@ def build_reframe_segments(
             i += 1
 
     if merged_count > 0:
-        _log("merged %d short segments (<%.1fs hold)", merged_count, MIN_HOLD_SECONDS)
+        _log("merged %d short segments (<%.1fs hold)", merged_count, _min_hold)
 
-    # ── Stage 3: Multi-speaker detection ──
+    # ── Stage 3: Multi-speaker detection (content-aware) ──
     wide_count = 0
-    if dense_faces and face_registry and len(face_registry.slots) >= 3:
+    split_count = 0
+    if dense_faces and face_registry and len(face_registry.slots) >= 2:
         for seg in raw_segments:
-            if _is_multi_speaker_crowd(seg.start, seg.end, dense_faces, face_registry):
+            active_slot_count = _count_active_slots(seg.start, seg.end, dense_faces)
+            if active_slot_count >= 3 and _wide_on_multi:
+                if _use_split_on_overlap and active_slot_count <= 4:
+                    seg.layout = "grid"
+                    seg.strategy = "grid"
+                    seg.reason = "wide_fallback"
+                    seg.confidence = 0.8
+                    split_count += 1
+                else:
+                    seg.layout = "wide_master"
+                    seg.strategy = "wide_master"
+                    seg.active_slot = None
+                    seg.subject_x = WIDE_MASTER_X
+                    seg.reason = "wide_fallback"
+                    seg.confidence = 0.8
+                    wide_count += 1
+            elif active_slot_count == 2 and _use_split_on_overlap:
+                # Check for speaker overlap (both active simultaneously)
+                overlap_dur = _check_speaker_overlap(
+                    seg.start, seg.end, active_speaker_events)
+                overlap_thresh = cfg.get("overlap_threshold_seconds", 1.0) if cfg else 1.0
+                if overlap_dur >= overlap_thresh:
+                    seg.layout = "split"
+                    seg.strategy = "split_screen"
+                    seg.reason = "split_overlap"
+                    seg.confidence = 0.8
+                    split_count += 1
+            elif active_slot_count >= 3 and _is_multi_speaker_crowd(seg.start, seg.end, dense_faces, face_registry):
                 seg.layout = "wide_master"
+                seg.strategy = "wide_master"
                 seg.active_slot = None
                 seg.subject_x = WIDE_MASTER_X
                 seg.reason = "wide_fallback"
@@ -193,7 +261,53 @@ def build_reframe_segments(
                 wide_count += 1
 
     if wide_count > 0:
-        _log("%d segments forced to WIDE_MASTER (3+ speakers)", wide_count)
+        _log("%d segments forced to WIDE_MASTER (multi-speaker)", wide_count)
+    if split_count > 0:
+        _log("%d segments set to SPLIT_SCREEN/GRID (overlap/multi)", split_count)
+
+    # ── Stage 3b: Narrative action-sequence detection ──
+    # For narrative content, detect clusters of rapid shot cuts and force WIDE_MASTER
+    action_wide_count = 0
+    if ct == "narrative" and cfg and shot_cuts:
+        action_cut_rate = cfg.get("action_cut_rate_threshold", 6.0)
+        action_window = cfg.get("action_window_seconds", 10.0)
+        for seg in raw_segments:
+            if seg.layout in ("wide_master", "split", "grid"):
+                continue
+            cuts_in_window = sum(
+                1 for sc in shot_cuts
+                if seg.start <= sc <= seg.end
+            )
+            seg_dur = seg.end - seg.start
+            if seg_dur > 0 and cuts_in_window / (seg_dur / action_window) >= action_cut_rate:
+                seg.layout = "wide_master"
+                seg.strategy = "wide_master"
+                seg.active_slot = None
+                seg.subject_x = WIDE_MASTER_X
+                seg.reason = "action_sequence"
+                action_wide_count += 1
+
+    if action_wide_count > 0:
+        _log("%d segments forced to WIDE_MASTER (action sequence, >%.0f cuts/%.0fs)",
+             action_wide_count, cfg.get("action_cut_rate_threshold", 6.0),
+             cfg.get("action_window_seconds", 10.0))
+
+    # ── Stage 3c: Gaming layout selection ──
+    gaming_stacked_count = 0
+    if ct == "gaming" and persistent_regions:
+        has_facecam = getattr(persistent_regions, 'has_facecam', False)
+        has_hud = getattr(persistent_regions, 'has_hud', False)
+        if has_facecam and cfg and cfg.get("prefer_stacked_gameplay"):
+            for seg in raw_segments:
+                seg.layout = "stacked_gameplay"
+                seg.strategy = "stacked_gameplay"
+                gaming_stacked_count += 1
+        elif has_hud:
+            for seg in raw_segments:
+                seg.layout = "blur_fill"
+                seg.strategy = "blur_fill"
+        if gaming_stacked_count > 0:
+            _log("%d segments set to STACKED_GAMEPLAY", gaming_stacked_count)
 
     # ── Stage 4: Hysteresis / minimum hold enforcement ──
     # Delete short B segment if A→B→C and A.slot == C.slot and B < 1.5s
@@ -233,17 +347,14 @@ def build_reframe_segments(
         _log("consolidated %d consecutive same-slot segments", consolidated)
 
     # ── Stage 5: Anticipation offset ──
-    # Shift speaker-turn segments earlier by ANTICIPATION_MS
-    # Don't shift if the segment already starts at/near a shot cut
     shot_cut_set = set(shot_cuts)
     anticipated = 0
     for seg in raw_segments:
         if seg.reason == "speaker_turn":
-            # Skip anticipation if segment starts at a shot cut
             at_shot_cut = any(abs(seg.start - sc) < 0.15 for sc in shot_cuts)
             if at_shot_cut:
                 continue
-            shift_s = ANTICIPATION_MS / 1000.0
+            shift_s = _anticipation_ms / 1000.0
             # Find previous shot cut to clamp (don't shift past it)
             prev_cut = 0.0
             for sc in sorted(shot_cut_set):
@@ -258,47 +369,78 @@ def build_reframe_segments(
 
     if anticipated > 0:
         _log("%d speaker-turn segments shifted -%dms (anticipation)",
-             anticipated, ANTICIPATION_MS)
+             anticipated, _anticipation_ms)
 
     # ── Stage 6: Ease vs snap decision ──
-    # Record pre-anticipation positions for shot-cut matching
-    anticipation_s = ANTICIPATION_MS / 1000.0
+    anticipation_s = _anticipation_ms / 1000.0
     for i, seg in enumerate(raw_segments):
         if i == 0:
             seg.ease_in_ms = 0
             continue
 
-        # Check if this transition coincides with a shot cut.
-        # Use wider window to catch anticipation-shifted starts.
         is_near_cut = any(
             abs(seg.start - sc) < 0.15 or abs(seg.start + anticipation_s - sc) < 0.15
             for sc in shot_cuts
         )
         if is_near_cut:
-            seg.ease_in_ms = EASE_SHOT_CUT_MS
+            seg.ease_in_ms = _ease_cut_ms
         elif seg.reason == "speaker_turn":
-            seg.ease_in_ms = EASE_SPEAKER_TURN_MS
+            seg.ease_in_ms = _ease_speaker_ms
         elif seg.reason == "subject_walk":
-            seg.ease_in_ms = EASE_SUBJECT_WALK_MS
+            seg.ease_in_ms = _ease_walk_ms
         else:
             seg.ease_in_ms = 0
 
     # ── Stage 7: Position snapping ──
-    # Ensure subject_x is either a face registry slot x or 50 (wide)
     for seg in raw_segments:
         seg.subject_x = _slot_to_x(seg.active_slot, face_registry)
 
+    # ── Stage 8: Lead-room application (narrative/vlog) ──
+    lead_room_count = 0
+    if _apply_lead_room and dense_faces:
+        try:
+            from backend.services.gaze_estimator import estimate_gaze_from_dense, apply_lead_room as _apply_lr
+            for seg in raw_segments:
+                if seg.active_slot is None or seg.layout in ("wide_master", "split", "grid", "blur_fill", "stacked_gameplay"):
+                    continue
+                gaze = estimate_gaze_from_dense(dense_faces, seg.active_slot, seg.start, seg.end)
+                if gaze != "center":
+                    seg.subject_x = _apply_lr(seg.subject_x, gaze)
+                    seg.lead_room_direction = gaze
+                    lead_room_count += 1
+        except Exception as e:
+            logger.warning("[%s] Lead-room application failed (non-fatal): %s", job_id, e)
+
+    if lead_room_count > 0:
+        _log("lead room applied to %d segments", lead_room_count)
+
+    # ── Stage 9: Hard constraints from persistent regions ──
+    if persistent_regions and hasattr(persistent_regions, 'as_rects'):
+        rects = persistent_regions.as_rects()
+        if rects:
+            for seg in raw_segments:
+                seg.hard_constraints = rects
+
     # ── Summary logging ──
     slot_counts = Counter()
+    strategy_counts = Counter()
     for seg in raw_segments:
         if seg.active_slot is not None:
             slot_counts[seg.active_slot] += 1
         else:
             slot_counts["wide"] += 1
+        strategy_counts[seg.strategy] += 1
 
     unique_x = set(seg.subject_x for seg in raw_segments)
     slot_str = ", ".join(f"{k}: {v}" for k, v in sorted(slot_counts.items(), key=lambda kv: str(kv[0])))
-    _log("FINAL %d segments — slots: {%s}", len(raw_segments), slot_str)
+    total_segs = len(raw_segments)
+
+    strategy_str = ", ".join(
+        f"{k}={v} ({100*v//max(total_segs,1)}%)"
+        for k, v in sorted(strategy_counts.items(), key=lambda x: -x[1])
+    )
+    _log("FINAL (%s): %d segments", ct, total_segs)
+    _log("  strategies: %s", strategy_str)
 
     x_parts = []
     if face_registry:
@@ -306,12 +448,74 @@ def build_reframe_segments(
             x_parts.append(f"slot{slot.slot_id}={int(round(slot.x_center))}")
     if WIDE_MASTER_X in unique_x:
         x_parts.append(f"wide={WIDE_MASTER_X}")
-    _log("unique subject_x = %d (%s)", len(unique_x), ", ".join(x_parts))
+    _log("  unique_x: %d (%s)", len(unique_x), ", ".join(x_parts))
+    _log("  slots: {%s}", slot_str)
+    if lead_room_count > 0:
+        _log("  lead_room_applied: %d segments", lead_room_count)
 
     return raw_segments
 
 
 # ── Internal helpers ──
+
+def _count_active_slots(
+    start: float,
+    end: float,
+    dense_faces: list,
+) -> int:
+    """Count how many distinct face slots appear in this interval."""
+    slots_seen = set()
+    for df in dense_faces:
+        if df.timestamp < start or df.timestamp > end:
+            continue
+        for f in df.faces:
+            sid = getattr(f, 'identity_id', -1)
+            if sid >= 0:
+                slots_seen.add(sid)
+    return len(slots_seen)
+
+
+def _check_speaker_overlap(
+    start: float,
+    end: float,
+    active_speaker_events: list,
+) -> float:
+    """Check if two different speakers are both active simultaneously.
+
+    Returns the total duration of overlap in seconds.
+    """
+    if not active_speaker_events:
+        return 0.0
+
+    # Collect time ranges per slot
+    from collections import defaultdict
+    slot_ranges = defaultdict(list)
+    for ev in active_speaker_events:
+        overlap_start = max(start, ev.start)
+        overlap_end = min(end, ev.end)
+        if overlap_start < overlap_end:
+            slot_ranges[ev.slot_id].append((overlap_start, overlap_end))
+
+    if len(slot_ranges) < 2:
+        return 0.0
+
+    # Find pairwise overlap between the two most active slots
+    slots = sorted(slot_ranges.keys(), key=lambda s: sum(e - s_ for s_, e in slot_ranges[s]), reverse=True)
+    if len(slots) < 2:
+        return 0.0
+
+    ranges_a = slot_ranges[slots[0]]
+    ranges_b = slot_ranges[slots[1]]
+    total_overlap = 0.0
+    for a_start, a_end in ranges_a:
+        for b_start, b_end in ranges_b:
+            ov_start = max(a_start, b_start)
+            ov_end = min(a_end, b_end)
+            if ov_start < ov_end:
+                total_overlap += ov_end - ov_start
+
+    return total_overlap
+
 
 def _resolve_slot_for_interval(
     start: float,

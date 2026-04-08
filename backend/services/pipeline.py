@@ -2471,6 +2471,37 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Speaker→slot mapping failed (non-fatal): %s", job_id, e)
 
+    # ── Content classification + persistent region detection ──
+    _content_profile = None
+    _persistent_regions = None
+    if dense_face_results and face_registry and scenes:
+        try:
+            from backend.services.content_classifier import classify_content, USE_CONTENT_AWARE_REFRAME
+            _video_dur = metadata.get("duration", 0)
+            _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
+            _content_profile = classify_content(
+                shot_cuts=_shot_cuts,
+                face_registry=face_registry,
+                dense_faces=dense_face_results,
+                scenes=scenes,
+                video_duration=_video_dur,
+                metadata=metadata,
+                job_id=job_id,
+            )
+        except Exception as e:
+            logger.warning("[%s] Content classification failed (non-fatal): %s", job_id, e)
+
+        try:
+            from backend.services.persistent_region_detector import detect_persistent_regions
+            _persistent_regions = detect_persistent_regions(
+                dense_faces=dense_face_results,
+                face_registry=face_registry,
+                video_duration=metadata.get("duration", 0),
+                job_id=job_id,
+            )
+        except Exception as e:
+            logger.warning("[%s] Persistent region detection failed (non-fatal): %s", job_id, e)
+
     # ── Reframe Segmenter (replaces per-second synthesis when enabled) ──
     _reframe_segments_used = False
     _has_speaker_data = active_speaker_events or transcript_speaker_events
@@ -2489,6 +2520,8 @@ async def _run_analysis_inner(job_id: str):
                     speaker_to_slot=speaker_slot_map,
                     video_duration=_video_dur,
                     job_id=job_id,
+                    content_profile=_content_profile,
+                    persistent_regions=_persistent_regions,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment
@@ -2496,7 +2529,7 @@ async def _run_analysis_inner(job_id: str):
                     # Keep original AI scenes (non-dense) for other pipeline stages
                     ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
                     for seg in reframe_segments:
-                        _desc = f"[reframe:{seg.reason}:{seg.ease_in_ms}]"
+                        _desc = f"[reframe:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}]"
                         ai_scenes.append(SceneDescription(
                             timestamp=float(seg.start),
                             description=_desc,

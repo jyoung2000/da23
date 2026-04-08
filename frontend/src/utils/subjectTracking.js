@@ -864,11 +864,12 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
 
         const sx = s.active_speaker_x ?? s.subject_x ?? 50;
         const safeSx = safeSubjectX(sx, srcRatio, targetRatio);
-        // Parse reason and ease_in_ms from description: [reframe:reason:easeMs]
-        const match = s.description.match(/\[reframe:(\w+):?(\d+)?\]/);
+        // Parse reason, ease_in_ms, strategy from description: [reframe:reason:easeMs:strategy]
+        const match = s.description.match(/\[reframe:(\w+):?(\d+)?:?(\w+)?\]/);
         const reason = match?.[1] || 'hold';
         const easeMs = match?.[2] ? parseInt(match[2], 10) : 0;
-        keyframes.push({ t: Math.max(0, Math.min(clipDur, t)), x: safeSx, reason, easeMs });
+        const strategy = match?.[3] || 'stationary';
+        keyframes.push({ t: Math.max(0, Math.min(clipDur, t)), x: safeSx, reason, easeMs, strategy, layoutMode: s.layout_mode });
       }
 
       // Deduplicate consecutive same-x entries. When removing, preserve the
@@ -887,9 +888,12 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
         deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x, easeMs: 0 });
       }
       const uniqueX = new Set(deduped.map(k => k.x));
+      const strategyCounts = {};
+      deduped.forEach(k => { strategyCounts[k.strategy || 'stationary'] = (strategyCounts[k.strategy || 'stationary'] || 0) + 1; });
+      const strategyStr = Object.entries(strategyCounts).map(([k, v]) => `${k}=${v}`).join(', ');
       console.log(
         `[SubjectTracking] PHASE 1: reframe-segment mode, ${reframeScenes.length} segments, unique_x=${uniqueX.size}`,
-        `(values: ${[...uniqueX].join(', ')})`
+        `(values: ${[...uniqueX].join(', ')}), strategies: {${strategyStr}}`
       );
       return deduped.length > 0 ? deduped : [{ t: 0, x: 50 }];
     }
