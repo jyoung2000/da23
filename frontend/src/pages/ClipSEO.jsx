@@ -947,57 +947,72 @@ export default function ClipSEO() {
         )}
       </div>
 
-      {/* ── EDITOR MODE: Full-width NLE above, settings + content below ── */}
-      {(isMobile || layoutMode === 'editor') && (
-        <>
-          <div style={{ width: isMobile ? '100%' : '90vw', margin: '0 auto 20px', position: 'relative' }}>
-            <VideoEditor
-              src={videoSrc}
-              clipStart={startTime ?? clip.start_time}
-              clipEnd={endTime ?? clip.end_time}
-              title={clip.title || `Clip ${clipId}`}
-              aspectRatio={aspectRatio}
-              sourceWidth={sourceDims.w}
-              sourceHeight={sourceDims.h}
-              subjectX={clipSubjectX}
-              scenes={stableScenes}
-              sceneCuts={stableSceneCuts}
-              initialVolume={playbackVolume}
-              initialSpeed={playbackSpeed}
-              onTimeUpdate={setCurrentTime}
-              onTrimChange={setEditorTrim}
-              onVolumeChange={setEditorVolume}
-              onSpeedChange={setEditorSpeed}
-              onSegmentsChange={saveSegments}
-              initialSegments={editorSegments}
-              settings={clipSettings}
-              speakers={speakers}
-              speakerNames={stableSpeakerNames}
-              onSettingsChange={setClipSettings}
-              jobId={jobId}
-              clipId={clipId}
-              transcript={stableTranscript}
-              onTranscriptUpdated={fetchJob}
-              onVideoRef={handleVideoRef}
-              onAspectRatioChange={(ar) => setClipSettings((prev) => ({ ...prev, aspectRatio: ar }))}
-              subtitleOverlay={
-                <SubtitleOverlay
-                  currentTime={currentTime}
-                  transcript={stableTranscript}
-                  clipStart={startTime ?? clip.start_time}
-                  clipEnd={endTime ?? clip.end_time}
-                  settings={clipSettings}
-                  aspectRatio={aspectRatio}
-                  sourceWidth={sourceDims.w}
-                  sourceHeight={sourceDims.h}
-                  segments={editorSegments}
-                />
-              }
-            />
+      {/* ── VIDEO EDITOR: Single instance, always mounted — layout changes via CSS only ── */}
+      {/* Wrapping flex container for sidebyside mode */}
+      <div style={{
+        display: !isMobile && layoutMode === 'sidebyside' ? 'flex' : 'block',
+        gap: !isMobile && layoutMode === 'sidebyside' ? 16 : undefined,
+        marginBottom: 20,
+        alignItems: !isMobile && layoutMode === 'sidebyside' ? 'flex-start' : undefined,
+      }}>
+        <div style={{
+          width: isMobile ? '100%' : layoutMode === 'editor' ? '90vw' : undefined,
+          flex: !isMobile && layoutMode === 'sidebyside' ? '1 1 50%' : undefined,
+          minWidth: !isMobile && layoutMode === 'sidebyside' ? 0 : undefined,
+          maxWidth: !isMobile && layoutMode === 'sidebyside' ? '60%' : undefined,
+          position: !isMobile && layoutMode === 'sidebyside' ? 'sticky' : 'relative',
+          top: !isMobile && layoutMode === 'sidebyside' ? 12 : undefined,
+          margin: isMobile || layoutMode === 'sidebyside' ? undefined : '0 auto',
+        }}>
+          <VideoEditor
+            src={videoSrc}
+            clipStart={startTime ?? clip.start_time}
+            clipEnd={endTime ?? clip.end_time}
+            title={clip.title || `Clip ${clipId}`}
+            aspectRatio={aspectRatio}
+            sourceWidth={sourceDims.w}
+            sourceHeight={sourceDims.h}
+            subjectX={clipSubjectX}
+            scenes={stableScenes}
+            sceneCuts={stableSceneCuts}
+            initialVolume={playbackVolume}
+            initialSpeed={playbackSpeed}
+            onTimeUpdate={setCurrentTime}
+            onTrimChange={setEditorTrim}
+            onVolumeChange={setEditorVolume}
+            onSpeedChange={setEditorSpeed}
+            onSegmentsChange={saveSegments}
+            initialSegments={editorSegments}
+            settings={clipSettings}
+            speakers={speakers}
+            speakerNames={stableSpeakerNames}
+            onSettingsChange={setClipSettings}
+            jobId={jobId}
+            clipId={clipId}
+            transcript={stableTranscript}
+            onTranscriptUpdated={fetchJob}
+            onVideoRef={handleVideoRef}
+            onAspectRatioChange={(ar) => setClipSettings((prev) => ({ ...prev, aspectRatio: ar }))}
+            subtitleOverlay={
+              <SubtitleOverlay
+                currentTime={currentTime}
+                transcript={stableTranscript}
+                clipStart={startTime ?? clip.start_time}
+                clipEnd={endTime ?? clip.end_time}
+                settings={clipSettings}
+                aspectRatio={aspectRatio}
+                sourceWidth={sourceDims.w}
+                sourceHeight={sourceDims.h}
+                segments={editorSegments}
+              />
+            }
+            compact={!isMobile && layoutMode === 'sidebyside'}
+          />
 
-            {/* ── Inline Editor Toolbar: Export + Subtitle Quick Settings ── */}
+            {/* ── Editor mode toolbar: full export + subtitle settings ── */}
             <div style={{
-              display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+              display: (isMobile || layoutMode === 'editor') ? 'flex' : 'none',
+              alignItems: 'center', gap: 8, padding: '8px 12px',
               background: 'var(--bg-panel)', borderRadius: '0 0 var(--radius-md) var(--radius-md)',
               borderTop: '1px solid var(--border)', flexWrap: 'wrap',
               marginTop: -1,
@@ -1086,8 +1101,8 @@ export default function ClipSEO() {
               </span>
             </div>
 
-            {/* ── Collapsible inline subtitle settings ── */}
-            {showInlineSubSettings && (
+            {/* ── Collapsible inline subtitle settings (editor mode only) ── */}
+            {(isMobile || layoutMode === 'editor') && showInlineSubSettings && (
               <div style={{
                 padding: '12px 16px', background: 'var(--bg-panel)',
                 border: '1px solid var(--border)', borderTop: 'none',
@@ -1172,62 +1187,11 @@ export default function ClipSEO() {
                 </div>
               </div>
             )}
-          </div>
-        </>
-      )}
 
-      {/* ── SIDE-BY-SIDE MODE: Player + Transcript side by side ── */}
-      {!isMobile && layoutMode === 'sidebyside' && (
-        <div style={{ display: 'flex', gap: 16, marginBottom: 20, alignItems: 'flex-start' }}>
-          {/* Left: sticky compact video editor — flex so portrait aspect ratios size naturally */}
-          <div style={{ flex: '1 1 50%', minWidth: 0, maxWidth: '60%', position: 'sticky', top: 12 }}>
-            <VideoEditor
-              src={videoSrc}
-              clipStart={startTime ?? clip.start_time}
-              clipEnd={endTime ?? clip.end_time}
-              title={clip.title || `Clip ${clipId}`}
-              aspectRatio={aspectRatio}
-              sourceWidth={sourceDims.w}
-              sourceHeight={sourceDims.h}
-              subjectX={clipSubjectX}
-              scenes={stableScenes}
-              sceneCuts={stableSceneCuts}
-              initialVolume={playbackVolume}
-              initialSpeed={playbackSpeed}
-              onTimeUpdate={setCurrentTime}
-              onTrimChange={setEditorTrim}
-              onVolumeChange={setEditorVolume}
-              onSpeedChange={setEditorSpeed}
-              onSegmentsChange={saveSegments}
-              initialSegments={editorSegments}
-              settings={clipSettings}
-              speakers={speakers}
-              speakerNames={stableSpeakerNames}
-              onSettingsChange={setClipSettings}
-              jobId={jobId}
-              clipId={clipId}
-              transcript={stableTranscript}
-              onTranscriptUpdated={fetchJob}
-              onVideoRef={handleVideoRef}
-              onAspectRatioChange={(ar) => setClipSettings((prev) => ({ ...prev, aspectRatio: ar }))}
-              subtitleOverlay={
-                <SubtitleOverlay
-                  currentTime={currentTime}
-                  transcript={stableTranscript}
-                  clipStart={startTime ?? clip.start_time}
-                  clipEnd={endTime ?? clip.end_time}
-                  settings={clipSettings}
-                  aspectRatio={aspectRatio}
-                  sourceWidth={sourceDims.w}
-                  sourceHeight={sourceDims.h}
-                  segments={editorSegments}
-                />
-              }
-              compact
-            />
-            {/* Compact export + subtitle bar */}
+            {/* ── Compact toolbar (side-by-side mode only) ── */}
             <div style={{
-              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px',
+              display: !isMobile && layoutMode === 'sidebyside' ? 'flex' : 'none',
+              alignItems: 'center', gap: 6, padding: '6px 10px',
               background: 'var(--bg-panel)', borderRadius: '0 0 var(--radius-sm) var(--radius-sm)',
               borderTop: '1px solid var(--border)', flexWrap: 'wrap', marginTop: -1,
             }}>
@@ -1251,40 +1215,41 @@ export default function ClipSEO() {
                 }}>{activeSegment ? 'Seg ' : ''}Subs {effectiveSubsEnabled ? 'On' : 'Off'}</button>
             </div>
           </div>
-          {/* Right: transcript */}
-          <div style={{ flex: '1 1 50%', minWidth: 0 }}>
-            {job?.transcript?.length > 0 && clipTimeRange ? (
-              <div>
-                <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 8 }}>
-                  Clip Transcript
+          {/* ── Side-by-side transcript panel ── */}
+          {!isMobile && layoutMode === 'sidebyside' && (
+            <div style={{ flex: '1 1 50%', minWidth: 0 }}>
+              {job?.transcript?.length > 0 && clipTimeRange ? (
+                <div>
+                  <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 8 }}>
+                    Clip Transcript
+                  </div>
+                  <div style={{ ...sectionStyle, padding: '8px 10px' }}>
+                    <TranscriptViewer
+                      transcript={job.transcript}
+                      timeRange={clipTimeRange}
+                      currentTime={currentTime}
+                      maxHeight={600}
+                      onSeek={(time) => {
+                        const video = videoRef.current;
+                        if (video) {
+                          video.currentTime = time;
+                          setCurrentTime(time);
+                        }
+                      }}
+                      jobId={jobId}
+                      onSpeakerRenamed={fetchJob}
+                      onTranscriptUpdated={fetchJob}
+                    />
+                  </div>
                 </div>
-                <div style={{ ...sectionStyle, padding: '8px 10px' }}>
-                  <TranscriptViewer
-                    transcript={job.transcript}
-                    timeRange={clipTimeRange}
-                    currentTime={currentTime}
-                    maxHeight={600}
-                    onSeek={(time) => {
-                      const video = videoRef.current;
-                      if (video) {
-                        video.currentTime = time;
-                        setCurrentTime(time);
-                      }
-                    }}
-                    jobId={jobId}
-                    onSpeakerRenamed={fetchJob}
-                    onTranscriptUpdated={fetchJob}
-                  />
+              ) : (
+                <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                  No transcript available for this clip
                 </div>
-              </div>
-            ) : (
-              <div style={{ padding: '40px 20px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-                No transcript available for this clip
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
         </div>
-      )}
 
       <div className="clip-panel-layout" style={{ display: 'flex', gap: 20, alignItems: 'flex-start', flexWrap: isMobile ? 'wrap' : 'nowrap', flexDirection: isMobile ? 'column' : 'row' }}>
         {/* Left column: clip info + export settings */}
