@@ -664,11 +664,26 @@ export default function ClipPreview({
       return interpolateSubjectX(subjectKeyframes, relTime);
     };
 
-    // For reframe-segment mode: find the active keyframe at a given time
-    // and return its ease duration for CSS transition
-    const getEaseMsAtTime = (relTime) => {
-      if (!isReframeSegmentMode) return 0;
-      // Find the keyframe that just started
+    // ── Reframe-segment easing state ──
+    // Instead of CSS transitions (which fight with rAF writes), we implement
+    // easing in JS: when a position change is detected, we animate from
+    // old→new over easeMs using cubic-bezier in the rAF loop itself.
+    let easeState = null; // { fromPct, toPct, startTime, durationMs }
+
+    // cubic-bezier(0.4, 0, 0.2, 1) approximation — ease-in-out
+    const easeCurve = (t) => {
+      // Simple approximation of cubic-bezier(0.4, 0, 0.2, 1)
+      if (t <= 0) return 0;
+      if (t >= 1) return 1;
+      // Attempt a reasonable cubic approximation
+      return t < 0.5
+        ? 4 * t * t * t
+        : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    };
+
+    // Find the easeMs for the keyframe that starts at or just before relTime
+    const getEaseMsForTransition = (relTime) => {
+      if (!isReframeSegmentMode || !subjectKeyframes) return 0;
       let active = subjectKeyframes[0];
       for (let i = 1; i < subjectKeyframes.length; i++) {
         if (subjectKeyframes[i].t <= relTime) {
@@ -686,7 +701,6 @@ export default function ClipPreview({
       const initRel = video.currentTime - clipStart;
       const initSx = getCropXAtTime(initRel);
       const initPct = subjectXToCenterPct(Math.max(0, Math.min(100, initSx)), srcRatio, targetRatio);
-      video.style.transition = '';
       video.style.objectPosition = `${initPct}% ${yPositionPct}%`;
       lastAppliedPctRef.current = initPct;
     }
@@ -694,30 +708,63 @@ export default function ClipPreview({
     const tick = () => {
       const relTime = video.currentTime - clipStart;
       const sx = getCropXAtTime(relTime);
-      const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
-      // Only update DOM if value actually changed (avoid layout thrashing)
-      const rounded = Math.round(centerPct * 10000) / 10000;
-      if (rounded !== lastPct) {
-        // In reframe-segment mode, use CSS transition for motivated eases
-        if (isReframeSegmentMode) {
-          const easeMs = getEaseMsAtTime(relTime);
-          if (easeMs > 0) {
-            video.style.transition = `object-position ${easeMs}ms cubic-bezier(0.4, 0, 0.2, 1)`;
-          } else {
-            video.style.transition = '';
-          }
+      const targetPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
+      const targetRounded = Math.round(targetPct * 10000) / 10000;
+
+      // Determine what to render this frame
+      let renderPct = targetPct;
+
+      if (isReframeSegmentMode && targetRounded !== lastPct && lastPct !== null) {
+        // Position just changed — start an ease if the transition has easeMs > 0
+        const easeMs = getEaseMsForTransition(relTime);
+        if (easeMs > 0) {
+          const fromPct = lastAppliedPctRef.current ?? targetPct;
+          easeState = {
+            fromPct,
+            toPct: targetPct,
+            startTime: performance.now(),
+            durationMs: easeMs,
+          };
+        } else {
+          easeState = null; // snap
         }
-        video.style.objectPosition = `${centerPct}% ${yPositionPct}%`;
-        lastPct = rounded;
-        lastAppliedPctRef.current = centerPct;
+      }
+
+      // If we're in an active ease, compute the interpolated position
+      if (easeState) {
+        const elapsed = performance.now() - easeState.startTime;
+        if (elapsed >= easeState.durationMs) {
+          // Ease complete
+          renderPct = easeState.toPct;
+          easeState = null;
+        } else {
+          const t = elapsed / easeState.durationMs;
+          renderPct = easeState.fromPct + (easeState.toPct - easeState.fromPct) * easeCurve(t);
+        }
+      }
+
+      const renderRounded = Math.round(renderPct * 10000) / 10000;
+      const renderedPctRef = lastAppliedPctRef.current != null
+        ? Math.round(lastAppliedPctRef.current * 10000) / 10000
+        : null;
+
+      if (renderRounded !== renderedPctRef) {
+        video.style.objectPosition = `${renderPct}% ${yPositionPct}%`;
+        lastAppliedPctRef.current = renderPct;
         // Log first 5 updates and then every 30th for debugging
         if (logCount < 5 || logCount % 30 === 0) {
           console.log(
-            `[SubjectTracking] t=${relTime.toFixed(2)}s: sx=${sx.toFixed(1)} → objectPosition=${centerPct.toFixed(2)}% ${yPositionPct.toFixed(1)}%`
+            `[SubjectTracking] t=${relTime.toFixed(2)}s: sx=${sx.toFixed(1)} → objectPosition=${renderPct.toFixed(2)}% ${yPositionPct.toFixed(1)}%` +
+            (easeState ? ` [easing]` : '')
           );
         }
         logCount++;
       }
+
+      // Update lastPct to track the *target* (not the eased render), so we
+      // detect the next position change correctly
+      lastPct = targetRounded;
+
       animId = requestAnimationFrame(tick);
     };
     animId = requestAnimationFrame(tick);
@@ -726,8 +773,6 @@ export default function ClipPreview({
       // Do NOT clear video.style.objectPosition here — the cleanup runs
       // after React's DOM commit, so clearing would overwrite the correct
       // static objectPosition that React just applied.
-      // But DO clear the transition to avoid stale eases
-      if (video) video.style.transition = '';
     };
   }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio, yPositionPct, isReframeSegmentMode]);
 

@@ -2510,21 +2510,6 @@ async def _run_analysis_inner(job_id: str):
                             face_count=len(face_registry.slots) if face_registry else 0,
                             face_positions=[],
                         ))
-                        # Add end-marker scene so frontend knows segment duration
-                        if seg.end < _video_dur:
-                            ai_scenes.append(SceneDescription(
-                                timestamp=float(seg.end - 0.001),
-                                description=_desc,
-                                importance_score=5,
-                                thumbnail_path="",
-                                subject_x=seg.subject_x,
-                                active_speaker_x=seg.subject_x if seg.active_slot is not None else None,
-                                layout_mode=seg.layout,
-                                precise_x=float(seg.subject_x),
-                                precise_y=float(seg.subject_y),
-                                face_count=len(face_registry.slots) if face_registry else 0,
-                                face_positions=[],
-                            ))
                     ai_scenes.sort(key=lambda s: s.timestamp)
                     scenes = ai_scenes
                     _tracking_mode = "multi_cluster"

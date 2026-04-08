@@ -847,10 +847,21 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       const clipDur = clipEnd - clipStart;
       const sorted = [...reframeScenes]
         .sort((a, b) => a.timestamp - b.timestamp);
+
+      // Build raw keyframes from reframe scenes, collapsing end-markers
+      // Each segment emits a start scene at seg.start and an end-marker at
+      // seg.end - 0.001. We only need the start scenes — the step-function
+      // interpolation holds each value until the next keyframe naturally.
+      const seen = new Set();
       const keyframes = [];
       for (const s of sorted) {
         const t = s.timestamp - clipStart;
         if (t < -0.5 || t > clipDur + 0.5) continue;
+        // Collapse near-duplicate timestamps (end-markers at t-0.001)
+        const tRounded = Math.round(t * 100) / 100;
+        if (seen.has(tRounded)) continue;
+        seen.add(tRounded);
+
         const sx = s.active_speaker_x ?? s.subject_x ?? 50;
         const safeSx = safeSubjectX(sx, srcRatio, targetRatio);
         // Parse reason and ease_in_ms from description: [reframe:reason:easeMs]
@@ -859,7 +870,9 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
         const easeMs = match?.[2] ? parseInt(match[2], 10) : 0;
         keyframes.push({ t: Math.max(0, Math.min(clipDur, t)), x: safeSx, reason, easeMs });
       }
-      // Deduplicate: remove consecutive same-x entries (keep first and last of each run)
+
+      // Deduplicate consecutive same-x entries. When removing, preserve the
+      // transition keyframe (the one with easeMs > 0 or a new reason).
       const deduped = keyframes.length > 0 ? [keyframes[0]] : [];
       for (let i = 1; i < keyframes.length; i++) {
         if (keyframes[i].x !== deduped[deduped.length - 1].x) {
@@ -868,10 +881,10 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       }
       // Ensure we have at least start and end keyframes
       if (deduped.length > 0 && deduped[0].t > 0) {
-        deduped.unshift({ t: 0, x: deduped[0].x });
+        deduped.unshift({ t: 0, x: deduped[0].x, easeMs: 0 });
       }
       if (deduped.length > 0 && deduped[deduped.length - 1].t < clipDur) {
-        deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x });
+        deduped.push({ t: clipDur, x: deduped[deduped.length - 1].x, easeMs: 0 });
       }
       const uniqueX = new Set(deduped.map(k => k.x));
       console.log(
