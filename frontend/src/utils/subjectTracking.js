@@ -1717,3 +1717,38 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
     };
   });
 }
+
+
+// ── RenderPlan integration ──────────────────────────────────────────────
+// When USE_RENDER_PLAN is enabled on the backend, the preview can fetch
+// a RenderPlan JSON instead of building keyframes from raw scenes.
+// This ensures the preview shows exactly what FFmpeg will export.
+
+/**
+ * Fetch the RenderPlan for a job from the backend API.
+ *
+ * @param {string} jobId - The job ID
+ * @param {Object} options
+ * @param {string} options.mode - "full" or "clip"
+ * @param {number} [options.clipIndex] - Clip index (required for mode="clip")
+ * @param {string} [options.aspectRatio] - Target aspect ratio (e.g., "9:16")
+ * @returns {Promise<Object|null>} The RenderPlan JSON, or null if unavailable
+ */
+export async function fetchRenderPlan(jobId, { mode = 'full', clipIndex, aspectRatio = '9:16' } = {}) {
+  if (!jobId) return null;
+  try {
+    const params = new URLSearchParams({ mode, aspect_ratio: aspectRatio });
+    if (clipIndex != null) params.set('clip_index', String(clipIndex));
+    const res = await fetch(`/api/jobs/${jobId}/render_plan?${params}`);
+    if (!res.ok) return null;
+    const plan = await res.json();
+    if (plan && plan.ops?.length > 0) {
+      console.log(`[SubjectTracking] RenderPlan loaded: ${plan.ops.length} ops, ${plan.total_duration_sec?.toFixed(1)}s`);
+      return plan;
+    }
+    return null;
+  } catch (err) {
+    console.log('[SubjectTracking] RenderPlan not available:', err.message);
+    return null;
+  }
+}

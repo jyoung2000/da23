@@ -1,5 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
+import { RenderPlanRenderer } from '../utils/renderPlanRenderer';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
 import useResponsive from '../hooks/useResponsive';
@@ -275,12 +276,64 @@ export default function ClipPreview({
   faceRegistry = null,
   defaultLayoutMode = 'single',
   trackingMode = null,
+  jobId = null,
+  clipIndex = null,
 }) {
   const { isMobile } = useResponsive();
   const fgVideoRef = useRef(null);
   const splitBottomVideoRef = useRef(null);
   const containerRef = useRef(null);
   const fullscreenRef = useRef(null);
+  const canvasRef = useRef(null);
+  const renderPlanRendererRef = useRef(null);
+  const [renderPlanData, setRenderPlanData] = useState(null);
+
+  // ── RenderPlan fetch: get the plan from the backend when jobId is available ──
+  useEffect(() => {
+    if (!jobId || !aspectRatio) return;
+    let cancelled = false;
+    const mode = clipIndex != null ? 'clip' : 'full';
+    const params = new URLSearchParams({ mode, aspect_ratio: aspectRatio });
+    if (clipIndex != null) params.set('clip_index', String(clipIndex));
+
+    fetch(`/api/jobs/${jobId}/render_plan?${params}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(plan => {
+        if (!cancelled && plan && plan.ops?.length > 0) {
+          setRenderPlanData(plan);
+          console.log(`[RenderPlan] Loaded plan: ${plan.ops.length} ops, ${plan.total_duration_sec?.toFixed(1)}s`);
+        }
+      })
+      .catch(err => {
+        console.log('[RenderPlan] Not available, using legacy preview:', err.message);
+      });
+    return () => { cancelled = true; };
+  }, [jobId, clipIndex, aspectRatio]);
+
+  // ── RenderPlan Canvas rendering via rAF ──
+  useEffect(() => {
+    if (!renderPlanData) return;
+    const canvas = canvasRef.current;
+    const video = fgVideoRef.current;
+    if (!canvas || !video) return;
+
+    const renderer = new RenderPlanRenderer(canvas, video, renderPlanData);
+    renderPlanRendererRef.current = renderer;
+
+    let animId;
+    const tick = () => {
+      const relTime = video.currentTime - clipStart;
+      renderer.draw(Math.max(0, relTime));
+      animId = requestAnimationFrame(tick);
+    };
+    animId = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(animId);
+      renderer.dispose();
+      renderPlanRendererRef.current = null;
+    };
+  }, [renderPlanData, clipStart]);
 
   // Dynamic subject tracking keyframes
   const subjectKeyframes = useMemo(
@@ -1277,9 +1330,22 @@ export default function ClipPreview({
           src={src}
           preload="auto"
           playsInline
-          style={videoStyle}
+          style={renderPlanData ? { ...videoStyle, display: 'none' } : videoStyle}
           onClick={togglePlay}
         />
+        {/* RenderPlan Canvas: shown when render plan is available for pixel-perfect preview */}
+        {renderPlanData && (
+          <canvas
+            ref={canvasRef}
+            onClick={togglePlay}
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'block',
+              objectFit: 'contain',
+            }}
+          />
+        )}
       </div>
     );
   };

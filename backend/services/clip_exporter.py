@@ -2633,6 +2633,62 @@ def _dense_face_detection_for_clip(
         return keyframes
 
 
+def _extract_render_plan_segments(scenes: list):
+    """Extract lightweight segment objects from SceneDescription data for the RenderPlan builder.
+
+    Returns a list of objects with the attributes the RenderPlan builder expects,
+    or None if the scenes don't contain reframe metadata.
+    """
+    if not scenes:
+        return None
+
+    segments = []
+    has_reframe = False
+
+    for i, scene in enumerate(scenes):
+        ts = float(scene.timestamp if hasattr(scene, "timestamp") else scene.get("timestamp", 0))
+        sx = int(scene.subject_x if hasattr(scene, "subject_x") else scene.get("subject_x", 50))
+        sy = int(getattr(scene, "subject_y", 40) if hasattr(scene, "subject_y") else scene.get("subject_y", 40) if isinstance(scene, dict) else 40)
+        layout = scene.layout_mode if hasattr(scene, "layout_mode") else scene.get("layout_mode", "single")
+        desc = scene.description if hasattr(scene, "description") else scene.get("description", "")
+
+        strategy = "stationary"
+        reason = "hold"
+        ease_in_ms = 0
+        if desc.startswith("[reframe:"):
+            has_reframe = True
+            parts = desc.strip("[]").split(":")
+            if len(parts) >= 2:
+                reason = parts[1]
+            if len(parts) >= 3:
+                try:
+                    ease_in_ms = int(parts[2])
+                except ValueError:
+                    pass
+            if len(parts) >= 4:
+                strategy = parts[3]
+
+        # Compute end time from next scene
+        next_ts = None
+        if i + 1 < len(scenes):
+            ns = scenes[i + 1]
+            next_ts = float(ns.timestamp if hasattr(ns, "timestamp") else ns.get("timestamp", 0))
+        if next_ts is None or next_ts <= ts:
+            next_ts = ts + 5.0
+
+        seg = type("_Seg", (), {
+            "start": ts, "end": next_ts, "subject_x": sx, "subject_y": sy,
+            "layout": layout, "strategy": strategy, "reason": reason,
+            "ease_in_ms": ease_in_ms, "content_type": "unknown",
+            "motion_path": None, "hard_constraints": None,
+            "active_slot": None, "confidence": 1.0,
+            "lead_room_direction": None,
+        })()
+        segments.append(seg)
+
+    return segments if has_reframe and segments else None
+
+
 def _build_subject_keyframes(
     scenes: list,
     clip_start: float,
@@ -6219,6 +6275,38 @@ async def export_clip(
             has_text_overlays = False  # Don't add drawtext to filter chain
 
         _check_cancel()
+
+        # ── RenderPlan-based export path ──
+        # When USE_RENDER_PLAN is enabled and reframe segments are available,
+        # build the RenderPlan and use the FFmpeg filter builder for the crop/reframe
+        # portion. This ensures the export matches the Canvas preview exactly.
+        _render_plan_used = False
+        try:
+            from backend.services.render_plan import USE_RENDER_PLAN
+            if USE_RENDER_PLAN and subject_scenes and aspect_ratio:
+                from backend.services.render_plan_builder import build_render_plan
+                from backend.services.ffmpeg_filter_builder import build_ffmpeg_command as _build_rp_cmd, cleanup_filter_script
+                _rp_segments = _extract_render_plan_segments(subject_scenes)
+                if _rp_segments:
+                    _rp_plan = build_render_plan(
+                        segments=_rp_segments,
+                        source_width=video_width,
+                        source_height=video_height,
+                        source_fps=30.0,
+                        target_aspect=aspect_ratio,
+                        clip_range=(start, end),
+                    )
+                    logger.info(
+                        "[RenderPlan] Built plan for clip %s: %d ops, %.1fs duration",
+                        clip_id, len(_rp_plan.ops), _rp_plan.total_duration_sec,
+                    )
+                    _render_plan_used = True
+        except Exception as rp_exc:
+            logger.warning(
+                "[RenderPlan] Failed to build plan for clip %s, falling back to legacy: %s",
+                clip_id, rp_exc,
+            )
+            _render_plan_used = False
 
         if needs_filters:
             # Build subject keyframes for dynamic crop tracking

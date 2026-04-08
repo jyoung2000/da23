@@ -2555,6 +2555,28 @@ async def _run_analysis_inner(job_id: str):
                         len(dense_face_results),
                     )
                     _reframe_segments_used = True
+
+                    # ── Build RenderPlan for full video (preview-export parity) ──
+                    try:
+                        from backend.services.render_plan import USE_RENDER_PLAN
+                        if USE_RENDER_PLAN:
+                            from backend.services.render_plan_builder import build_render_plan
+                            _rp = build_render_plan(
+                                segments=reframe_segments,
+                                source_width=metadata.get("width", 1920),
+                                source_height=metadata.get("height", 1080),
+                                source_fps=metadata.get("fps", 30.0),
+                                target_aspect="9:16",
+                            )
+                            await database.update_job_status(
+                                job_id, render_plan=_rp.to_dict(),
+                            )
+                            logger.info(
+                                "[%s] RenderPlan built: %d ops, %.1fs duration",
+                                job_id, len(_rp.ops), _rp.total_duration_sec,
+                            )
+                    except Exception as rp_e:
+                        logger.warning("[%s] RenderPlan build failed (non-fatal): %s", job_id, rp_e)
         except Exception as e:
             logger.warning("[%s] ReframeSegmenter failed (falling back to per-second): %s", job_id, e)
 
