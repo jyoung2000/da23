@@ -283,6 +283,43 @@ class SubjectConfidenceEstimator:
         return (covered_time / seg_dur) >= 0.3
 
 
+def face_in_proposed_crop(seg, face_registry, dense_faces,
+                         source_width: int = 1920, source_height: int = 1080,
+                         target_aspect: float = 9 / 16) -> bool:
+    """Returns True if at least one face from the registry has its center
+    inside the segment's proposed crop rectangle."""
+    if not face_registry or not dense_faces:
+        return False
+
+    src_aspect = source_width / source_height if source_height > 0 else 16 / 9
+    if target_aspect < src_aspect:
+        crop_w_pct = (target_aspect / src_aspect) * 100
+    else:
+        crop_w_pct = 100.0
+
+    crop_x_min = seg.subject_x - crop_w_pct / 2
+    crop_x_max = seg.subject_x + crop_w_pct / 2
+    if crop_x_min < 0:
+        crop_x_min = 0
+        crop_x_max = crop_w_pct
+    if crop_x_max > 100:
+        crop_x_max = 100
+        crop_x_min = 100 - crop_w_pct
+
+    seg_mid = (seg.start + seg.end) / 2.0
+    for df in dense_faces:
+        if abs(df.timestamp - seg_mid) > 0.5:
+            continue
+        for f in df.faces:
+            sid = getattr(f, 'identity_id', -1)
+            if sid < 0:
+                continue
+            face_x = getattr(f, 'nose_x', getattr(f, 'x', 50))
+            if crop_x_min <= face_x <= crop_x_max:
+                return True
+    return False
+
+
 def get_fallback_strategy(
     confidence: float,
     content_type: str,

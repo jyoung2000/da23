@@ -864,12 +864,15 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
 
         const sx = s.active_speaker_x ?? s.subject_x ?? 50;
         const safeSx = safeSubjectX(sx, srcRatio, targetRatio);
-        // Parse reason, ease_in_ms, strategy from description: [reframe:reason:easeMs:strategy]
-        const match = s.description.match(/\[reframe:(\w+):?(\d+)?:?(\w+)?\]/);
+        // Parse reason, ease_in_ms, strategy, confidence, subject_source from description
+        // Format: [reframe:reason:easeMs:strategy:confidence:subject_source]
+        const match = s.description.match(/\[reframe:(\w+):?(\d+)?:?(\w+)?:?([\d.]+)?:?(\w+)?\]/);
         const reason = match?.[1] || 'hold';
         const easeMs = match?.[2] ? parseInt(match[2], 10) : 0;
         const strategy = match?.[3] || 'stationary';
-        keyframes.push({ t: Math.max(0, Math.min(clipDur, t)), x: safeSx, reason, easeMs, strategy, layoutMode: s.layout_mode });
+        const confidence = match?.[4] ? parseFloat(match[4]) : null;
+        const subjectSource = match?.[5] || null;
+        keyframes.push({ t: Math.max(0, Math.min(clipDur, t)), x: safeSx, reason, easeMs, strategy, layoutMode: s.layout_mode, confidence, subjectSource });
       }
 
       // Deduplicate consecutive same-x entries. When removing, preserve the

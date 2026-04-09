@@ -390,18 +390,30 @@ export default function ClipPreview({
     if (!isCrop) return null;
     if (!scenes?.length) return { mode: 'no-data', label: 'No AI data', color: '#f59e0b' };
     if (!subjectKeyframes?.length) return { mode: 'error', label: 'Tracking failed', color: '#ef4444' };
+    const first = subjectKeyframes[0];
+    const sx = first.x;
+    const conf = first.confidence;
+    const strategy = first.strategy || 'stationary';
+    const strategyChip = strategy === 'stationary' ? 'CROP'
+      : strategy === 'split_screen' ? 'SPLIT'
+      : strategy === 'blur_fill' ? 'BLUR'
+      : strategy === 'wide_master' ? 'WIDE'
+      : strategy === 'grid' ? 'GRID'
+      : strategy === 'tracking' ? 'TRACK'
+      : strategy.toUpperCase();
+    const confLabel = conf != null ? ` \u00b7 Conf: ${Math.round(conf * 100)}%` : '';
+
     if (hasDynamicSubject) {
       return {
         mode: 'dynamic',
-        label: `Face tracked \u00b7 ${subjectKeyframes.length} keyframes`,
+        label: `Subject x: ${sx}%${confLabel} \u00b7 ${strategyChip}`,
         color: '#10b981',
       };
     }
-    const sx = subjectKeyframes[0].x;
-    if (Math.abs(sx - 50) < 3) {
-      return { mode: 'center', label: 'Centered', color: '#6b7280' };
+    if (Math.abs(sx - 50) < 3 && strategy === 'stationary') {
+      return { mode: 'center', label: `Centered${confLabel} \u00b7 ${strategyChip}`, color: '#6b7280' };
     }
-    return { mode: 'static', label: `Face tracked at ${sx}%`, color: '#10b981' };
+    return { mode: 'static', label: `Subject x: ${sx}%${confLabel} \u00b7 ${strategyChip}`, color: '#10b981' };
   }, [isCrop, scenes, subjectKeyframes, hasDynamicSubject]);
 
   const SPEED_OPTIONS = [0.5, 1.0, 1.5, 2.0];

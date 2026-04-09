@@ -2552,7 +2552,7 @@ async def _run_analysis_inner(job_id: str):
                     # Keep original AI scenes (non-dense) for other pipeline stages
                     ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
                     for seg in reframe_segments:
-                        _desc = f"[reframe:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}]"
+                        _desc = f"[reframe:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}:{seg.confidence:.2f}:{seg.subject_source or 'unknown'}]"
                         ai_scenes.append(SceneDescription(
                             timestamp=float(seg.start),
                             description=_desc,

@@ -146,9 +146,20 @@ class LocalPacingEstimator:
     def compute(self):
         """Compute per-second pacing scores from all added signals.
 
+        Uses prefix sums for O(N) windowed computation instead of O(N×W).
         Applies rolling window smoothing and signal normalization.
         """
-        # Windowed signal computation
+        # Build prefix sums for O(1) window queries
+        cut_prefix = np.zeros(self.duration + 1, dtype=np.float64)
+        speaker_prefix = np.zeros(self.duration + 1, dtype=np.float64)
+        motion_prefix = np.zeros(self.duration + 1, dtype=np.float64)
+        audio_prefix = np.zeros(self.duration + 1, dtype=np.float64)
+
+        np.cumsum(self.cut_density, out=cut_prefix[1:])
+        np.cumsum(self.speaker_density, out=speaker_prefix[1:])
+        np.cumsum(self.motion_energy, out=motion_prefix[1:])
+        np.cumsum(self.audio_dynamics, out=audio_prefix[1:])
+
         raw_pacing = np.zeros(self.duration, dtype=np.float32)
 
         for t in range(self.duration):
@@ -156,23 +167,19 @@ class LocalPacingEstimator:
             win_end = min(self.duration, t + self.half_win + 1)
             win_size = win_end - win_start
 
-            # Signal A: cut density (cuts per second in window)
-            cuts_in_win = float(np.sum(self.cut_density[win_start:win_end]))
-            cut_rate = cuts_in_win / max(1, win_size)
-            norm_cuts = min(1.0, cut_rate / CUT_RATE_REF)
+            # O(1) window sums via prefix arrays
+            cuts_in_win = float(cut_prefix[win_end] - cut_prefix[win_start])
+            norm_cuts = min(1.0, (cuts_in_win / max(1, win_size)) / CUT_RATE_REF)
 
-            # Signal B: speaker turn density
-            turns_in_win = float(np.sum(self.speaker_density[win_start:win_end]))
-            turn_rate = turns_in_win / max(1, win_size)
-            norm_speakers = min(1.0, turn_rate / TURN_RATE_REF)
+            turns_in_win = float(speaker_prefix[win_end] - speaker_prefix[win_start])
+            norm_speakers = min(1.0, (turns_in_win / max(1, win_size)) / TURN_RATE_REF)
 
-            # Signal C: motion energy (already normalized if add_motion_energy was called)
-            norm_motion = min(1.0, float(np.mean(self.motion_energy[win_start:win_end])))
+            motion_sum = float(motion_prefix[win_end] - motion_prefix[win_start])
+            norm_motion = min(1.0, motion_sum / max(1, win_size))
 
-            # Signal D: audio dynamics
-            norm_audio = min(1.0, float(np.mean(self.audio_dynamics[win_start:win_end])))
+            audio_sum = float(audio_prefix[win_end] - audio_prefix[win_start])
+            norm_audio = min(1.0, audio_sum / max(1, win_size))
 
-            # Weighted sum
             raw_pacing[t] = (
                 self.w_cuts * norm_cuts
                 + self.w_speakers * norm_speakers

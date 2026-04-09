@@ -67,6 +67,8 @@ class ReframeSegment:
     lead_room_direction: Optional[str] = None  # "left" | "right" | None
     motion_path: Optional[list] = None  # [(t, x, y), ...] for tracking/panning
     hard_constraints: Optional[list] = None  # [(x, y, w, h), ...] HUD rects
+    subject_source: str = ""  # which code path produced subject_x
+    fallback_reason: Optional[str] = None  # why a fallback was applied
 
 
 def build_reframe_segments(
@@ -133,7 +135,7 @@ def build_reframe_segments(
     # ── Initialize subject confidence estimator ──
     _confidence_estimator = None
     try:
-        from backend.services.subject_confidence import SubjectConfidenceEstimator, get_fallback_strategy
+        from backend.services.subject_confidence import SubjectConfidenceEstimator, get_fallback_strategy, face_in_proposed_crop
         _confidence_estimator = SubjectConfidenceEstimator(
             face_registry=face_registry,
             dense_faces=dense_faces,
@@ -211,7 +213,7 @@ def build_reframe_segments(
         seg_end = sorted_boundaries[i + 1]
         reason = boundary_reasons.get(seg_start, "hold")
 
-        active_slot, confidence, layout = _resolve_slot_for_interval(
+        active_slot, confidence, layout, subject_source = _resolve_slot_for_interval(
             seg_start, seg_end,
             transcript_segments, speaker_to_slot,
             active_speaker_events,
@@ -232,6 +234,7 @@ def build_reframe_segments(
             ease_in_ms=0,
             strategy="stationary",
             content_type=ct,
+            subject_source=subject_source,
         ))
 
     # ── Merge short segments (< min_hold, adaptive per-segment) ──
@@ -265,6 +268,10 @@ def build_reframe_segments(
         for seg in raw_segments:
             active_slot_count = _count_active_slots(seg.start, seg.end, dense_faces)
             if active_slot_count >= 3 and _wide_on_multi:
+                # Don't override if the segment already has a confident single-speaker
+                # assignment (active speaker or transcript speaker picked one)
+                if seg.active_slot is not None and seg.confidence >= 0.6:
+                    continue  # Already tracking a specific speaker, keep it
                 if _use_split_on_overlap and active_slot_count <= 4:
                     seg.layout = "grid"
                     seg.strategy = "grid"
@@ -389,6 +396,8 @@ def build_reframe_segments(
                     seg.subject_x = subject_x
                     seg.active_slot = active_slot
                     seg.reason = reason
+                    seg.subject_source = "last_known" if "inherit" in reason else "hardcoded_center"
+                    seg.fallback_reason = conf_reason
                     fallback_count += 1
                     _log("segment %.1f-%.1fs: confidence=%.2f, fallback=%s (reason=%s)",
                          seg.start, seg.end, conf, strategy.upper(), conf_reason)
@@ -400,8 +409,16 @@ def build_reframe_segments(
         _log("%d segments received confidence-gated fallbacks", fallback_count)
 
     # ── Stage 3e: Motion-aware tracking for fast content ──
+    # Skip optical flow entirely on stable talking-head segments (podcast with
+    # stable face positions). This saves significant compute on podcast exports.
     motion_tracking_count = 0
-    if _allow_motion_tracking and dense_faces:
+    _skip_motion = False
+    if ct == "podcast" and face_registry and not face_registry.is_continuous_motion:
+        # Stable talking-head: face positions have low stdev, no motion tracking needed
+        _skip_motion = True
+        _log("skipping motion tracking (stable %s content)", ct)
+
+    if _allow_motion_tracking and dense_faces and not _skip_motion:
         try:
             from backend.services.optical_flow import (
                 compute_motion_energy_per_second,
@@ -452,9 +469,13 @@ def build_reframe_segments(
 
         if b_dur < hysteresis_thresh and c.active_slot == a.active_slot:
             # Look ahead: does speaker B come back for a sustained period?
+            # Cap look-ahead to 3 segments for calm content (pacing < 0.3),
+            # full 5 for fast content where rapid back-and-forth is real.
+            local_pacing = pacing_estimator.pacing[min(int(b_mid), pacing_estimator.duration - 1)] if _has_pacing else 0.5
+            max_lookahead = 3 if local_pacing < 0.3 else 5
             b_returns = False
             if i + 2 < len(raw_segments):
-                for j in range(i + 2, min(i + 5, len(raw_segments))):
+                for j in range(i + 2, min(i + max_lookahead, len(raw_segments))):
                     future_seg = raw_segments[j]
                     if (future_seg.active_slot == b.active_slot
                             and (future_seg.end - future_seg.start) >= hysteresis_thresh * 2):
@@ -596,6 +617,39 @@ def build_reframe_segments(
     if lead_room_count > 0:
         _log("  lead_room_applied: %d segments", lead_room_count)
 
+    # ── Per-segment diagnostic logging ──
+    for seg in raw_segments:
+        face_slots_at_mid = []
+        seg_mid = (seg.start + seg.end) / 2.0
+        if dense_faces:
+            # Find face slots visible near segment midpoint
+            for df in dense_faces:
+                if abs(df.timestamp - seg_mid) < 0.5 and df.faces:
+                    for f in df.faces:
+                        sid = getattr(f, 'identity_id', -1)
+                        if sid >= 0:
+                            fx = getattr(f, 'nose_x', getattr(f, 'x', 50))
+                            face_slots_at_mid.append((sid, round(fx, 1)))
+                    break
+
+        try:
+            from backend.services.subject_confidence import face_in_proposed_crop as _fipc
+            in_crop = _fipc(seg, face_registry, dense_faces)
+        except Exception:
+            in_crop = "unknown"
+        logger.info(
+            "[reframe] segment t=%.2f-%.2f strategy=%s subject_x=%d subject_y=%d "
+            "source_path=%s face_slots=%s active_slot=%s "
+            "confidence=%.2f fallback_reason=%s face_in_crop_rect=%s",
+            seg.start, seg.end, seg.strategy, seg.subject_x, seg.subject_y,
+            seg.subject_source or "unknown",
+            face_slots_at_mid,
+            seg.active_slot,
+            seg.confidence,
+            seg.fallback_reason or "none",
+            in_crop,
+        )
+
     return raw_segments
 
 
@@ -668,43 +722,58 @@ def _resolve_slot_for_interval(
     active_speaker_events: list,
     dense_faces: list,
     face_registry,
-) -> tuple[Optional[int], float, str]:
+    source_width: int = 1920,
+    source_height: int = 1080,
+) -> tuple[Optional[int], float, str, str]:
     """Determine the active slot for a time interval.
 
     Priority:
       1. Transcript-speaker override (>60% coverage, confidence > 0.6)
       2. Active-speaker majority (mode > 50%)
       3. Dense face dominance (one slot in 70%+ frames)
-      4. Wide master fallback
+      4. Multi-face spread check — pick active speaker or split/blur
+      5. Wide master fallback
 
     Returns:
-        (active_slot, confidence, layout)
+        (active_slot, confidence, layout, subject_source)
     """
     duration = end - start
     if duration <= 0:
-        return None, 0.0, "wide_master"
+        return None, 0.0, "wide_master", "hardcoded_center"
 
     # Priority 1: Transcript-speaker override
     if transcript_segments and speaker_to_slot:
         slot, coverage = _transcript_slot_coverage(
             start, end, transcript_segments, speaker_to_slot)
         if slot is not None and coverage >= SPEAKER_COVERAGE_THRESHOLD:
-            return slot, min(1.0, coverage), "single"
+            return slot, min(1.0, coverage), "single", "active_speaker_slot"
 
     # Priority 2: Active-speaker majority
     if active_speaker_events:
         slot, coverage = _active_speaker_majority(start, end, active_speaker_events)
         if slot is not None and coverage >= 0.5:
-            return slot, min(1.0, coverage), "single"
+            return slot, min(1.0, coverage), "single", "active_speaker_slot"
 
     # Priority 3: Dense face dominance
     if dense_faces and face_registry:
         slot = _dense_face_dominant_slot(start, end, dense_faces, face_registry)
         if slot is not None:
-            return slot, 0.7, "single"
+            return slot, 0.7, "single", "dense_face_dominant"
 
-    # Priority 4: Wide master fallback
-    return None, 0.3, "wide_master"
+    # Priority 4: Multi-face spread check
+    # When multiple confident faces are visible but none dominates,
+    # check if they fit in a single crop. If not, pick active speaker
+    # or use split/blur. NEVER average distant face positions.
+    if dense_faces and face_registry and len(face_registry.slots) >= 2:
+        result = _resolve_multi_face_spread(
+            start, end, face_registry, active_speaker_events,
+            dense_faces, source_width, source_height,
+        )
+        if result is not None:
+            return result
+
+    # Priority 5: Wide master fallback
+    return None, 0.3, "wide_master", "hardcoded_center"
 
 
 def _transcript_slot_coverage(
@@ -804,6 +873,93 @@ def _dense_face_dominant_slot(
         return best_slot_id
 
     return None
+
+
+def _resolve_multi_face_spread(
+    start: float,
+    end: float,
+    face_registry,
+    active_speaker_events: list,
+    dense_faces: list,
+    source_width: int = 1920,
+    source_height: int = 1080,
+) -> Optional[tuple[Optional[int], float, str, str]]:
+    """Handle multi-face segments where no single face dominates.
+
+    When multiple confident face slots are visible but none wins majority,
+    checks whether they fit in a single crop. If they do, returns their
+    centroid. If they don't, picks the active speaker or falls back to
+    split/blur. NEVER averages positions of faces that don't fit in one crop.
+
+    Returns:
+        (active_slot, confidence, layout, subject_source) or None if not applicable.
+    """
+    # Find slots with faces visible in this interval
+    frames_in_range = [
+        df for df in dense_faces
+        if start <= df.timestamp <= end and df.faces
+    ]
+    if not frames_in_range:
+        return None
+
+    total = len(frames_in_range)
+    slot_counts = Counter()
+    for df in frames_in_range:
+        seen = set()
+        for f in df.faces:
+            sid = getattr(f, 'identity_id', -1)
+            if sid >= 0 and sid not in seen:
+                slot_counts[sid] += 1
+                seen.add(sid)
+
+    # Only applies when 2+ slots are confidently visible (>20% of frames)
+    confident_slot_ids = [sid for sid, cnt in slot_counts.items()
+                          if cnt / total >= MULTI_SPEAKER_THRESHOLD]
+    if len(confident_slot_ids) < 2:
+        return None
+
+    confident_slots = [face_registry.slot_by_id(sid)
+                       for sid in confident_slot_ids]
+    confident_slots = [s for s in confident_slots if s is not None]
+    if len(confident_slots) < 2:
+        return None
+
+    # Compute the spread (max distance between face slot centers)
+    xs = [s.x_center for s in confident_slots]
+    spread = max(xs) - min(xs)
+
+    # Compute crop width as percentage of source frame
+    src_aspect = source_width / source_height if source_height > 0 else 16 / 9
+    target_aspect = 9 / 16
+    crop_width_pct = (target_aspect / src_aspect) * 100  # ~31.6% for 16:9→9:16
+
+    # If all confident faces fit inside ONE crop window (with 15% padding), centroid is safe
+    if spread < crop_width_pct * 0.85:
+        cx = sum(xs) / len(xs)
+        # Find the slot closest to centroid
+        nearest = min(confident_slots, key=lambda s: abs(s.x_center - cx))
+        return nearest.slot_id, 0.75, "single", "dense_face_dominant"
+
+    # Faces are spread wider than a single crop can contain.
+    # NEVER average — that lands between them on empty space.
+
+    # Tiebreaker 1: Active speaker picks the slot
+    if active_speaker_events:
+        slot_id, coverage = _active_speaker_majority(start, end, active_speaker_events)
+        if slot_id is not None and slot_id in confident_slot_ids:
+            return slot_id, min(1.0, max(0.6, coverage)), "single", "active_speaker_slot"
+
+    # Tiebreaker 2: Check for simultaneous speaking (overlap)
+    if active_speaker_events:
+        overlap_dur = _check_speaker_overlap(start, end, active_speaker_events)
+        seg_dur = end - start
+        if seg_dur > 0 and overlap_dur / seg_dur > 0.30:
+            # Both speaking >30% of the segment — split screen
+            return None, 0.8, "split", "multi_face_split"
+
+    # Tiebreaker 3: Pick the slot with the most frames (most recently dominant)
+    best_sid = max(confident_slot_ids, key=lambda sid: slot_counts[sid])
+    return best_sid, 0.55, "single", "dense_face_dominant"
 
 
 def _is_multi_speaker_crowd(
