@@ -175,49 +175,36 @@ def _smooth_layout_votes(
                 merged.append((start, end, mode))
         return merged
 
-    # Absorb short segments into neighbors.
-    # Merge after each pass so same-mode segments combine and grow beyond min_duration.
-    # Max iterations prevents infinite loops on pathological input.
+    # Deterministic two-pass absorb: O(n), no loops, no `changed` flag.
+    # Forward pass: walk left-to-right, absorb short segments into predecessor.
+    # Backward pass: walk right-to-left, absorb remaining short segments.
     stabilized = _merge_consecutive(raw_segments)
-    max_passes = 50
 
-    for _pass in range(max_passes):
-        changed = False
-        new_segments = []
-        for i, (start, end, mode) in enumerate(stabilized):
-            duration = end - start
-            if duration < min_duration and len(stabilized) > 1:
-                if i > 0 and (i == len(stabilized) - 1 or
-                              (new_segments and (new_segments[-1][1] - new_segments[-1][0]) >=
-                               (stabilized[i + 1][1] - stabilized[i + 1][0] if i + 1 < len(stabilized) else 0))):
-                    # Extend previous segment
-                    prev = new_segments[-1]
-                    new_segments[-1] = (prev[0], end, prev[2])
-                    changed = True
-                elif i + 1 < len(stabilized):
-                    # Absorb into next segment by changing this mode
-                    next_mode = stabilized[i + 1][2]
-                    if next_mode != mode:  # Only flag changed if mode actually changes
-                        new_segments.append((start, end, next_mode))
-                        changed = True
-                    else:
-                        new_segments.append((start, end, mode))
-                else:
-                    new_segments.append((start, end, mode))
-            else:
-                new_segments.append((start, end, mode))
+    # Forward pass
+    forward = [stabilized[0]]
+    for i in range(1, len(stabilized)):
+        start, end, mode = stabilized[i]
+        duration = end - start
+        if duration < min_duration and len(stabilized) > 1:
+            # Extend predecessor
+            prev = forward[-1]
+            forward[-1] = (prev[0], end, prev[2])
+        else:
+            forward.append((start, end, mode))
+    forward = _merge_consecutive(forward)
 
-        # CRITICAL: merge consecutive same-mode segments INSIDE the loop
-        # so absorbed segments combine and grow beyond min_duration
-        stabilized = _merge_consecutive(new_segments)
-
-        if not changed:
-            break
-    else:
-        logger.warning(
-            "[Layout] Smoothing did not converge after %d passes (%d segments remaining)",
-            max_passes, len(stabilized),
-        )
+    # Backward pass
+    backward = [forward[-1]]
+    for i in range(len(forward) - 2, -1, -1):
+        start, end, mode = forward[i]
+        duration = end - start
+        if duration < min_duration and len(forward) > 1:
+            # Extend successor (which is backward[0] since we're going right-to-left)
+            succ = backward[0]
+            backward[0] = (start, succ[1], succ[2])
+        else:
+            backward.insert(0, (start, end, mode))
+    stabilized = _merge_consecutive(backward)
 
     return stabilized
 
