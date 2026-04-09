@@ -32,6 +32,8 @@ def build_autoflip_segments(
     source_width: int,
     source_height: int,
     persistent_regions=None,
+    object_registry=None,
+    text_regions: list = None,
     target_aspect: float = 9 / 16,
     job_id: str = "",
 ) -> list:
@@ -83,6 +85,8 @@ def build_autoflip_segments(
             source_width=source_width,
             source_height=source_height,
             target_aspect=target_aspect,
+            object_registry=object_registry,
+            text_regions=text_regions,
             job_id=job_id,
         )
 

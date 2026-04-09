@@ -81,6 +81,15 @@ def select_camera_mode(
         logger.info("[%s] Camera mode: PADDING (per-frame feature spread exceeds crop width)", job_id)
         return CameraMode.PADDING
 
+    # Log when camera mode is driven by objects instead of faces
+    if focus.required:
+        from backend.services.focus_model import FeatureKind
+        has_faces = any(rf.kind == FeatureKind.FACE for rf in focus.required)
+        has_objects = any(rf.kind == FeatureKind.OBJECT for rf in focus.required)
+        if has_objects and not has_faces:
+            obj_classes = set(rf.identity for rf in focus.required if rf.kind == FeatureKind.OBJECT)
+            logger.info("[%s] Camera mode driven by objects (no faces): track_ids=%s", job_id, obj_classes)
+
     # Extract x positions from per-frame targets
     target_xs = [t[1] for t in focus.per_frame_target]
     max_x = max(target_xs)
