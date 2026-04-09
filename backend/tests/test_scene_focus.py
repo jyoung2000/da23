@@ -67,7 +67,7 @@ class TestAggregateFocus:
         ]
         registry = MockFaceRegistry(slots=[MockFaceSlot(slot_id=0, x_center=50)])
         result = aggregate_scene_focus(
-            shot_start=0, shot_end=2, dense_faces=dense_faces,
+            shot_start=0, shot_end=2.5, dense_faces=dense_faces,
             saliency_keyframes=[], persistent_regions=None,
             face_registry=registry, source_width=1920, source_height=1080,
         )

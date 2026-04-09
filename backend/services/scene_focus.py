@@ -33,9 +33,11 @@ def aggregate_scene_focus(
     optional = []
 
     # 1. Collect required features from dense faces
+    #    Use half-open interval [shot_start, shot_end) so boundary frames
+    #    belong to the next shot, not both.
     if dense_faces:
         for df in dense_faces:
-            if df.timestamp < shot_start or df.timestamp > shot_end:
+            if df.timestamp < shot_start or df.timestamp >= shot_end:
                 continue
             for f in df.faces:
                 sid = getattr(f, 'identity_id', -1)
@@ -105,7 +107,7 @@ def aggregate_scene_focus(
             if len(entry) < 3:
                 continue
             t, x, confidence = entry[0], entry[1], entry[2]
-            if t < shot_start or t > shot_end:
+            if t < shot_start or t >= shot_end:
                 continue
             optional.append(RequiredFeature(
                 t_start=float(t),
@@ -172,7 +174,7 @@ def aggregate_scene_focus(
     if dense_faces:
         timestamps_seen = set()
         for df in dense_faces:
-            if df.timestamp < shot_start or df.timestamp > shot_end:
+            if df.timestamp < shot_start or df.timestamp >= shot_end:
                 continue
             if df.timestamp in timestamps_seen:
                 continue

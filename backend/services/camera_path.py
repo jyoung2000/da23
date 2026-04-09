@@ -42,13 +42,11 @@ def select_camera_mode(
       3. PANNING if motion is linear (high direction consistency, low turn-around count).
       4. PADDING fallback otherwise — content cannot be cropped without clipping required features.
     """
-    # If required features don't fit, immediately PADDING
-    if not focus.fits_target_aspect:
-        logger.info("[%s] Camera mode: PADDING (required features don't fit target aspect)", job_id)
-        return CameraMode.PADDING
-
-    # No per-frame targets means no motion data — STATIONARY
+    # No per-frame targets means no motion data — STATIONARY if fits, PADDING otherwise
     if len(focus.per_frame_target) < 2:
+        if not focus.fits_target_aspect:
+            logger.info("[%s] Camera mode: PADDING (insufficient targets and doesn't fit)", job_id)
+            return CameraMode.PADDING
         logger.info("[%s] Camera mode: STATIONARY (insufficient per-frame targets: %d)",
                     job_id, len(focus.per_frame_target))
         return CameraMode.STATIONARY
@@ -60,6 +58,29 @@ def select_camera_mode(
     else:
         crop_width_pct = 100.0
 
+    # Check per-frame feature spread: do any individual frames have required
+    # features wider than the crop? If so, PADDING is the only option.
+    # Group required features by timestamp to check per-frame fit.
+    _per_frame_fits = True
+    if focus.required:
+        from collections import defaultdict
+        by_time = defaultdict(list)
+        for rf in focus.required:
+            by_time[rf.t_start].append(rf)
+        for t, features in by_time.items():
+            if len(features) < 2:
+                continue
+            lefts = [rf.left for rf in features]
+            rights = [rf.right for rf in features]
+            frame_spread = max(rights) - min(lefts)
+            if frame_spread > crop_width_pct:
+                _per_frame_fits = False
+                break
+
+    if not _per_frame_fits:
+        logger.info("[%s] Camera mode: PADDING (per-frame feature spread exceeds crop width)", job_id)
+        return CameraMode.PADDING
+
     # Extract x positions from per-frame targets
     target_xs = [t[1] for t in focus.per_frame_target]
     max_x = max(target_xs)
@@ -68,8 +89,9 @@ def select_camera_mode(
 
     # ── STATIONARY test ──
     # If subjects barely move (within 10% of crop width), static crop suffices
+    # AND the overall bounding rect fits in a single static window
     stationary_tolerance = crop_width_pct * 0.1
-    if x_range <= stationary_tolerance:
+    if x_range <= stationary_tolerance and focus.fits_target_aspect:
         logger.info("[%s] Camera mode: STATIONARY (x_range=%.1f <= tolerance=%.1f)",
                     job_id, x_range, stationary_tolerance)
         return CameraMode.STATIONARY
@@ -91,7 +113,9 @@ def select_camera_mode(
         if accels:
             mean_accel = sum(accels) / len(accels)
             # Threshold: 5%/sec^2 — smooth motion
-            if mean_accel < 5.0 and x_range <= crop_width_pct * 0.8:
+            # For TRACKING, the camera follows the subject, so total x_range
+            # doesn't matter (unlike STATIONARY). Only acceleration matters.
+            if mean_accel < 5.0:
                 logger.info("[%s] Camera mode: TRACKING (mean_accel=%.2f, x_range=%.1f)",
                             job_id, mean_accel, x_range)
                 return CameraMode.TRACKING
