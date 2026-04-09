@@ -38,6 +38,7 @@ class ReframeStrategy(str, Enum):
 CONTENT_TYPE_CONFIG = {
     ContentType.NARRATIVE: {
         # Style/layout preferences (NOT timing — timing is from pacing estimator)
+        "enable_object_detection": True,
         "apply_lead_room": True,
         "wide_master_on_multi_face": True,
         "allow_tracking": False,
@@ -57,6 +58,7 @@ CONTENT_TYPE_CONFIG = {
         "action_window_seconds": 10.0,
     },
     ContentType.PODCAST: {
+        "enable_object_detection": False,
         "apply_lead_room": False,
         "wide_master_on_multi_face": False,
         "allow_tracking": False,
@@ -74,6 +76,7 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
     },
     ContentType.GAMING: {
+        "enable_object_detection": False,
         "apply_lead_room": False,
         "wide_master_on_multi_face": False,
         "allow_tracking": True,
@@ -92,6 +95,7 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
     },
     ContentType.VLOG: {
+        "enable_object_detection": True,
         "apply_lead_room": True,
         "wide_master_on_multi_face": True,
         "allow_tracking": True,
@@ -109,6 +113,7 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
     },
     ContentType.SPORTS: {
+        "enable_object_detection": True,
         "apply_lead_room": False,
         "wide_master_on_multi_face": True,
         "allow_tracking": True,
@@ -127,6 +132,7 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
     },
     ContentType.MUSIC_VIDEO: {
+        "enable_object_detection": True,
         "apply_lead_room": False,
         "wide_master_on_multi_face": True,
         "allow_tracking": True,
@@ -142,6 +148,7 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
     },
     ContentType.ANIME: {
+        "enable_object_detection": False,
         "apply_lead_room": True,
         "wide_master_on_multi_face": True,
         "allow_tracking": True,
@@ -157,6 +164,7 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
     },
     ContentType.UNKNOWN: {
+        "enable_object_detection": True,
         "apply_lead_room": False,
         "wide_master_on_multi_face": True,
         "allow_tracking": False,

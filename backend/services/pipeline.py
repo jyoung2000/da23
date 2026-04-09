@@ -2243,6 +2243,42 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Object tracking failed (non-fatal): %s", job_id, e)
 
+    # ── Object detection for AutoFlip reframe path (CPU, class-aware) ──
+    _object_registry = None
+    _text_regions = []
+    OBJECT_DETECTION_ENABLED = os.environ.get("OBJECT_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
+    if USE_AUTOFLIP_REFRAME and OBJECT_DETECTION_ENABLED and face_results and scenes:
+        _ct = getattr(_content_profile, 'content_type', 'unknown') if '_content_profile' in dir() and _content_profile else 'unknown'
+        try:
+            from backend.services.content_type_config import get_config as _get_ct_cfg
+            _ct_cfg = _get_ct_cfg(_ct)
+            _skip_obj_det = not _ct_cfg.get("enable_object_detection", True)
+        except Exception:
+            _skip_obj_det = _ct in ('gaming', 'anime', 'podcast')
+
+        if not _skip_obj_det:
+            try:
+                from backend.services.object_tracker import track_objects_with_registry
+                frame_list_for_det = [(f.timestamp, f.path) for f in frames]
+                _object_registry = track_objects_with_registry(frame_list_for_det, face_results)
+                logger.info("[%s] ObjectRegistry: %d stable tracks (backend=%s)",
+                            job_id, len(_object_registry.stable_tracks()),
+                            getattr(_object_registry, '_backend_name', 'unknown'))
+            except Exception as e:
+                logger.warning("[%s] Object registry build failed (non-fatal): %s", job_id, e)
+
+            try:
+                from backend.services.text_detector import detect_text_in_frames
+                frame_list_for_text = [(f.timestamp, f.path) for f in frames]
+                _text_regions = detect_text_in_frames(frame_list_for_text)
+                persistent_count = sum(1 for tr in _text_regions if tr.is_persistent)
+                logger.info("[%s] TextDetector: %d regions (%d persistent)",
+                            job_id, len(_text_regions), persistent_count)
+            except Exception as e:
+                logger.warning("[%s] Text detection failed (non-fatal): %s", job_id, e)
+        else:
+            logger.info("[%s] Object detection skipped for content_type=%s", job_id, _ct)
+
     # Save original AI vision subject_x BEFORE dense face or lip-audio overwrites.
     # These originals are the AI model's spatial reasoning — not lip detection noise.
     _original_scene_sx = [(s.timestamp, s.subject_x) for s in scenes] if scenes else []
@@ -2543,6 +2579,8 @@ async def _run_analysis_inner(job_id: str):
                     source_width=metadata.get("width", 1920),
                     source_height=metadata.get("height", 1080),
                     persistent_regions=_persistent_regions,
+                    object_registry=_object_registry,
+                    text_regions=_text_regions,
                     target_aspect=9/16,
                     job_id=job_id,
                 )
