@@ -23,6 +23,8 @@ def aggregate_scene_focus(
     source_width: int,
     source_height: int,
     target_aspect: float = 9 / 16,
+    saliency_regions: list = None,
+    object_detections: list = None,
     job_id: str = "",
 ) -> SceneFocusRegion:
     """Collect all required and non-required features in [shot_start, shot_end],
@@ -118,6 +120,54 @@ def aggregate_scene_focus(
                 h=10.0,
                 kind=FeatureKind.SALIENCY,
                 weight=float(confidence),
+                must_be_in_frame=False,
+            ))
+
+    # 3.5. Object detections as required/non-required features
+    if object_detections:
+        from backend.services.object_detector import get_class_priority
+        from collections import defaultdict as _defaultdict
+
+        by_class = _defaultdict(list)
+        for od in object_detections:
+            if od.timestamp < shot_start or od.timestamp >= shot_end:
+                continue
+            by_class[od.class_name].append(od)
+
+        for class_name, dets in by_class.items():
+            if len(dets) < 2:
+                is_moving = False
+            else:
+                xs = [d.x for d in dets]
+                is_moving = (max(xs) - min(xs)) > 5.0
+
+            must_be_in_frame, weight = get_class_priority(class_name, is_moving)
+
+            for od in dets:
+                feature = RequiredFeature(
+                    t_start=od.timestamp,
+                    t_end=od.timestamp,
+                    x=od.x, y=od.y, w=od.w, h=od.h,
+                    kind=FeatureKind.OBJECT,
+                    weight=weight * od.confidence,
+                    must_be_in_frame=must_be_in_frame,
+                )
+                if must_be_in_frame:
+                    required.append(feature)
+                else:
+                    optional.append(feature)
+
+    # 3.6. Spatiotemporal saliency regions as non-required features
+    if saliency_regions:
+        for sr in saliency_regions:
+            if sr.timestamp < shot_start or sr.timestamp >= shot_end:
+                continue
+            optional.append(RequiredFeature(
+                t_start=sr.timestamp,
+                t_end=sr.timestamp,
+                x=sr.x, y=sr.y, w=sr.w, h=sr.h,
+                kind=FeatureKind.SALIENCY,
+                weight=sr.saliency_score,
                 must_be_in_frame=False,
             ))
 
