@@ -1682,11 +1682,24 @@ export default function VideoEditor({
         const media = timelineMediaLibrary.find(m => m.id === item.mediaRef);
         url = media?.url || '';
       }
-      if (!url || url.startsWith('blob:')) continue;
+      if (!url) continue;
       const audio = new Audio(url);
       audio.preload = 'auto';
       audio.volume = Math.min(1, Math.max(0, item.volume ?? 1));
       audio.playbackRate = item.speed ?? 1;
+      audio.addEventListener('error', () => {
+        console.warn(`[AudioOverlay] Failed to load audio for item ${item.id}: ${url}`);
+        // If blob URL was revoked (page reload), try mediaRef backend URL
+        if (url.startsWith('blob:') && item.mediaRef) {
+          const media = timelineMediaLibrary.find(m => m.id === item.mediaRef);
+          const backendUrl = media?.url;
+          if (backendUrl && !backendUrl.startsWith('blob:')) {
+            console.log(`[AudioOverlay] Retrying with backend URL for ${item.id}`);
+            audio.src = backendUrl;
+            audio.load();
+          }
+        }
+      });
       current[item.id] = audio;
     }
 
@@ -1698,7 +1711,7 @@ export default function VideoEditor({
       }
       audioOverlayRefs.current = {};
     };
-  }, [audioOverlayItems.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [audioOverlayItems]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync volume and speed when properties change
   useEffect(() => {
