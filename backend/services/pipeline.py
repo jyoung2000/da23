@@ -2243,6 +2243,29 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Object tracking failed (non-fatal): %s", job_id, e)
 
+    # ── Saliency + Object Detection for AutoFlip path ──
+    _saliency_regions = []
+    _object_detections = []
+    OBJECT_DETECTION_ENABLED = os.environ.get("OBJECT_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
+    USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
+    if USE_AUTOFLIP_REFRAME and OBJECT_DETECTION_ENABLED and not _is_gameplay:
+        try:
+            from backend.services.saliency_tracker import track_saliency_in_frames
+            frame_list_sal = [(f.timestamp, f.path) for f in frames]
+            _saliency_regions = track_saliency_in_frames(frame_list_sal, face_results)
+            logger.info("[%s] SaliencyTracker: %d regions", job_id, len(_saliency_regions))
+        except Exception as e:
+            logger.warning("[%s] Saliency tracker failed (non-fatal): %s", job_id, e)
+
+        try:
+            from backend.services.object_detector import detect_objects_in_frames, get_detector
+            frame_list_det = [(f.timestamp, f.path) for f in frames]
+            _object_detections = detect_objects_in_frames(frame_list_det, face_results)
+            logger.info("[%s] ObjectDetector: %d detections (backend=%s)",
+                        job_id, len(_object_detections), get_detector().backend_name)
+        except Exception as e:
+            logger.warning("[%s] Object detection failed (non-fatal): %s", job_id, e)
+
     # Save original AI vision subject_x BEFORE dense face or lip-audio overwrites.
     # These originals are the AI model's spatial reasoning — not lip detection noise.
     _original_scene_sx = [(s.timestamp, s.subject_x) for s in scenes] if scenes else []
@@ -2543,6 +2566,8 @@ async def _run_analysis_inner(job_id: str):
                     source_width=metadata.get("width", 1920),
                     source_height=metadata.get("height", 1080),
                     persistent_regions=_persistent_regions,
+                    saliency_regions=_saliency_regions,
+                    object_detections=_object_detections,
                     target_aspect=9/16,
                     job_id=job_id,
                 )
