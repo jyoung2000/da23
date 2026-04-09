@@ -2555,6 +2555,8 @@ async def _run_analysis_inner(job_id: str):
                     transcript_segments=transcript,
                     speaker_to_slot=speaker_slot_map,
                     video_duration=_video_dur,
+                    source_width=metadata.get("width", 1920),
+                    source_height=metadata.get("height", 1080),
                     job_id=job_id,
                     content_profile=_content_profile,
                     persistent_regions=_persistent_regions,

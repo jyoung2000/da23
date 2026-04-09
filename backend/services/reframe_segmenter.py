@@ -79,6 +79,8 @@ def build_reframe_segments(
     transcript_segments: list,
     speaker_to_slot: dict[str, int],
     video_duration: float,
+    source_width: int = 1920,
+    source_height: int = 1080,
     job_id: str = "",
     content_profile=None,
     persistent_regions=None,
@@ -142,6 +144,8 @@ def build_reframe_segments(
             active_speaker_events=active_speaker_events,
             transcript_segments=transcript_segments,
             speaker_to_slot=speaker_to_slot,
+            source_width=source_width,
+            source_height=source_height,
         )
     except Exception as e:
         logger.warning("[%s] SubjectConfidenceEstimator init failed: %s", job_id, e)

@@ -59,8 +59,8 @@ class SubjectConfidenceEstimator:
         active_speaker_events: list,
         transcript_segments: list,
         speaker_to_slot: dict,
-        source_width: int = 1920,
-        source_height: int = 1080,
+        source_width: int,
+        source_height: int,
     ):
         self.face_registry = face_registry
         self.dense_faces = dense_faces or []
@@ -281,6 +281,56 @@ class SubjectConfidenceEstimator:
                 covered_time += overlap_end - overlap_start
 
         return (covered_time / seg_dur) >= 0.3
+
+    def check_required_features_fit(
+        self,
+        seg_start: float,
+        seg_end: float,
+        crop_center_x: float,
+        crop_center_y: float,
+        crop_width_pct: float,
+        crop_height_pct: float,
+        required_features: list,
+    ) -> tuple:
+        """Returns (all_fit, detail). `all_fit` is True ONLY when every required
+        feature's full bounding box is inside the crop rectangle, not just the
+        center point. This is the AutoFlip hard constraint check.
+
+        Args:
+            seg_start, seg_end: Segment time range.
+            crop_center_x, crop_center_y: Crop center in 0-100 space.
+            crop_width_pct, crop_height_pct: Crop dimensions in 0-100 space.
+            required_features: list[RequiredFeature] from focus_model.
+
+        Returns:
+            (all_fit: bool, detail: str)
+        """
+        crop_left = crop_center_x - crop_width_pct / 2
+        crop_right = crop_center_x + crop_width_pct / 2
+        crop_top = crop_center_y - crop_height_pct / 2
+        crop_bottom = crop_center_y + crop_height_pct / 2
+
+        # Clamp crop to frame bounds
+        if crop_left < 0:
+            crop_right -= crop_left
+            crop_left = 0
+        if crop_right > 100:
+            crop_left -= (crop_right - 100)
+            crop_right = 100
+
+        for rf in required_features:
+            if not rf.must_be_in_frame:
+                continue
+            # Check time overlap
+            if rf.t_end < seg_start or rf.t_start > seg_end:
+                continue
+            # Check full bounding box containment
+            if (rf.left < crop_left or rf.right > crop_right or
+                    rf.top < crop_top or rf.bottom > crop_bottom):
+                kind_str = rf.kind.value if hasattr(rf.kind, 'value') else str(rf.kind)
+                return (False, f"clipped:{kind_str}:{rf.identity}")
+
+        return (True, "all_required_in_frame")
 
 
 def face_in_proposed_crop(seg, face_registry, dense_faces,
