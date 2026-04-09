@@ -163,3 +163,51 @@ def track_objects_in_frames(
     if return_confidence:
         return confidence_keyframes
     return keyframes
+
+
+def track_objects_with_registry(
+    frame_paths: list,
+    face_results: list = None,
+    conf_threshold: float = 0.40,
+) -> "ObjectRegistry":
+    """Run class-aware object detection and build a persistent registry.
+
+    Returns an ObjectRegistry with bounding-box tracks for the AutoFlip path.
+    If no detector backend is available, returns an empty registry.
+
+    This is the new entry point for the AutoFlip reframe path. The legacy
+    track_objects_in_frames function continues to work for the old path.
+    """
+    from backend.services.object_detector import ObjectDetector
+    from backend.services.object_registry import ObjectRegistry
+
+    detector = ObjectDetector(conf_threshold=conf_threshold)
+    registry = ObjectRegistry()
+    registry._backend_name = detector.backend_name
+
+    if detector.backend_name == "none":
+        logger.info("[ObjectTracker] No detector backend — returning empty registry")
+        return registry
+
+    for i, (timestamp, path) in enumerate(frame_paths):
+        # Skip frames where faces are already detected
+        if face_results and i < len(face_results):
+            fr = face_results[i]
+            if fr.faces:
+                continue
+
+        img = cv2.imread(str(path))
+        if img is None:
+            continue
+
+        dets = detector.detect(img, timestamp=timestamp)
+        if dets:
+            registry.update(dets, timestamp=timestamp)
+
+    stable = registry.stable_tracks()
+    logger.info(
+        "[ObjectTracker] Registry: %d total tracks, %d stable (backend=%s)",
+        len(registry.tracks), len(stable), detector.backend_name,
+    )
+
+    return registry
