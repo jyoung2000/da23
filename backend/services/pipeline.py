@@ -2210,11 +2210,25 @@ async def _run_analysis_inner(job_id: str):
             logger.warning("[%s] Screen detection failed (non-fatal): %s", job_id, e)
 
     # ── Object tracking for faceless frames (CPU, ~15ms/frame) ──
+    _saliency_keyframes = []  # populated for AutoFlip reframe path
     if settings.SUBJECT_TRACKING_ENABLED and face_results and scenes:
         try:
             from backend.services.object_tracker import track_objects_in_frames
             frame_list = [(f.timestamp, f.path) for f in frames]
             object_kf = track_objects_in_frames(frame_list, face_results)
+
+            # Also collect confidence-bearing tuples for AutoFlip reframe path
+            USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
+            if USE_AUTOFLIP_REFRAME:
+                _saliency_keyframes = track_objects_in_frames(
+                    frame_list, face_results, return_confidence=True,
+                )
+                if _saliency_keyframes:
+                    logger.info(
+                        "[%s] Saliency keyframes for AutoFlip: %d tuples",
+                        job_id, len(_saliency_keyframes),
+                    )
+
             if object_kf:
                 logger.info("[%s] Object tracker: %d keyframes from faceless frames", job_id, len(object_kf))
                 obj_map = {round(t, 1): sx for t, sx in object_kf}

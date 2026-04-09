@@ -78,11 +78,15 @@ def _find_salient_region(gray: np.ndarray) -> TrackedObject | None:
 def track_objects_in_frames(
     frame_paths: list,
     face_results: list = None,
-) -> list[tuple[float, int]]:
+    return_confidence: bool = False,
+) -> list:
     """Track the primary non-face subject across frames.
 
     Returns (timestamp, subject_x) tuples compatible with the existing
     subject tracking pipeline — can be merged directly into keyframes.
+
+    When return_confidence=True, returns list[(timestamp, x_center, confidence)]
+    instead, for use by the AutoFlip reframe path.
 
     Strategy:
     1. For frames WITHOUT faces: compute spectral residual saliency map
@@ -91,8 +95,10 @@ def track_objects_in_frames(
     4. Return the horizontal center as subject_x
     """
     keyframes = []
+    confidence_keyframes = []  # (timestamp, x_center, confidence)
     prev_gray = None
     prev_point = None
+    prev_confidence = 0.5  # Carry forward confidence during optical flow tracking
 
     for i, (timestamp, path) in enumerate(frame_paths):
         # Skip frames that already have face data
@@ -125,6 +131,7 @@ def track_objects_in_frames(
                     nx = new_pts[0][0][0] / w * 100
                     if 0 <= nx <= 100:
                         keyframes.append((timestamp, round(nx)))
+                        confidence_keyframes.append((timestamp, float(nx), prev_confidence * 0.9))
                         prev_point = new_pts
                         prev_gray = gray
                         tracked = True
@@ -136,6 +143,8 @@ def track_objects_in_frames(
             obj = _find_salient_region(gray)
             if obj:
                 keyframes.append((timestamp, round(obj.x_center)))
+                confidence_keyframes.append((timestamp, float(obj.x_center), float(obj.confidence)))
+                prev_confidence = float(obj.confidence)
                 # Set up for optical flow tracking
                 pt_x = obj.x_center / 100 * w
                 pt_y = obj.y_center / 100 * h
@@ -151,4 +160,6 @@ def track_objects_in_frames(
             len(keyframes),
         )
 
+    if return_confidence:
+        return confidence_keyframes
     return keyframes
