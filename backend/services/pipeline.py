@@ -2520,10 +2520,84 @@ async def _run_analysis_inner(job_id: str):
     _reframe_segments_used = False
     _pacing_estimator = None
     _has_speaker_data = active_speaker_events or transcript_speaker_events
+    USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
     if dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
             from backend.services.reframe_segmenter import USE_REFRAME_SEGMENTER, build_reframe_segments
-            if USE_REFRAME_SEGMENTER and not _is_gameplay and not _is_continuous:
+            logger.info("[%s] Reframe mode: %s", job_id,
+                        "AUTOFLIP" if USE_AUTOFLIP_REFRAME else "SEGMENTER" if USE_REFRAME_SEGMENTER else "LEGACY")
+            if USE_AUTOFLIP_REFRAME and not _is_gameplay:
+                # ── AutoFlip reframe path ──
+                from backend.services.autoflip_segmenter import build_autoflip_segments
+                _video_dur = metadata.get("duration", 0)
+                _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
+                reframe_segments = build_autoflip_segments(
+                    shot_cuts=_shot_cuts,
+                    face_registry=face_registry,
+                    active_speaker_events=active_speaker_events,
+                    dense_faces=dense_face_results,
+                    saliency_keyframes=_saliency_keyframes,
+                    transcript_segments=transcript,
+                    speaker_to_slot=speaker_slot_map,
+                    video_duration=_video_dur,
+                    source_width=metadata.get("width", 1920),
+                    source_height=metadata.get("height", 1080),
+                    persistent_regions=_persistent_regions,
+                    target_aspect=9/16,
+                    job_id=job_id,
+                )
+                if reframe_segments:
+                    from backend.models import SceneDescription
+                    ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
+                    for seg in reframe_segments:
+                        _desc = f"[autoflip:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}:{seg.confidence:.2f}]"
+                        ai_scenes.append(SceneDescription(
+                            timestamp=float(seg.start),
+                            description=_desc,
+                            importance_score=5,
+                            thumbnail_path="",
+                            subject_x=seg.subject_x,
+                            active_speaker_x=seg.subject_x if seg.active_slot is not None else None,
+                            layout_mode=seg.layout,
+                            precise_x=float(seg.subject_x),
+                            precise_y=float(seg.subject_y),
+                            face_count=len(face_registry.slots) if face_registry else 0,
+                            face_positions=[],
+                        ))
+                    ai_scenes.sort(key=lambda s: s.timestamp)
+                    scenes = ai_scenes
+                    _tracking_mode = "multi_cluster"
+                    await database.update_job_status(
+                        job_id, scenes=list(scenes), tracking_mode=_tracking_mode,
+                    )
+                    logger.info(
+                        "[%s] *** AutoFlipSegmenter: %d segments → %d scenes ***",
+                        job_id, len(reframe_segments), len(scenes),
+                    )
+                    _reframe_segments_used = True
+
+                    try:
+                        from backend.services.render_plan import USE_RENDER_PLAN
+                        if USE_RENDER_PLAN:
+                            from backend.services.render_plan_builder import build_render_plan
+                            _rp = build_render_plan(
+                                segments=reframe_segments,
+                                source_width=metadata.get("width", 1920),
+                                source_height=metadata.get("height", 1080),
+                                source_fps=metadata.get("fps", 30.0),
+                                target_aspect="9:16",
+                            )
+                            await database.update_job_status(
+                                job_id, render_plan=_rp.to_dict(),
+                            )
+                            logger.info(
+                                "[%s] AutoFlip RenderPlan: %d ops, %.1fs duration",
+                                job_id, len(_rp.ops), _rp.total_duration_sec,
+                            )
+                    except Exception as rp_e:
+                        logger.warning("[%s] AutoFlip RenderPlan build failed (non-fatal): %s", job_id, rp_e)
+
+            elif USE_REFRAME_SEGMENTER and not _is_gameplay and not _is_continuous:
                 _video_dur = metadata.get("duration", 0)
                 _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
 
