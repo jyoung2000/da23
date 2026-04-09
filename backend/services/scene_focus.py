@@ -23,6 +23,8 @@ def aggregate_scene_focus(
     source_width: int,
     source_height: int,
     target_aspect: float = 9 / 16,
+    object_registry=None,
+    text_regions: list = None,
     job_id: str = "",
 ) -> SceneFocusRegion:
     """Collect all required and non-required features in [shot_start, shot_end],
@@ -121,6 +123,53 @@ def aggregate_scene_focus(
                 must_be_in_frame=False,
             ))
 
+    # 3.5. Collect object tracks as required/non-required features
+    if object_registry:
+        try:
+            from backend.services.object_priority import get_priority
+            for track in object_registry.stable_tracks(min_detections=3):
+                # Check if track overlaps with this shot
+                if track.t_end < shot_start or track.t_start >= shot_end:
+                    continue
+                is_moving = track.is_moving
+                must_be, weight = get_priority(track.class_name, is_moving)
+                for det in track.detections:
+                    if det.timestamp < shot_start or det.timestamp >= shot_end:
+                        continue
+                    target_list = required if must_be else optional
+                    target_list.append(RequiredFeature(
+                        t_start=det.timestamp,
+                        t_end=det.timestamp,
+                        x=float(det.x),
+                        y=float(det.y),
+                        w=float(det.w),
+                        h=float(det.h),
+                        kind=FeatureKind.OBJECT,
+                        weight=weight,
+                        must_be_in_frame=must_be,
+                        identity=track.track_id,
+                    ))
+        except Exception as e:
+            logger.warning("[%s] Object track aggregation failed: %s", job_id, e)
+
+    # 3.6. Collect text regions as required (persistent) or optional (transient)
+    if text_regions:
+        for tr in text_regions:
+            if tr.timestamp < shot_start or tr.timestamp >= shot_end:
+                continue
+            target_list = required if tr.is_persistent else optional
+            target_list.append(RequiredFeature(
+                t_start=tr.timestamp,
+                t_end=tr.timestamp,
+                x=float(tr.x),
+                y=float(tr.y),
+                w=float(tr.w),
+                h=float(tr.h),
+                kind=FeatureKind.TEXT,
+                weight=0.9 if tr.is_persistent else 0.4,
+                must_be_in_frame=tr.is_persistent,
+            ))
+
     # 4. Compute min bounding rect over required features
     if required:
         min_left = min(rf.left for rf in required)
@@ -171,26 +220,30 @@ def aggregate_scene_focus(
 
     # 7. Per-frame targets
     per_frame_target = []
+    # Collect all timestamps that have required features
+    _all_timestamps = set()
     if dense_faces:
-        timestamps_seen = set()
         for df in dense_faces:
             if df.timestamp < shot_start or df.timestamp >= shot_end:
                 continue
-            if df.timestamp in timestamps_seen:
-                continue
-            timestamps_seen.add(df.timestamp)
+            _all_timestamps.add(df.timestamp)
+    # Also include timestamps from object/text required features
+    for rf in required:
+        if rf.must_be_in_frame and shot_start <= rf.t_start < shot_end:
+            _all_timestamps.add(rf.t_start)
 
-            # Weighted centroid of required features visible at this timestamp
-            visible = [rf for rf in required if rf.must_be_in_frame and
-                       abs(rf.t_start - df.timestamp) < 0.01]
-            if visible:
-                total_w = sum(rf.weight for rf in visible)
-                if total_w > 0:
-                    tx = sum(rf.x * rf.weight for rf in visible) / total_w
-                    ty = sum(rf.y * rf.weight for rf in visible) / total_w
-                else:
-                    tx, ty = optimal_crop_center
-                per_frame_target.append((df.timestamp, tx, ty))
+    for ts in sorted(_all_timestamps):
+        # Weighted centroid of required features visible at this timestamp
+        visible = [rf for rf in required if rf.must_be_in_frame and
+                   abs(rf.t_start - ts) < 0.01]
+        if visible:
+            total_w = sum(rf.weight for rf in visible)
+            if total_w > 0:
+                tx = sum(rf.x * rf.weight for rf in visible) / total_w
+                ty = sum(rf.y * rf.weight for rf in visible) / total_w
+            else:
+                tx, ty = optimal_crop_center
+            per_frame_target.append((ts, tx, ty))
 
     return SceneFocusRegion(
         shot_start=shot_start,
