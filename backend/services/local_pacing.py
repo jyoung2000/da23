@@ -18,13 +18,13 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ── Adaptive hold constants ──
-MIN_HOLD_FLOOR = 0.30      # frantic content: sub-second cuts allowed
-MIN_HOLD_CEILING = 2.60    # calm content: 2.6s minimum hold
+MIN_HOLD_FLOOR = 0.25      # frantic content: sub-second cuts allowed
+MIN_HOLD_CEILING = 2.00    # calm content: 2.0s minimum hold (snappier response)
 HOLD_CURVE_POWER = 0.75    # gentle power curve so mid-range isn't a plateau
 
 # ── Anticipation constants ──
-ANTICIPATION_MIN_MS = 80   # frantic: very short anticipation
-ANTICIPATION_MAX_MS = 300  # calm: full anticipation
+ANTICIPATION_MIN_MS = 120  # frantic: short anticipation
+ANTICIPATION_MAX_MS = 400  # calm: full anticipation for snappy lead-in
 
 # ── Pacing window ──
 PACING_WINDOW_SEC = 8      # rolling window size in seconds

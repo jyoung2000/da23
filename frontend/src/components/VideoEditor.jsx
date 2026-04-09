@@ -1515,6 +1515,26 @@ export default function VideoEditor({
       return interpolateSubjectX(subjectKeyframes, relTime);
     };
 
+    // Detect reframe-segment mode (keyframes carry easeMs metadata)
+    const isReframeMode = subjectKeyframes?.some(k => k.easeMs !== undefined);
+
+    // Ease-out: fast snap to target, smooth deceleration — like a human operator
+    const easeCurve = (t) => {
+      if (t <= 0) return 0;
+      if (t >= 1) return 1;
+      return 1 - Math.pow(1 - t, 3);
+    };
+
+    const getEaseMsForTransition = (relTime) => {
+      if (!isReframeMode || !subjectKeyframes) return 0;
+      let active = subjectKeyframes[0];
+      for (let i = 1; i < subjectKeyframes.length; i++) {
+        if (subjectKeyframes[i].t <= relTime) active = subjectKeyframes[i];
+        else break;
+      }
+      return active?.easeMs || 0;
+    };
+
     // Apply initial position synchronously to eliminate 1-2 frame gap
     {
       const initRel = video.currentTime - (clipStart || 0);
@@ -1525,6 +1545,7 @@ export default function VideoEditor({
     }
     let animId;
     let lastPct = null;
+    let easeState = null; // { fromPct, toPct, startTime, durationMs }
     const tick = () => {
       const absTime = video.currentTime;
       const relTime = absTime - (clipStart || 0);
@@ -1534,13 +1555,45 @@ export default function VideoEditor({
       const sx = trackingOn
         ? getCropXAtTime(relTime)
         : (safeSubjectX ? safeSubjectX(subjectX, srcRatio, targetRatio) : subjectX);
-      const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
-      const rounded = Math.round(centerPct * 10000) / 10000;
-      if (rounded !== lastPct) {
-        video.style.objectPosition = `${centerPct}% 50%`;
-        lastPct = rounded;
-        lastAppliedPctRef.current = centerPct;
+      const targetPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
+      const targetRounded = Math.round(targetPct * 10000) / 10000;
+
+      let renderPct = targetPct;
+
+      // Start easing on position change (reframe-segment mode)
+      if (isReframeMode && targetRounded !== lastPct && lastPct !== null) {
+        const easeMs = getEaseMsForTransition(relTime);
+        if (easeMs > 0) {
+          easeState = {
+            fromPct: lastAppliedPctRef.current ?? targetPct,
+            toPct: targetPct,
+            startTime: performance.now(),
+            durationMs: easeMs,
+          };
+        } else {
+          easeState = null;
+        }
       }
+
+      if (easeState) {
+        const elapsed = performance.now() - easeState.startTime;
+        if (elapsed >= easeState.durationMs) {
+          renderPct = easeState.toPct;
+          easeState = null;
+        } else {
+          const t = elapsed / easeState.durationMs;
+          renderPct = easeState.fromPct + (easeState.toPct - easeState.fromPct) * easeCurve(t);
+        }
+      }
+
+      const renderRounded = Math.round(renderPct * 10000) / 10000;
+      const appliedRounded = lastAppliedPctRef.current != null
+        ? Math.round(lastAppliedPctRef.current * 10000) / 10000 : null;
+      if (renderRounded !== appliedRounded) {
+        video.style.objectPosition = `${renderPct}% 50%`;
+        lastAppliedPctRef.current = renderPct;
+      }
+      lastPct = targetRounded;
       animId = requestAnimationFrame(tick);
     };
     animId = requestAnimationFrame(tick);

@@ -748,15 +748,13 @@ export default function ClipPreview({
     // old→new over easeMs using cubic-bezier in the rAF loop itself.
     let easeState = null; // { fromPct, toPct, startTime, durationMs }
 
-    // cubic-bezier(0.4, 0, 0.2, 1) approximation — ease-in-out
+    // Ease-out curve: fast start, smooth deceleration — mimics a human
+    // camera operator snapping to the subject then settling gently.
+    // 1 - (1-t)^3 reaches 87.5% in the first half of the duration.
     const easeCurve = (t) => {
-      // Simple approximation of cubic-bezier(0.4, 0, 0.2, 1)
       if (t <= 0) return 0;
       if (t >= 1) return 1;
-      // Attempt a reasonable cubic approximation
-      return t < 0.5
-        ? 4 * t * t * t
-        : 1 - Math.pow(-2 * t + 2, 3) / 2;
+      return 1 - Math.pow(1 - t, 3);
     };
 
     // Find the easeMs for the keyframe that starts at or just before relTime

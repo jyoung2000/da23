@@ -688,17 +688,17 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio 
   if (!keyframes || keyframes.length <= 1) return keyframes ? [...keyframes] : [];
 
   // Scale parameters for aspect ratio magnification
-  let reframeThreshold = 8;   // Must drift this far from hold to trigger reframe
-  let reframeDuration = 0.30; // How long a reframe takes (seconds)
+  let reframeThreshold = 4;   // Respond quickly — 4% drift triggers reframe
+  let reframeDuration = 0.15; // Fast snap (seconds) — human-like decisive movement
   let effectiveMaxSpeed = maxSpeed;
 
   if (srcRatio && targetRatio) {
     const R = srcRatio / targetRatio;
     if (R > 1.5) {
-      // Narrower crop = smaller movements are more visible
-      reframeThreshold = Math.max(3, Math.round(8 / Math.sqrt(R)));
-      reframeDuration = Math.max(0.15, 0.30 / Math.sqrt(R));
-      effectiveMaxSpeed = Math.min(80, maxSpeed * Math.sqrt(R));
+      // Narrower crop = smaller movements are more visible, react even faster
+      reframeThreshold = Math.max(2, Math.round(4 / Math.sqrt(R)));
+      reframeDuration = Math.max(0.08, 0.15 / Math.sqrt(R));
+      effectiveMaxSpeed = Math.min(100, maxSpeed * Math.sqrt(R));
     }
   }
 
@@ -738,9 +738,9 @@ export function smoothKeyframesBidirectional(keyframes, maxSpeed = 22, srcRatio 
       reframeTarget = target;
       reframeStartPos = pos;
       reframeProgress = 0;
-      // Adaptive pan speed: scale duration based on distance
+      // Adaptive pan speed: scale duration based on distance — stay fast
       const distance = Math.abs(target - pos);
-      reframeDuration = Math.max(0.12, Math.min(0.45, 0.10 + distance * 0.008));
+      reframeDuration = Math.max(0.08, Math.min(0.25, 0.06 + distance * 0.004));
     } else if (reframing) {
       // Already reframing — update target if same direction, else keep current
       if (newDirection !== 0 && lastDirection !== 0 && newDirection !== lastDirection) {
