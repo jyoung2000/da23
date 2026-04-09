@@ -2504,6 +2504,7 @@ async def _run_analysis_inner(job_id: str):
 
     # ── Reframe Segmenter (replaces per-second synthesis when enabled) ──
     _reframe_segments_used = False
+    _pacing_estimator = None
     _has_speaker_data = active_speaker_events or transcript_speaker_events
     if dense_face_results and face_registry and scenes and _has_speaker_data:
         try:
@@ -2511,6 +2512,27 @@ async def _run_analysis_inner(job_id: str):
             if USE_REFRAME_SEGMENTER and not _is_gameplay and not _is_continuous:
                 _video_dur = metadata.get("duration", 0)
                 _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
+
+                # ── Build LocalPacingEstimator ──
+                try:
+                    from backend.services.local_pacing import LocalPacingEstimator, compute_motion_from_dense_faces
+                    _ct_str = getattr(_content_profile, 'content_type', 'unknown') if _content_profile else 'unknown'
+                    _pacing_estimator = LocalPacingEstimator(_video_dur, content_type=_ct_str or 'unknown')
+                    _pacing_estimator.add_shot_cuts(_shot_cuts)
+                    _pacing_estimator.add_speaker_turns(active_speaker_events)
+                    _motion = compute_motion_from_dense_faces(dense_face_results, _video_dur)
+                    _pacing_estimator.add_motion_energy(_motion)
+                    _pacing_estimator.compute()
+                    logger.info(
+                        "[%s] LocalPacingEstimator: mean=%.2f, min_hold range=[%.2f, %.2f]",
+                        job_id, float(_pacing_estimator.pacing.mean()),
+                        min(_pacing_estimator.get_min_hold_array()),
+                        max(_pacing_estimator.get_min_hold_array()),
+                    )
+                except Exception as pe:
+                    logger.warning("[%s] LocalPacingEstimator failed (non-fatal): %s", job_id, pe)
+                    _pacing_estimator = None
+
                 reframe_segments = build_reframe_segments(
                     shot_cuts=_shot_cuts,
                     face_registry=face_registry,
@@ -2522,6 +2544,7 @@ async def _run_analysis_inner(job_id: str):
                     job_id=job_id,
                     content_profile=_content_profile,
                     persistent_regions=_persistent_regions,
+                    pacing_estimator=_pacing_estimator,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment

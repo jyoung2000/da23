@@ -1,8 +1,8 @@
 """Content type classifier for the reframe pipeline.
 
 Determines whether a video is narrative (movie/TV), podcast, gaming, vlog,
-or sports based on lightweight signals: cut rate, face distribution,
-face position stability, and scene description hints.
+sports, music_video, or anime based on lightweight signals: cut rate, face
+distribution, face position stability, and scene description hints.
 
 Runs early in the pipeline (after frame extraction + face detection) so
 the ReframeSegmenter can apply content-specific editorial strategies.
@@ -60,7 +60,7 @@ def classify_content(
     """
     _log = lambda msg, *a: logger.info("[%s] ContentClassifier: " + msg, job_id, *a)
     profile = ContentProfile()
-    scores = {ct.value: 0.0 for ct in ContentType if ct != ContentType.UNKNOWN}
+    scores = {ct.value: 0.0 for ct in ContentType if ct not in (ContentType.UNKNOWN,)}
     signals = {}
 
     if video_duration <= 0:
@@ -195,6 +195,34 @@ def classify_content(
             else:
                 profile.motion_profile = "high"
                 scores["sports"] += 0.5
+
+    # ── Signal 7: Music video detection ──
+    # Very high cut rate + low speech fraction signals music video
+    if cut_rate >= 40:
+        scores["music_video"] = scores.get("music_video", 0) + 3.0
+        signals["high_cut_rate_music"] = True
+    elif cut_rate >= 20:
+        scores["music_video"] = scores.get("music_video", 0) + 1.5
+
+    # Scene description hints for music_video and anime
+    if scenes:
+        desc_lower_all = " ".join(
+            (getattr(s, "description", "") or "").lower() for s in scenes[:50]
+        )
+        music_keywords = ["music", "concert", "performance", "stage", "dancing",
+                          "singer", "band", "microphone", "audience"]
+        anime_keywords = ["anime", "animation", "animated", "cartoon", "manga",
+                          "subtitles", "japanese"]
+
+        music_hits = sum(1 for kw in music_keywords if kw in desc_lower_all)
+        anime_hits = sum(1 for kw in anime_keywords if kw in desc_lower_all)
+
+        if music_hits >= 2:
+            scores["music_video"] = scores.get("music_video", 0) + 3.0
+            signals["scene_desc_music_video"] = music_hits
+        if anime_hits >= 2:
+            scores["anime"] = scores.get("anime", 0) + 3.0
+            signals["scene_desc_anime"] = anime_hits
 
     # ── Pick winner ──
     best_type = max(scores, key=scores.get)

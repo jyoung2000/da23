@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
 import { RenderPlanRenderer } from '../utils/renderPlanRenderer';
+import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
 import useResponsive from '../hooks/useResponsive';
@@ -1463,6 +1464,15 @@ export default function ClipPreview({
       >
         {renderVideoArea()}
         {renderSubtitles()}
+
+        {/* Reframe debug overlay (dev mode) */}
+        {renderPlanData && renderPlanData.debug && (
+          <ReframeDebugOverlay
+            renderPlan={renderPlanData}
+            currentTime={displayTime - clipStart}
+            clipDuration={clipEnd - clipStart}
+          />
+        )}
 
         {/* Play/pause overlay */}
         {!playing && (

@@ -24,6 +24,7 @@ async def get_render_plan(
     clip_index: Optional[int] = Query(None, ge=0),
     aspect_ratio: str = Query("9:16"),
     target_height: int = Query(1920, ge=480, le=3840),
+    debug: int = Query(0, ge=0, le=1),
 ):
     """Get the RenderPlan for a job.
 
@@ -92,7 +93,13 @@ async def get_render_plan(
             target_height_px=target_height,
             clip_range=clip_range,
         )
-        return plan.to_dict()
+        result = plan.to_dict()
+
+        # Include debug info when requested
+        if debug:
+            result["debug"] = _build_debug_info(job, segments)
+
+        return result
 
     except ValueError as e:
         logger.error("RenderPlan build failed for job %s: %s", job_id, e)
@@ -171,3 +178,36 @@ class _SimpleSegment:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+
+def _build_debug_info(job, segments) -> dict:
+    """Build debug visualization data from job and segments.
+
+    Includes pacing, min_hold, confidence, and fallback reasons.
+    """
+    debug = {
+        "pacing_per_sec": [],
+        "min_hold_per_sec": [],
+        "confidence_per_segment": [],
+        "fallback_reasons": [],
+    }
+
+    # Try to get pacing data from job metadata
+    pacing_data = getattr(job, "pacing_data", None)
+    if pacing_data and isinstance(pacing_data, dict):
+        debug["pacing_per_sec"] = pacing_data.get("pacing", [])
+        debug["min_hold_per_sec"] = pacing_data.get("min_hold", [])
+
+    # Extract confidence and fallback reasons from segments
+    if segments:
+        for seg in segments:
+            conf = getattr(seg, "confidence", 1.0)
+            debug["confidence_per_segment"].append(round(conf, 3))
+
+            reason = getattr(seg, "reason", "") or ""
+            if "confidence" in reason or "fallback" in reason or "blur_fill" in reason or "wide_master" in reason:
+                debug["fallback_reasons"].append(reason)
+            else:
+                debug["fallback_reasons"].append(None)
+
+    return debug

@@ -6,7 +6,18 @@ Eliminates jitter by making reframes *motivated editorial events* rather
 than face-detection outputs.
 
 Content-aware mode (gated by ContentProfile) applies different editorial
-strategies per content type: narrative, podcast, gaming, vlog, sports.
+strategies per content type: narrative, podcast, gaming, vlog, sports,
+music_video, anime.
+
+Two-pass architecture:
+  Pass 1 (measurement): Build per-second signal arrays
+  Pass 2 (planning): Walk arrays with look-ahead to emit segments
+
+Adaptive pacing: Timing (min_hold, anticipation) derived from
+LocalPacingEstimator, not hardcoded config values.
+
+Confidence-gated fallback ladder: Low confidence NEVER produces a center
+crop. Instead falls back to blur_fill or wide_master showing the full source.
 
 Consumes shot cuts, face registry, active speaker events, dense faces,
 transcript segments, and speaker-to-slot mapping. Produces a list of
@@ -69,6 +80,7 @@ def build_reframe_segments(
     job_id: str = "",
     content_profile=None,
     persistent_regions=None,
+    pacing_estimator=None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -83,6 +95,8 @@ def build_reframe_segments(
         job_id: For logging correlation.
         content_profile: ContentProfile from content_classifier (optional).
         persistent_regions: RegionDetectionResult from persistent_region_detector (optional).
+        pacing_estimator: LocalPacingEstimator (optional). When provided,
+            replaces hardcoded min_hold and anticipation with data-driven values.
 
     Returns:
         List of ReframeSegment covering [0, video_duration].
@@ -101,8 +115,11 @@ def build_reframe_segments(
             cfg = None
 
     # Use content-type-specific tunables or fall back to module defaults
-    _min_hold = cfg.get("min_hold_seconds", MIN_HOLD_SECONDS) if cfg else MIN_HOLD_SECONDS
-    _anticipation_ms = cfg.get("anticipation_ms", ANTICIPATION_MS) if cfg else ANTICIPATION_MS
+    # NOTE: min_hold_seconds and anticipation_ms are NO LONGER from config.
+    # They come from the pacing_estimator (adaptive) or module defaults (legacy).
+    _has_pacing = pacing_estimator is not None
+    _min_hold = MIN_HOLD_SECONDS  # Default; overridden per-segment by pacing estimator
+    _anticipation_ms = ANTICIPATION_MS  # Default; overridden per-segment by pacing estimator
     _speaker_conf_thresh = cfg.get("speaker_confidence_threshold", SPEAKER_CONFIDENCE_THRESHOLD) if cfg else SPEAKER_CONFIDENCE_THRESHOLD
     _speaker_cov_thresh = cfg.get("speaker_coverage_threshold", SPEAKER_COVERAGE_THRESHOLD) if cfg else SPEAKER_COVERAGE_THRESHOLD
     _ease_speaker_ms = cfg.get("ease_speaker_turn_ms", EASE_SPEAKER_TURN_MS) if cfg else EASE_SPEAKER_TURN_MS
@@ -111,6 +128,24 @@ def build_reframe_segments(
     _wide_on_multi = cfg.get("wide_master_on_multi_face", True) if cfg else True
     _use_split_on_overlap = cfg.get("use_split_screen_on_overlap", False) if cfg else False
     _apply_lead_room = cfg.get("apply_lead_room", False) if cfg else False
+    _allow_motion_tracking = cfg.get("allow_motion_tracking", False) if cfg else False
+
+    # ── Initialize subject confidence estimator ──
+    _confidence_estimator = None
+    try:
+        from backend.services.subject_confidence import SubjectConfidenceEstimator, get_fallback_strategy
+        _confidence_estimator = SubjectConfidenceEstimator(
+            face_registry=face_registry,
+            dense_faces=dense_faces,
+            active_speaker_events=active_speaker_events,
+            transcript_segments=transcript_segments,
+            speaker_to_slot=speaker_to_slot,
+        )
+    except Exception as e:
+        logger.warning("[%s] SubjectConfidenceEstimator init failed: %s", job_id, e)
+
+    if _has_pacing:
+        _log("using adaptive pacing from LocalPacingEstimator")
 
     n_scenes = len(dense_faces) if dense_faces else 0
     n_cuts = len(shot_cuts)
@@ -146,7 +181,7 @@ def build_reframe_segments(
                         boundary_reasons[t] = "speaker_turn"
             prev_speaker = speaker
 
-    # 1c. Active-speaker slot changes with hold > MIN_HOLD
+    # 1c. Active-speaker slot changes with hold > min_hold (adaptive)
     if active_speaker_events and len(active_speaker_events) >= 2:
         for i in range(1, len(active_speaker_events)):
             prev_ev = active_speaker_events[i - 1]
@@ -154,7 +189,8 @@ def build_reframe_segments(
             if curr_ev.slot_id != prev_ev.slot_id:
                 # Check if the new slot holds long enough
                 hold_dur = curr_ev.end - curr_ev.start
-                if hold_dur >= _min_hold:
+                local_min_hold = pacing_estimator.min_hold_at(curr_ev.start) if _has_pacing else _min_hold
+                if hold_dur >= local_min_hold:
                     t = curr_ev.start
                     if 0 < t < video_duration and t not in boundary_reasons:
                         boundaries.add(t)
@@ -198,7 +234,7 @@ def build_reframe_segments(
             content_type=ct,
         ))
 
-    # ── Merge short segments (< min_hold) ──
+    # ── Merge short segments (< min_hold, adaptive per-segment) ──
     merged_count = 0
     changed = True
     while changed:
@@ -207,7 +243,10 @@ def build_reframe_segments(
         while i < len(raw_segments):
             seg = raw_segments[i]
             dur = seg.end - seg.start
-            if dur < _min_hold and len(raw_segments) > 1:
+            # Use adaptive min_hold at the segment's midpoint
+            seg_mid = (seg.start + seg.end) / 2.0
+            local_min_hold = pacing_estimator.min_hold_at(seg_mid) if _has_pacing else _min_hold
+            if dur < local_min_hold and len(raw_segments) > 1:
                 # Find best neighbor to merge into
                 merged_into = _merge_short_segment(raw_segments, i)
                 if merged_into is not None:
@@ -217,7 +256,7 @@ def build_reframe_segments(
             i += 1
 
     if merged_count > 0:
-        _log("merged %d short segments (<%.1fs hold)", merged_count, _min_hold)
+        _log("merged %d short segments (adaptive min_hold)", merged_count)
 
     # ── Stage 3: Multi-speaker detection (content-aware) ──
     wide_count = 0
@@ -309,8 +348,96 @@ def build_reframe_segments(
         if gaming_stacked_count > 0:
             _log("%d segments set to STACKED_GAMEPLAY", gaming_stacked_count)
 
-    # ── Stage 4: Hysteresis / minimum hold enforcement ──
-    # Delete short B segment if A→B→C and A.slot == C.slot and B < 1.5s
+    # ── Stage 3d: Confidence-gated fallback ladder ──
+    # Evaluate each segment's confidence and apply fallbacks.
+    # Low confidence NEVER produces a center crop — falls back to blur_fill or wide_master.
+    fallback_count = 0
+    last_confident_x = None
+    last_confident_slot = None
+    if _confidence_estimator:
+        for seg in raw_segments:
+            if seg.layout in ("wide_master", "split", "grid", "blur_fill", "stacked_gameplay"):
+                # Already a multi-speaker or special layout — skip
+                if seg.confidence >= 0.70:
+                    last_confident_x = seg.subject_x
+                    last_confident_slot = seg.active_slot
+                continue
+
+            conf, conf_reason = _confidence_estimator.evaluate(
+                seg.start, seg.end, seg.active_slot, seg.subject_x,
+            )
+            seg.confidence = conf
+
+            if conf >= 0.70:
+                # High confidence — keep as-is
+                last_confident_x = seg.subject_x
+                last_confident_slot = seg.active_slot
+                continue
+
+            # Apply fallback ladder
+            try:
+                from backend.services.subject_confidence import get_fallback_strategy
+                fallback = get_fallback_strategy(
+                    conf, ct,
+                    last_confident_x=last_confident_x,
+                    last_confident_slot=last_confident_slot,
+                )
+                if fallback is not None:
+                    strategy, layout, subject_x, active_slot, reason = fallback
+                    seg.strategy = strategy
+                    seg.layout = layout
+                    seg.subject_x = subject_x
+                    seg.active_slot = active_slot
+                    seg.reason = reason
+                    fallback_count += 1
+                    _log("segment %.1f-%.1fs: confidence=%.2f, fallback=%s (reason=%s)",
+                         seg.start, seg.end, conf, strategy.upper(), conf_reason)
+            except Exception as e:
+                logger.warning("[%s] Fallback ladder failed for segment %.1f-%.1f: %s",
+                               job_id, seg.start, seg.end, e)
+
+    if fallback_count > 0:
+        _log("%d segments received confidence-gated fallbacks", fallback_count)
+
+    # ── Stage 3e: Motion-aware tracking for fast content ──
+    motion_tracking_count = 0
+    if _allow_motion_tracking and dense_faces:
+        try:
+            from backend.services.optical_flow import (
+                compute_motion_energy_per_second,
+                should_use_motion_tracking,
+                is_motion_chaotic,
+                build_motion_tracking_path,
+            )
+            motion_energy = compute_motion_energy_per_second(dense_faces, video_duration)
+            for seg in raw_segments:
+                if seg.layout in ("wide_master", "split", "grid", "blur_fill", "stacked_gameplay"):
+                    continue
+                if should_use_motion_tracking(motion_energy, seg.start, seg.end):
+                    motion_path = build_motion_tracking_path(
+                        dense_faces, seg.start, seg.end, shot_cuts,
+                    )
+                    if len(motion_path) >= 2:
+                        seg.strategy = "tracking"
+                        seg.motion_path = motion_path
+                        motion_tracking_count += 1
+                elif is_motion_chaotic(motion_energy, seg.start, seg.end):
+                    # Too chaotic for tracking — use wide_master
+                    seg.strategy = "wide_master"
+                    seg.layout = "wide_master"
+                    seg.active_slot = None
+                    seg.subject_x = WIDE_MASTER_X
+                    seg.reason = "chaotic_motion"
+        except Exception as e:
+            logger.warning("[%s] Motion tracking failed (non-fatal): %s", job_id, e)
+
+    if motion_tracking_count > 0:
+        _log("%d segments set to TRACKING (motion-aware)", motion_tracking_count)
+
+    # ── Stage 4: Two-pass look-ahead hysteresis ──
+    # Instead of blindly removing short B segments, look ahead up to 3s:
+    # If the change is "speaker B for <1s then back to A," suppress.
+    # If it's "speaker B for 3+ seconds," commit.
     hysteresis_removed = 0
     i = 1
     while i < len(raw_segments) - 1:
@@ -318,17 +445,32 @@ def build_reframe_segments(
         b = raw_segments[i]
         c = raw_segments[i + 1]
         b_dur = b.end - b.start
-        if b_dur < 1.5 and c.active_slot == a.active_slot:
-            # Absorb B into A
-            a.end = b.end
-            raw_segments.pop(i)
-            hysteresis_removed += 1
-            # Don't increment i — check the new pair
-        else:
-            i += 1
+        # Adaptive hysteresis threshold based on local pacing
+        b_mid = (b.start + b.end) / 2.0
+        local_min_hold = pacing_estimator.min_hold_at(b_mid) if _has_pacing else 1.5
+        hysteresis_thresh = max(local_min_hold, 0.5)  # at least 0.5s
+
+        if b_dur < hysteresis_thresh and c.active_slot == a.active_slot:
+            # Look ahead: does speaker B come back for a sustained period?
+            b_returns = False
+            if i + 2 < len(raw_segments):
+                for j in range(i + 2, min(i + 5, len(raw_segments))):
+                    future_seg = raw_segments[j]
+                    if (future_seg.active_slot == b.active_slot
+                            and (future_seg.end - future_seg.start) >= hysteresis_thresh * 2):
+                        b_returns = True
+                        break
+
+            if not b_returns:
+                # Absorb B into A
+                a.end = b.end
+                raw_segments.pop(i)
+                hysteresis_removed += 1
+                continue  # Don't increment — check the new pair
+        i += 1
 
     if hysteresis_removed > 0:
-        _log("hysteresis removed %d blip segments (<1.5s, neighbors match)", hysteresis_removed)
+        _log("hysteresis removed %d blip segments (look-ahead)", hysteresis_removed)
 
     # ── Stage 4b: Consolidate consecutive same-slot segments ──
     consolidated = 0
@@ -346,7 +488,7 @@ def build_reframe_segments(
     if consolidated > 0:
         _log("consolidated %d consecutive same-slot segments", consolidated)
 
-    # ── Stage 5: Anticipation offset ──
+    # ── Stage 5: Anticipation offset (adaptive) ──
     shot_cut_set = set(shot_cuts)
     anticipated = 0
     for seg in raw_segments:
@@ -354,7 +496,9 @@ def build_reframe_segments(
             at_shot_cut = any(abs(seg.start - sc) < 0.15 for sc in shot_cuts)
             if at_shot_cut:
                 continue
-            shift_s = _anticipation_ms / 1000.0
+            # Adaptive anticipation: frantic content → short, calm → full
+            local_anticipation_ms = pacing_estimator.anticipation_ms_at(seg.start) if _has_pacing else _anticipation_ms
+            shift_s = local_anticipation_ms / 1000.0
             # Find previous shot cut to clamp (don't shift past it)
             prev_cut = 0.0
             for sc in sorted(shot_cut_set):
@@ -368,8 +512,7 @@ def build_reframe_segments(
                 anticipated += 1
 
     if anticipated > 0:
-        _log("%d speaker-turn segments shifted -%dms (anticipation)",
-             anticipated, _anticipation_ms)
+        _log("%d speaker-turn segments shifted (adaptive anticipation)", anticipated)
 
     # ── Stage 6: Ease vs snap decision ──
     anticipation_s = _anticipation_ms / 1000.0
