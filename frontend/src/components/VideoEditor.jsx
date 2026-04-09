@@ -1135,8 +1135,7 @@ export default function VideoEditor({
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    const onReady = () => {
-      setVideoReady(true);
+    const onMetadata = () => {
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
@@ -1145,23 +1144,45 @@ export default function VideoEditor({
         video.currentTime = clipStart;
       }
     };
-    const onError = () => setVideoError(true);
+    const onCanPlay = () => {
+      setVideoReady(true);
+      if (video.duration && isFinite(video.duration)) {
+        setVideoDuration(video.duration);
+      }
+    };
+    const onError = () => {
+      // Retry once on transient failures (partial content, stale range)
+      if (!video._retried) {
+        video._retried = true;
+        video.load();
+        return;
+      }
+      setVideoError(true);
+    };
     const onDuration = () => {
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
     };
-    video.addEventListener('loadedmetadata', onReady);
+    video.addEventListener('loadedmetadata', onMetadata);
+    video.addEventListener('canplay', onCanPlay);
     video.addEventListener('durationchange', onDuration);
     video.addEventListener('error', onError);
-    if (video.readyState >= 1) {
+    // If already past canplay when effect runs (e.g. cached)
+    if (video.readyState >= 3) {
       setVideoReady(true);
+      if (video.duration && isFinite(video.duration)) {
+        setVideoDuration(video.duration);
+      }
+    } else if (video.readyState >= 1) {
+      // Have metadata but not yet playable
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
     }
     return () => {
-      video.removeEventListener('loadedmetadata', onReady);
+      video.removeEventListener('loadedmetadata', onMetadata);
+      video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('durationchange', onDuration);
       video.removeEventListener('error', onError);
     };
@@ -1173,7 +1194,10 @@ export default function VideoEditor({
     if (!video || clipStart === undefined || clipStart === null) return;
     video.currentTime = clipStart;
     setCurrentTime(clipStart);
-    video.play().then(() => setPlaying(true)).catch(() => {});
+    // Only auto-play if video is ready (has enough data to begin playback)
+    if (video.readyState >= 3) {
+      video.play().then(() => setPlaying(true)).catch(() => {});
+    }
   }, [clipStart, clipEnd]);
 
   // ── Fullscreen tracking ────────────────────────────
@@ -2630,7 +2654,21 @@ export default function VideoEditor({
           <div className="ve-aspect-badge">{String(aspectRatio || '')}</div>
         )}
 
-        {!playing && (
+        {!videoReady && (
+          <div style={{
+            position: 'absolute', inset: 0, zIndex: 20,
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            background: 'var(--bg-elevated, #1a1a1a)',
+            gap: 12,
+          }}>
+            <div className="ve-loading__spinner" />
+            <span style={{ fontSize: 12, color: 'var(--text-muted, #888)', letterSpacing: '0.02em' }}>
+              Loading video...
+            </span>
+          </div>
+        )}
+
+        {videoReady && !playing && (
           <div className="ve-viewport__play-overlay" style={{ pointerEvents: 'none' }}>
             <div className="ve-viewport__play-icon">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="white" stroke="none">
@@ -2757,7 +2795,7 @@ export default function VideoEditor({
       )}
 
       {/* ── Timeline ── */}
-      <div className="ve-timeline">
+      <div className="ve-timeline" style={videoReady ? undefined : { opacity: 0.3, pointerEvents: 'none' }}>
         {/* Ruler — clickable for Premiere-style seek */}
         <div
           className="ve-timeline__ruler"
@@ -3339,18 +3377,20 @@ export default function VideoEditor({
       )}
 
       {/* ── Controls bar ── */}
-      <div className={`ve-controls${compact ? ' ve-controls--compact' : ''}${effectiveSegment ? ' ve-controls--segment-mode' : ''}`}>
+      <div className={`ve-controls${compact ? ' ve-controls--compact' : ''}${effectiveSegment ? ' ve-controls--segment-mode' : ''}`}
+        style={videoReady ? undefined : { opacity: 0.4, pointerEvents: 'none' }}
+      >
         {/* Transport row: centered on all devices */}
         <div className="ve-controls__transport">
-          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(-5); }} title="Back 5s (J)">
+          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(-5); }} title="Back 5s (J)" disabled={!videoReady}>
             <Icon.SkipBack />
           </button>
 
-          <button className="ve-btn ve-btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} title="Play/Pause (Space)">
+          <button className="ve-btn ve-btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} title="Play/Pause (Space)" disabled={!videoReady}>
             {playing ? <Icon.Pause /> : <Icon.Play />}
           </button>
 
-          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(5); }} title="Forward 5s (L)">
+          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(5); }} title="Forward 5s (L)" disabled={!videoReady}>
             <Icon.SkipForward />
           </button>
 

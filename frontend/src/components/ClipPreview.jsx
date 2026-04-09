@@ -419,6 +419,7 @@ export default function ClipPreview({
   const SPEED_OPTIONS = [0.5, 1.0, 1.5, 2.0];
 
   const [playing, setPlaying] = useState(false);
+  const [videoReady, setVideoReady] = useState(false);
   // Use a ref for the raw video time to avoid re-rendering on every timeupdate.
   // Only the display time (throttled) triggers re-renders.
   const currentTimeRef = useRef(clipStart);
@@ -521,8 +522,12 @@ export default function ClipPreview({
     const video = fgVideoRef.current;
     if (!video) return;
 
-    const onLoaded = () => {
+    const onMetadata = () => {
       video.currentTime = clipStart;
+    };
+
+    const onCanPlay = () => {
+      setVideoReady(true);
       video.play().then(() => setPlaying(true)).catch(() => {});
     };
 
@@ -541,13 +546,20 @@ export default function ClipPreview({
         video.load();
       }
     };
-    video.addEventListener('loadedmetadata', onLoaded);
+    video.addEventListener('loadedmetadata', onMetadata);
+    video.addEventListener('canplay', onCanPlay);
     video.addEventListener('timeupdate', onTimeUpdate);
     video.addEventListener('error', onError);
-    if (video.readyState >= 1) onLoaded();
+    if (video.readyState >= 3) {
+      setVideoReady(true);
+      onCanPlay();
+    } else if (video.readyState >= 1) {
+      onMetadata();
+    }
 
     return () => {
-      video.removeEventListener('loadedmetadata', onLoaded);
+      video.removeEventListener('loadedmetadata', onMetadata);
+      video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('timeupdate', onTimeUpdate);
       video.removeEventListener('error', onError);
     };
@@ -1486,8 +1498,28 @@ export default function ClipPreview({
           />
         )}
 
+        {/* Loading overlay */}
+        {!videoReady && (
+          <div style={{
+            position: 'absolute', inset: 0, zIndex: 20,
+            display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+            background: 'var(--video-bg, #000)',
+            gap: 10,
+          }}>
+            <div style={{
+              width: 24, height: 24,
+              border: '2px solid rgba(255,255,255,0.15)',
+              borderTopColor: 'var(--accent-cyan, #0A84FF)',
+              borderRadius: '50%',
+              animation: 'spin 0.8s linear infinite',
+            }} />
+            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)' }}>Loading...</span>
+            <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+          </div>
+        )}
+
         {/* Play/pause overlay */}
-        {!playing && (
+        {videoReady && !playing && (
           <div style={{
             position: 'absolute', inset: 0, zIndex: 6,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1505,8 +1537,12 @@ export default function ClipPreview({
         )}
       </div>
 
-      {/* Controls */}
-      <div style={{ background: 'var(--bg-elevated)', padding: isMobile ? '8px 12px' : '6px 12px' }}>
+      {/* Controls — hidden until video is ready */}
+      <div style={{
+        background: 'var(--bg-elevated)',
+        padding: isMobile ? '8px 12px' : '6px 12px',
+        ...(videoReady ? {} : { opacity: 0.3, pointerEvents: 'none' }),
+      }}>
         {/* Draggable seek bar */}
         <div
           ref={seekBarRef}
