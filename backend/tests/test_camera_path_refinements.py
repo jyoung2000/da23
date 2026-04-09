@@ -43,12 +43,13 @@ class TestRuleAShortShot:
 
 
 class TestRuleBMultiFeatureInfeasibility:
-    def test_three_hard_required_dont_fit_padding(self):
-        """5s shot with 3 hard-required faces that don't fit -> PADDING via Rule B."""
+    def test_simultaneous_multi_features_dont_fit_padding(self):
+        """5s shot with 3 simultaneous hard-required faces that don't fit -> PADDING via Rule B."""
+        # All 3 faces at same timestamp -> simultaneous, bounding rect exceeds crop
         required = [
             _make_required_face(t=1.0, x=10.0),
-            _make_required_face(t=2.0, x=50.0),
-            _make_required_face(t=3.0, x=90.0),
+            _make_required_face(t=1.0, x=50.0),
+            _make_required_face(t=1.0, x=90.0),
         ]
         targets = [(t, 50.0, 40.0) for t in [0.0, 1.0, 2.0, 3.0, 4.0]]
         focus = _make_focus(targets, fits=False, shot_start=0.0, shot_end=5.0, required=required)

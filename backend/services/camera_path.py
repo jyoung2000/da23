@@ -71,13 +71,22 @@ def select_camera_mode(
             return CameraMode.PADDING
 
     # ── Rule B: Multi-feature geometric infeasibility ──
-    # When the shot has multiple hard-required features whose combined
-    # bounding rect exceeds the crop window, PADDING is the only correct
-    # answer regardless of motion.
-    if len(hard_required) >= 2 and not focus.fits_target_aspect:
-        logger.info("[%s] Camera mode: PADDING (%d hard-required features don't fit)",
-                    job_id, len(hard_required))
-        return CameraMode.PADDING
+    # When the shot has multiple hard-required features that need to appear
+    # simultaneously (same timestamp) and their combined bounding rect
+    # exceeds the crop window, PADDING is the only correct answer.
+    # A single subject walking across the frame has one feature per timestamp,
+    # which is handled fine by TRACKING — Rule B only catches genuinely
+    # multi-subject frames.
+    if hard_required and not focus.fits_target_aspect:
+        from collections import defaultdict as _defaultdict_b
+        _by_time = _defaultdict_b(list)
+        for rf in hard_required:
+            _by_time[rf.t_start].append(rf)
+        _has_simultaneous_multi = any(len(fs) >= 2 for fs in _by_time.values())
+        if _has_simultaneous_multi:
+            logger.info("[%s] Camera mode: PADDING (simultaneous multi-feature doesn't fit)",
+                        job_id)
+            return CameraMode.PADDING
 
     # No per-frame targets means no motion data -- STATIONARY if fits, PADDING otherwise
     if len(focus.per_frame_target) < 2:
