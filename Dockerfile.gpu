@@ -138,11 +138,16 @@ RUN pip3 install --upgrade pip && \
 
 # Download YuNet model for face detection fallback (~350KB, one-time)
 # Download SFace recognition model for identity embeddings (~2MB, one-time)
+# Download MobileNet-SSD for object detection (~10MB, CPU-only)
 RUN mkdir -p /app/backend/models && \
     curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" && \
     curl -sL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
-    "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" && \
+    curl -sL -o /app/backend/models/MobileNetSSD_deploy.prototxt \
+    "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/deploy.prototxt" && \
+    curl -sL -o /app/backend/models/MobileNetSSD_deploy.caffemodel \
+    "https://drive.google.com/uc?export=download&id=0B3gersZ2cHIxRm5PMWRoTkdHdHc" || true
 
 # Copy backend source
 COPY backend/ ./backend/

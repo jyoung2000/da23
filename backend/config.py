@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     DIARIZATION_MAX_SPEAKERS: int = 0  # 0 = unlimited (pyannote auto-detects)
     HF_AUTH_TOKEN: str = ""  # HuggingFace token for pyannote model access
 
+    # Saliency fusion + camera solver (AutoFlip-style pipeline)
+    SALIENCY_FUSION_ENABLED: bool = True   # Parallel face/object/saliency signal fusion
+    CAMERA_SOLVER_MODE: str = "auto"       # "auto" | "off" — Euclidean path solver
+
     @property
     def active_provider_chain(self) -> list[str]:
         return [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]

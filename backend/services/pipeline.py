@@ -2292,6 +2292,77 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Object detection failed (non-fatal): %s", job_id, e)
 
+    # ── Saliency Fusion + Camera Solver (AutoFlip-style parallel pipeline) ──
+    _saliency_fusion_shots = None
+    _saliency_fusion_frame_signals = None
+    _camera_solver_results = None
+    if (settings.SALIENCY_FUSION_ENABLED
+            and settings.CAMERA_SOLVER_MODE != "off"
+            and not _is_gameplay
+            and dense_face_results
+            and frames):
+        try:
+            _video_path = video_path  # from outer scope
+            _video_dur = metadata.get("duration", 0)
+            _src_w = metadata.get("width", 1920)
+            _src_h = metadata.get("height", 1080)
+            _frame_list_fusion = [(f.timestamp, f.path) for f in frames]
+
+            # Run shot detection + saliency detector in parallel via ThreadPool
+            from concurrent.futures import ThreadPoolExecutor as _FusionPool
+            _fusion_results = {}
+
+            def _run_shot_detect():
+                from backend.services.shot_detector import detect_shots
+                return detect_shots(_video_path, video_duration=_video_dur)
+
+            def _run_saliency_detect():
+                from backend.services.saliency_detector import detect_saliency_in_frames
+                return detect_saliency_in_frames(_frame_list_fusion, face_results)
+
+            with _FusionPool(max_workers=2, thread_name_prefix="fusion") as pool:
+                fut_shots = pool.submit(_run_shot_detect)
+                fut_sal = pool.submit(_run_saliency_detect)
+                _fusion_results["shots"] = fut_shots.result(timeout=300)
+                _fusion_results["saliency"] = fut_sal.result(timeout=300)
+
+            _saliency_fusion_shots = _fusion_results["shots"]
+            _saliency_fusion_saliency = _fusion_results["saliency"]
+
+            logger.info(
+                "[%s] SaliencyFusion: %d shots, %d saliency frames, %d object detections",
+                job_id, len(_saliency_fusion_shots),
+                len(_saliency_fusion_saliency), len(_object_detections),
+            )
+
+            # Signal fusion: merge face + object + saliency signals
+            from backend.services.signal_fusion import fuse_signals
+            _saliency_fusion_frame_signals = fuse_signals(
+                dense_faces=dense_face_results,
+                object_detections=_object_detections,
+                saliency_frames=_saliency_fusion_saliency,
+                active_speaker_events=active_speaker_events if active_speaker_events else [],
+                face_registry=face_registry,
+            )
+
+            # Camera solver: pick mode + generate keyframes per shot
+            from backend.services.camera_solver import solve_shots
+            _camera_solver_results = solve_shots(
+                shots=_saliency_fusion_shots,
+                frame_signals=_saliency_fusion_frame_signals,
+                source_width=_src_w,
+                source_height=_src_h,
+                target_aspect=9 / 16,
+                job_id=job_id,
+            )
+            logger.info(
+                "[%s] CameraSolver: %d shot solutions",
+                job_id, len(_camera_solver_results),
+            )
+        except Exception as e:
+            logger.warning("[%s] Saliency fusion pipeline failed (non-fatal): %s", job_id, e)
+            _camera_solver_results = None
+
     # Save original AI vision subject_x BEFORE dense face or lip-audio overwrites.
     # These originals are the AI model's spatial reasoning — not lip detection noise.
     _original_scene_sx = [(s.timestamp, s.subject_x) for s in scenes] if scenes else []
@@ -3112,23 +3183,43 @@ async def _run_analysis_inner(job_id: str):
         face_registry_dict = face_registry.to_dict()
         if face_registry.multi_speaker:
             try:
-                from backend.services.layout_engine import build_layout_timeline
                 _layout_face_data = dense_face_results if dense_face_results else face_results
-                layout_timeline = build_layout_timeline(
-                    face_results=_layout_face_data,
-                    face_registry=face_registry,
-                    active_speaker_events=active_speaker_events,
-                    scene_descriptions=scenes,
-                    clip_start=0,
-                    clip_end=metadata.get("duration", 0),
-                )
+                # If camera solver produced results, use the solver-integrated layout engine
+                if _camera_solver_results:
+                    from backend.services.layout_engine import build_layout_timeline_with_solver
+                    layout_timeline = build_layout_timeline_with_solver(
+                        shot_cameras=_camera_solver_results,
+                        face_results=_layout_face_data,
+                        face_registry=face_registry,
+                        active_speaker_events=active_speaker_events,
+                        scene_descriptions=scenes,
+                        clip_start=0,
+                        clip_end=metadata.get("duration", 0),
+                        is_gameplay=_is_gameplay,
+                    )
+                    logger.info(
+                        "[%s] [Layout+Solver] Video layout analysis: default=%s, %d segments, %d layout changes",
+                        job_id, layout_timeline.default_mode,
+                        len(layout_timeline.segments),
+                        layout_timeline.total_layout_changes,
+                    )
+                else:
+                    from backend.services.layout_engine import build_layout_timeline
+                    layout_timeline = build_layout_timeline(
+                        face_results=_layout_face_data,
+                        face_registry=face_registry,
+                        active_speaker_events=active_speaker_events,
+                        scene_descriptions=scenes,
+                        clip_start=0,
+                        clip_end=metadata.get("duration", 0),
+                    )
+                    logger.info(
+                        "[%s] [Layout] Video layout analysis: default=%s, %d segments, %d layout changes",
+                        job_id, layout_timeline.default_mode,
+                        len(layout_timeline.segments),
+                        layout_timeline.total_layout_changes,
+                    )
                 default_layout_mode = layout_timeline.default_mode
-                logger.info(
-                    "[%s] [Layout] Video layout analysis: default=%s, %d segments, %d layout changes",
-                    job_id, layout_timeline.default_mode,
-                    len(layout_timeline.segments),
-                    layout_timeline.total_layout_changes,
-                )
             except Exception as e:
                 logger.warning("[%s] Layout analysis failed (non-fatal): %s", job_id, e)
         else:

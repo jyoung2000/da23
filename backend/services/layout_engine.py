@@ -357,3 +357,130 @@ def build_layout_timeline(
     )
 
     return timeline
+
+
+# ─────────────────────── Camera Solver Integration ────────────────────────
+
+
+def build_layout_timeline_with_solver(
+    shot_cameras: list,
+    face_results: list,
+    face_registry,
+    active_speaker_events: list,
+    scene_descriptions: list = None,
+    clip_start: float = 0,
+    clip_end: float = 0,
+    is_gameplay: bool = False,
+) -> LayoutTimeline:
+    """Build a layout timeline that integrates camera solver output.
+
+    For each shot:
+      - STATIONARY / TRACKING / PANNING → SINGLE layout with solver's
+        keyframes stored in face_positions as a crop motion path.
+      - PADDED → fall through to the existing face-count layout voter
+        (SPLIT / PIP / GAMEPLAY) for that shot's time range.
+      - GAMEPLAY content bypasses the solver entirely.
+
+    Args:
+        shot_cameras: list[ShotCamera] from camera_solver.solve_shots
+        face_results: dense FrameFaces for fallback layout voting
+        face_registry: FaceRegistry
+        active_speaker_events: active speaker timeline
+        scene_descriptions: for screen content detection
+        clip_start, clip_end: overall clip bounds
+        is_gameplay: if True, skip solver entirely and use existing logic
+
+    Returns:
+        LayoutTimeline
+    """
+    from backend.models import LayoutMode
+    from backend.services.camera_solver import CameraMode
+
+    # Gameplay: bypass solver, use existing layout engine
+    if is_gameplay or not shot_cameras:
+        return build_layout_timeline(
+            face_results=face_results,
+            face_registry=face_registry,
+            active_speaker_events=active_speaker_events,
+            scene_descriptions=scene_descriptions,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+
+    segments = []
+    padded_ranges = []
+
+    for sc in shot_cameras:
+        if sc.mode in (CameraMode.STATIONARY, CameraMode.TRACKING, CameraMode.PANNING):
+            # Solver handled this shot → SINGLE layout with keyframes
+            # Store keyframes as face_positions for downstream consumers
+            kf_positions = [
+                {
+                    "timestamp": float(t),
+                    "x": float(cx * 100),  # convert 0-1 to 0-100 pct
+                    "y": float(cy * 100),
+                    "camera_mode": sc.mode.value,
+                }
+                for t, cx, cy in sc.keyframes
+            ]
+            segments.append(LayoutSegment(
+                start=sc.shot_start,
+                end=sc.shot_end,
+                layout_mode=LayoutMode.SINGLE,
+                face_positions=kf_positions,
+                transition_type="cut" if not segments else "dissolve",
+            ))
+        elif sc.mode == CameraMode.PADDED:
+            # Solver couldn't fit → hand off to existing layout voter
+            padded_ranges.append((sc.shot_start, sc.shot_end))
+
+    # For PADDED shots, run the existing layout voter on their time ranges
+    for pad_start, pad_end in padded_ranges:
+        pad_faces = [fr for fr in face_results if pad_start <= fr.timestamp < pad_end]
+        if pad_faces and ALLOW_MULTI_LAYOUT:
+            sub_timeline = build_layout_timeline(
+                face_results=pad_faces,
+                face_registry=face_registry,
+                active_speaker_events=active_speaker_events,
+                scene_descriptions=scene_descriptions,
+                clip_start=pad_start,
+                clip_end=pad_end,
+            )
+            segments.extend(sub_timeline.segments)
+        else:
+            # No multi-layout → SINGLE with center crop
+            segments.append(LayoutSegment(
+                start=pad_start,
+                end=pad_end,
+                layout_mode=LayoutMode.SINGLE,
+                transition_type="cut",
+            ))
+
+    # Sort segments by start time
+    segments.sort(key=lambda s: s.start)
+
+    # Determine default mode
+    mode_durations = {}
+    for seg in segments:
+        dur = seg.end - seg.start
+        mode_durations[seg.layout_mode] = mode_durations.get(seg.layout_mode, 0) + dur
+    default_mode = max(mode_durations, key=mode_durations.get) if mode_durations else LayoutMode.SINGLE
+
+    total_changes = max(0, len(segments) - 1)
+
+    timeline = LayoutTimeline(
+        segments=segments,
+        default_mode=default_mode,
+        face_registry=face_registry,
+        total_layout_changes=total_changes,
+    )
+
+    logger.info(
+        "[Layout+Solver] Timeline: default=%s, %d segments, %d changes, "
+        "%d solver-handled, %d padded-fallback",
+        default_mode, len(segments), total_changes,
+        sum(1 for sc in shot_cameras if sc.mode != CameraMode.PADDED),
+        len(padded_ranges),
+    )
+
+    return timeline
