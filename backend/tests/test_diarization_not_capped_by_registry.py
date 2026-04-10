@@ -98,30 +98,43 @@ class TestDiarizationNotCappedByRegistry:
             _FaceSlot(slot_id=3, x_center=85.0),
         ])
 
-        # Dense face data: 4 faces visible in frames
+        # Dense face data: 4 faces visible in frames.
+        # All faces have lip_aperture=0 (not speaking) — only the active
+        # speaker events or audio heuristics determine who speaks.
         face_results = []
         for i in range(60):
             t = i * 1.0
             faces = [
-                _FaceInfo(identity_id=0, nose_x=15, lip_aperture=0.05 if i % 15 < 3 else 0.0),
-                _FaceInfo(identity_id=1, nose_x=35, lip_aperture=0.05 if i % 15 >= 3 and i % 15 < 6 else 0.0),
-                _FaceInfo(identity_id=2, nose_x=65, lip_aperture=0.05 if i % 15 >= 6 and i % 15 < 9 else 0.0),
-                _FaceInfo(identity_id=3, nose_x=85, lip_aperture=0.05 if i % 15 >= 9 and i % 15 < 12 else 0.0),
+                _FaceInfo(identity_id=0, nose_x=15, lip_aperture=0.0),
+                _FaceInfo(identity_id=1, nose_x=35, lip_aperture=0.0),
+                _FaceInfo(identity_id=2, nose_x=65, lip_aperture=0.0),
+                _FaceInfo(identity_id=3, nose_x=85, lip_aperture=0.0),
             ]
             face_results.append(_FrameFaces(timestamp=t, faces=faces))
 
-        # Raw transcript segments with 6 distinct audio speakers
-        # Speakers 5 and 6 are off-camera (no face slot)
+        # Raw transcript segments with 6 distinct audio speakers.
+        # Speakers 5 and 6 are off-camera (no face slot).
+        # Large gaps (>= 1.2s) between segments signal speaker changes.
+        # No face has lip_aperture > 0, so the function relies on audio
+        # heuristics (gap detection) and falls through to virtual speakers.
         raw_segments = []
-        speakers_order = [
-            "Speaker 1", "Speaker 2", "Speaker 3", "Speaker 4",
-            "Speaker 5", "Speaker 6",  # These two have no face slot
-            "Speaker 1", "Speaker 3", "Speaker 5", "Speaker 2",
+        segments_data = [
+            # (start, end, speaker_label)
+            (0.0, 5.0, "Speaker 1"),     # no lip data -> slot -1, but first seg
+            (6.5, 10.0, "Speaker 2"),    # gap=1.5s, no lip -> virtual
+            (11.5, 16.0, "Speaker 3"),   # gap=1.5s, no lip -> virtual
+            (17.5, 22.0, "Speaker 4"),   # gap=1.5s, no lip -> virtual
+            (24.0, 28.0, "Speaker 5"),   # gap=2.0s, no lip -> virtual
+            (30.0, 34.0, "Speaker 6"),   # gap=2.0s, no lip -> virtual
+            (36.0, 40.0, "Speaker 1"),   # gap=2.0s, back
+            (42.0, 46.0, "Speaker 3"),   # gap=2.0s
+            (48.0, 52.0, "Speaker 5"),   # gap=2.0s
+            (54.0, 58.0, "Speaker 2"),   # gap=2.0s
         ]
-        for i, spk in enumerate(speakers_order):
+        for start, end, spk in segments_data:
             raw_segments.append({
-                "start": i * 6.0,
-                "end": (i + 1) * 6.0,
+                "start": start,
+                "end": end,
                 "text": f"Hello from {spk}",
                 "words": None,
                 "confidence": 0.9,

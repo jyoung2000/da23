@@ -2758,10 +2758,11 @@ def assign_speakers_with_face_data(
                 slot_lars.setdefault(sid, []).append(lar)
             return max(slot_lars, key=lambda s: sum(slot_lars[s]) / len(slot_lars[s]))
 
-        # No one clearly speaking — use most common face slot
-        from collections import Counter
-        slot_counts = Counter(sid for sid, _, _, _ in nearby)
-        return slot_counts.most_common(1)[0][0] if slot_counts else -1
+        # No one clearly speaking (all lar <= 0.02) — return -1 so the
+        # caller can use audio heuristics or create a virtual speaker.
+        # Previously this fell back to "most common face slot" which
+        # prevented detecting off-camera speakers (Bug D).
+        return -1
 
     def _find_speaker_for_segment(seg):
         """Determine speaker for a segment using all available signals."""
@@ -2806,14 +2807,18 @@ def assign_speakers_with_face_data(
 
         return -1
 
-    # Assign speakers — no cap, each face slot = unique speaker
+    # Assign speakers — face slots provide anchors but audio can exceed them.
+    # DIARIZATION_ALLOW_EXCEED_FACE_SLOTS (default true): when audio heuristics
+    # detect a speaker change but no face slot matches, create a virtual speaker
+    # label not tied to any face slot (off-camera speaker). This decouples the
+    # audio speaker count from the face registry ceiling (Bug D fix).
+    ALLOW_EXCEED = os.environ.get("DIARIZATION_ALLOW_EXCEED_FACE_SLOTS", "true").lower() in ("true", "1", "yes")
     slot_to_speaker = {}
     next_spk = 1
     segments = []
     prev_spk = 1
+    virtual_speakers = 0  # count of off-camera speaker labels created
 
-    # Also run audio heuristics to detect pause-based speaker changes
-    # and use them as a SECONDARY signal when visual data is ambiguous
     for i, seg in enumerate(raw_segments):
         slot_id = _find_speaker_for_segment(seg)
 
@@ -2827,15 +2832,48 @@ def assign_speakers_with_face_data(
                     if spk == prev_spk:
                         prev_slot = sid
                         break
-                # Look for any OTHER slot in nearby frames
+                # Look for any OTHER slot with active lip movement nearby
+                # (not just any visible face — must be speaking)
+                nearby_speaking_slots = set()
+                for ft in frame_times:
+                    if abs(ft - seg["start"]) <= 3.0:
+                        for sid, lar, _, _ in frame_data.get(ft, []):
+                            if sid != prev_slot and lar > 0.02:
+                                nearby_speaking_slots.add(sid)
+                if nearby_speaking_slots:
+                    slot_id = min(nearby_speaking_slots)
+                elif ALLOW_EXCEED:
+                    # No face slot matches and audio says new speaker:
+                    # create a virtual speaker (off-camera voice)
+                    virtual_key = f"_virtual_{next_spk}"
+                    slot_to_speaker[virtual_key] = next_spk
+                    spk = next_spk
+                    next_spk += 1
+                    virtual_speakers += 1
+                    prev_spk = spk
+                    words = [WordTimestamp(**w) for w in seg["words"]] if seg.get("words") else None
+                    segments.append(TranscriptSegment(
+                        start=round(seg["start"], 2), end=round(seg["end"], 2),
+                        text=seg["text"], speaker=f"Speaker {spk}", words=words,
+                        confidence=seg.get("confidence"), avg_logprob=seg.get("avg_logprob"),
+                        no_speech_prob=seg.get("no_speech_prob"),
+                    ))
+                    continue
+            else:
+                # Small gap + no face match: look for any other visible slot
                 nearby_slots = set()
                 for ft in frame_times:
                     if abs(ft - seg["start"]) <= 3.0:
+                        prev_slot_id = None
+                        for sid, spk_label in slot_to_speaker.items():
+                            if spk_label == prev_spk:
+                                prev_slot_id = sid
+                                break
                         for sid, _, _, _ in frame_data.get(ft, []):
-                            if sid != prev_slot:
+                            if sid != prev_slot_id:
                                 nearby_slots.add(sid)
                 if nearby_slots:
-                    slot_id = min(nearby_slots)  # Pick the first alternative slot
+                    slot_id = min(nearby_slots)
 
         if slot_id >= 0:
             if slot_id not in slot_to_speaker:
@@ -2856,10 +2894,11 @@ def assign_speakers_with_face_data(
 
     num_speakers = len(set(s.speaker for s in segments))
     logger.info(
-        "Face-aware diarization: %d speakers from %d face slots, "
-        "%d/%d frames with face data, %d scene descriptions, %d active speaker events",
-        num_speakers, len(slot_to_speaker), len(frame_data),
-        len(face_results), len(scene_sx_map),
+        "Face-aware diarization: %d speakers from %d face slots "
+        "(%d virtual/off-camera), %d/%d frames with face data, "
+        "%d scene descriptions, %d active speaker events",
+        num_speakers, len(face_registry.slots), virtual_speakers,
+        len(frame_data), len(face_results), len(scene_sx_map),
         len(active_speaker_events) if active_speaker_events else 0,
     )
     return segments
