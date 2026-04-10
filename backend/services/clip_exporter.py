@@ -2689,6 +2689,59 @@ def _extract_render_plan_segments(scenes: list):
     return segments if has_reframe and segments else None
 
 
+def _extract_solver_keyframes(
+    layout_timeline_data: list,
+    clip_start: float,
+    clip_end: float,
+) -> list[tuple[float, int]] | None:
+    """Extract solver-generated keyframes from layout_timeline_data.
+
+    When the camera solver has produced per-shot keyframes, they are stored
+    in the LayoutSegment's face_positions list as dicts with a 'solver_mode'
+    key. This function finds those and converts them to (relative_time,
+    subject_x_0_100) tuples for direct use in the FFmpeg crop pipeline.
+
+    Returns None if no solver keyframes found.
+    """
+    solver_kf = []
+    for seg_data in (layout_timeline_data or []):
+        fps = seg_data if isinstance(seg_data, dict) else {}
+        face_positions = fps.get("face_positions", [])
+        if not face_positions:
+            continue
+        # Check if this segment has solver keyframes
+        if not any(fp.get("solver_mode") for fp in face_positions):
+            continue
+        seg_start = fps.get("start", 0)
+        seg_end = fps.get("end", 0)
+        # Only include segments that overlap with this clip
+        if seg_end <= clip_start or seg_start >= clip_end:
+            continue
+        for fp in face_positions:
+            if not fp.get("solver_mode"):
+                continue
+            abs_t = float(fp.get("timestamp", 0))
+            if abs_t < clip_start or abs_t > clip_end:
+                continue
+            rel_t = round(abs_t - clip_start, 3)
+            sx = int(round(float(fp.get("x", 50))))
+            sx = max(5, min(95, sx))  # basic safety clamp
+            solver_kf.append((rel_t, sx))
+
+    if not solver_kf:
+        return None
+
+    solver_kf.sort()
+    # Ensure coverage at t=0 and t=end
+    if solver_kf[0][0] > 0.01:
+        solver_kf.insert(0, (0.0, solver_kf[0][1]))
+    clip_dur = clip_end - clip_start
+    if solver_kf[-1][0] < clip_dur - 0.01:
+        solver_kf.append((round(clip_dur, 3), solver_kf[-1][1]))
+
+    return solver_kf
+
+
 def _build_subject_keyframes(
     scenes: list,
     clip_start: float,
@@ -6338,6 +6391,38 @@ async def export_clip(
                     clip_id,
                 )
 
+            # ── Solver keyframe override: use camera solver's per-shot keyframes ──
+            # When layout_timeline_data has segments with solver_mode in face_positions,
+            # use those directly instead of the cluster-snap pipeline.
+            _using_solver_keyframes = False
+            if (layout_timeline_data and aspect_ratio and not all_tracking_off
+                    and not frontend_subject_keyframes
+                    and os.environ.get("CLIPAI_CAMERA_SOLVER", "on").lower() != "off"):
+                try:
+                    solver_kf = _extract_solver_keyframes(
+                        layout_timeline_data, start, end,
+                    )
+                    if solver_kf:
+                        _using_solver_keyframes = True
+                        keyframes = solver_kf
+                        logger.info(
+                            "[SubjectTracking] clip %s: Using %d solver keyframes (bypassing cluster-snap)",
+                            clip_id, len(keyframes),
+                        )
+                        unique_x = set(kf[1] for kf in keyframes)
+                        if len(unique_x) <= 1:
+                            subject_x = keyframes[0][1]
+                            keyframes = None
+                            logger.info(
+                                "[SubjectTracking] clip %s: solver keyframes all sx=%d — static crop",
+                                clip_id, subject_x,
+                            )
+                except Exception as _solver_err:
+                    logger.warning(
+                        "[SubjectTracking] clip %s: solver keyframe extraction failed (%s), falling back",
+                        clip_id, _solver_err,
+                    )
+
             # ── Frontend keyframe override: use preview player's exact keyframes ──
             _using_frontend_keyframes = False
             if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
@@ -6382,7 +6467,7 @@ async def export_clip(
                         clip_id, subject_x,
                     )
 
-            elif subject_scenes and aspect_ratio and not all_tracking_off:
+            elif subject_scenes and aspect_ratio and not all_tracking_off and not _using_solver_keyframes:
                 # ── PHASE 0: Build raw keyframes ──
                 raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
 

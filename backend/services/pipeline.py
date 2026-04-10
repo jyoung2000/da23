@@ -3111,26 +3111,55 @@ async def _run_analysis_inner(job_id: str):
     if face_registry:
         face_registry_dict = face_registry.to_dict()
         if face_registry.multi_speaker:
-            try:
-                from backend.services.layout_engine import build_layout_timeline
-                _layout_face_data = dense_face_results if dense_face_results else face_results
-                layout_timeline = build_layout_timeline(
-                    face_results=_layout_face_data,
-                    face_registry=face_registry,
-                    active_speaker_events=active_speaker_events,
-                    scene_descriptions=scenes,
-                    clip_start=0,
-                    clip_end=metadata.get("duration", 0),
-                )
-                default_layout_mode = layout_timeline.default_mode
-                logger.info(
-                    "[%s] [Layout] Video layout analysis: default=%s, %d segments, %d layout changes",
-                    job_id, layout_timeline.default_mode,
-                    len(layout_timeline.segments),
-                    layout_timeline.total_layout_changes,
-                )
-            except Exception as e:
-                logger.warning("[%s] Layout analysis failed (non-fatal): %s", job_id, e)
+            # Try camera solver first (per-shot, eliminates cross-cut drift)
+            _solver_on = os.environ.get("CLIPAI_CAMERA_SOLVER", settings.CLIPAI_CAMERA_SOLVER).lower() != "off"
+            _layout_face_data = dense_face_results if dense_face_results else face_results
+            if _solver_on and _layout_face_data and not _is_gameplay:
+                try:
+                    from backend.services.layout_engine import plan_layout
+                    layout_timeline = plan_layout(
+                        video_path=video_path,
+                        frame_faces=_layout_face_data,
+                        face_registry=face_registry,
+                        active_speaker_events=active_speaker_events,
+                        source_width=metadata.get("width", 1920),
+                        source_height=metadata.get("height", 1080),
+                        scene_descriptions=scenes,
+                        video_duration=metadata.get("duration", 0),
+                        job_id=job_id,
+                    )
+                    default_layout_mode = layout_timeline.default_mode
+                    logger.info(
+                        "[%s] [Layout+Solver] Video layout analysis: default=%s, %d segments, %d layout changes",
+                        job_id, layout_timeline.default_mode,
+                        len(layout_timeline.segments),
+                        layout_timeline.total_layout_changes,
+                    )
+                except Exception as e:
+                    logger.warning("[%s] Camera solver layout failed, falling back to legacy: %s", job_id, e)
+                    layout_timeline = None
+
+            # Legacy fallback (also runs when solver is off or failed)
+            if layout_timeline is None:
+                try:
+                    from backend.services.layout_engine import build_layout_timeline
+                    layout_timeline = build_layout_timeline(
+                        face_results=_layout_face_data,
+                        face_registry=face_registry,
+                        active_speaker_events=active_speaker_events,
+                        scene_descriptions=scenes,
+                        clip_start=0,
+                        clip_end=metadata.get("duration", 0),
+                    )
+                    default_layout_mode = layout_timeline.default_mode
+                    logger.info(
+                        "[%s] [Layout] Video layout analysis: default=%s, %d segments, %d layout changes",
+                        job_id, layout_timeline.default_mode,
+                        len(layout_timeline.segments),
+                        layout_timeline.total_layout_changes,
+                    )
+                except Exception as e:
+                    logger.warning("[%s] Layout analysis failed (non-fatal): %s", job_id, e)
         else:
             logger.info("[%s] [Layout] Single-speaker video — using SINGLE layout", job_id)
 

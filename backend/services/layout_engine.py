@@ -331,3 +331,144 @@ def build_layout_timeline(
     )
 
     return timeline
+
+
+# ─────────────────────── Camera Solver Integration ────────────────────────
+
+def plan_layout(
+    video_path: str,
+    frame_faces: list,
+    face_registry,
+    active_speaker_events: list,
+    source_width: int = 1920,
+    source_height: int = 1080,
+    scene_descriptions: list = None,
+    video_duration: float = 0,
+    job_id: str = "",
+) -> LayoutTimeline:
+    """Solver-first layout planner.
+
+    Runs shot detection → required regions → per-shot camera solver.
+    For solver-handled shots (STATIONARY/PANNING/TRACKING), emits SINGLE
+    layout with the solver's keyframes stored in face_positions.
+    For PADDED shots, falls through to the existing layout voter.
+
+    Wrapped in a try/except: on any failure, falls back to the existing
+    build_layout_timeline().
+    """
+    from backend.services.shot_detector import detect_shots
+    from backend.services.camera_solver import solve_all_shots, CameraMode
+    from backend.services.required_regions import build_required_regions
+
+    try:
+        return _plan_layout_impl(
+            video_path, frame_faces, face_registry, active_speaker_events,
+            source_width, source_height, scene_descriptions, video_duration,
+            job_id,
+        )
+    except Exception as e:
+        logger.warning("[%s] plan_layout failed (%s) — falling back to legacy layout", job_id, e)
+        clip_end = video_duration or (frame_faces[-1].timestamp if frame_faces else 0)
+        return build_layout_timeline(
+            face_results=frame_faces,
+            face_registry=face_registry,
+            active_speaker_events=active_speaker_events,
+            scene_descriptions=scene_descriptions,
+            clip_start=0,
+            clip_end=clip_end,
+        )
+
+
+def _plan_layout_impl(
+    video_path, frame_faces, face_registry, active_speaker_events,
+    source_width, source_height, scene_descriptions, video_duration, job_id,
+):
+    from backend.models import LayoutMode
+    from backend.services.shot_detector import detect_shots
+    from backend.services.camera_solver import solve_all_shots, CameraMode
+    from backend.services.required_regions import build_required_regions
+
+    # 1. Detect shots
+    shots = detect_shots(video_path, video_duration=video_duration)
+    logger.info("[%s] plan_layout: %d shots detected", job_id, len(shots))
+
+    # 2. Build required regions from existing face data
+    regions = build_required_regions(frame_faces, active_speaker_events)
+
+    # 3. Solve camera mode per shot
+    shot_cameras = solve_all_shots(
+        shots, regions,
+        source_width=source_width,
+        source_height=source_height,
+        job_id=job_id,
+    )
+
+    # 4. Build LayoutSegments
+    segments = []
+    padded_count = 0
+
+    for sc in shot_cameras:
+        if sc.mode in (CameraMode.STATIONARY, CameraMode.PANNING, CameraMode.TRACKING):
+            # Solver output → SINGLE layout with keyframes
+            kf_positions = [
+                {
+                    "timestamp": float(t),
+                    "x": float(cx * 100),  # convert 0-1 to 0-100 pct
+                    "y": float(cy * 100),
+                    "solver_mode": sc.mode.value,
+                }
+                for t, cx, cy in sc.keyframes
+            ]
+            seg = LayoutSegment(
+                start=sc.start,
+                end=sc.end,
+                layout_mode=LayoutMode.SINGLE,
+                face_positions=kf_positions,
+                transition_type="cut" if not segments else "dissolve",
+            )
+            segments.append(seg)
+        else:
+            # PADDED → existing layout voter decides SPLIT / PIP
+            padded_count += 1
+            pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
+            if pad_faces and ALLOW_MULTI_LAYOUT:
+                sub = build_layout_timeline(
+                    face_results=pad_faces,
+                    face_registry=face_registry,
+                    active_speaker_events=active_speaker_events,
+                    scene_descriptions=scene_descriptions,
+                    clip_start=sc.start,
+                    clip_end=sc.end,
+                )
+                segments.extend(sub.segments)
+            else:
+                segments.append(LayoutSegment(
+                    start=sc.start,
+                    end=sc.end,
+                    layout_mode=LayoutMode.SINGLE,
+                    transition_type="cut",
+                ))
+
+    segments.sort(key=lambda s: s.start)
+
+    mode_durations = {}
+    for seg in segments:
+        dur = seg.end - seg.start
+        mode_durations[seg.layout_mode] = mode_durations.get(seg.layout_mode, 0) + dur
+    default_mode = max(mode_durations, key=mode_durations.get) if mode_durations else LayoutMode.SINGLE
+
+    total_changes = max(0, len(segments) - 1)
+    timeline = LayoutTimeline(
+        segments=segments,
+        default_mode=default_mode,
+        face_registry=face_registry,
+        total_layout_changes=total_changes,
+    )
+
+    solver_handled = sum(1 for sc in shot_cameras if sc.mode != CameraMode.PADDED)
+    logger.info(
+        "[%s] [Layout+Solver] %d segments, %d solver-handled, %d padded-fallback, default=%s",
+        job_id, len(segments), solver_handled, padded_count, default_mode,
+    )
+
+    return timeline

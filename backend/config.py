@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     DIARIZATION_MAX_SPEAKERS: int = 0  # 0 = unlimited (pyannote auto-detects)
     HF_AUTH_TOKEN: str = ""  # HuggingFace token for pyannote model access
 
+    # Camera solver (per-shot AutoFlip-style crop planning)
+    CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER
+
     @property
     def active_provider_chain(self) -> list[str]:
         return [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]
