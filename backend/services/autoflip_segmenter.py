@@ -297,6 +297,51 @@ def build_autoflip_segments(
         for seg in segments:
             seg.confidence = 0.5  # Neutral default
 
+    # ── 4b. Apply fallback ladder for low-confidence segments ──
+    # The autoflip segmenter sets seg.confidence from the estimator but
+    # was not applying the fallback ladder (root cause of confidence bypass bug).
+    try:
+        from backend.services.subject_confidence import get_fallback_strategy
+        last_confident_x = None
+        last_confident_slot = None
+        fallback_count = 0
+        for seg in segments:
+            if seg.layout in ("wide_master", "blur_fill"):
+                if seg.confidence >= 0.70:
+                    last_confident_x = seg.subject_x
+                    last_confident_slot = seg.active_slot
+                continue
+
+            if seg.confidence >= 0.70:
+                last_confident_x = seg.subject_x
+                last_confident_slot = seg.active_slot
+                continue
+
+            fallback = get_fallback_strategy(
+                seg.confidence, seg.content_type,
+                last_confident_x=last_confident_x,
+                last_confident_slot=last_confident_slot,
+            )
+            if fallback is not None:
+                strategy, layout, subject_x, active_slot, reason = fallback
+                seg.strategy = strategy
+                seg.layout = layout
+                seg.subject_x = subject_x
+                seg.active_slot = active_slot
+                seg.fallback_reason = reason
+                fallback_count += 1
+                _log("segment %.1f-%.1fs: confidence=%.2f, fallback=%s (reason=%s)",
+                     seg.start, seg.end, seg.confidence, strategy.upper(), reason)
+
+        if fallback_count > 0:
+            _log("%d segments received confidence-gated fallbacks", fallback_count)
+    except Exception as e:
+        logger.warning("[%s] AutoFlip fallback ladder failed: %s", job_id, e)
+
+    # ── 4c. Hard gate enforcement (last line of defense) ──
+    from backend.services.confidence_audit import enforce_confidence_floor
+    segments = enforce_confidence_floor(segments, job_id=job_id)
+
     # Log one-mode-per-shot invariant
     _log("one mode per shot: True")
 
