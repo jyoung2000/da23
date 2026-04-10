@@ -2579,6 +2579,30 @@ async def _run_analysis_inner(job_id: str):
                 logger.info("[%s] Reframe mode: AUTOFLIP (fusion: %s)", job_id,
                             "enabled" if USE_SUBJECT_FUSION else "disabled")
 
+                # ── Dense Propagation (optional, behind feature flag) ──
+                USE_DENSE_PROPAGATION = os.environ.get("USE_DENSE_PROPAGATION", "false").lower() in ("true", "1", "yes")
+                _interpolated_timeline = None
+                if USE_DENSE_PROPAGATION and dense_face_results and frames:
+                    try:
+                        from backend.services.dense_propagator import build_interpolated_timeline
+                        _interpolated_timeline = build_interpolated_timeline(
+                            dense_face_results=dense_face_results,
+                            frame_paths=[(f.timestamp, f.path) for f in frames],
+                            source_width=metadata.get("width", 1920),
+                            source_height=metadata.get("height", 1080),
+                            source_fps=metadata.get("fps", 30.0),
+                            shot_cuts=_shot_cuts,
+                            backend=os.environ.get("PROPAGATION_BACKEND", "KCF"),
+                            runtime_budget_sec=240.0,
+                            job_id=job_id,
+                        )
+                        if _interpolated_timeline:
+                            logger.info("[%s] DensePropagation: %s",
+                                        job_id, _interpolated_timeline.to_dict_summary())
+                    except Exception as e:
+                        logger.warning("[%s] Dense propagation failed (non-fatal): %s", job_id, e)
+                        _interpolated_timeline = None
+
                 reframe_segments = build_autoflip_segments(
                     shot_cuts=_shot_cuts,
                     face_registry=face_registry,
@@ -2596,6 +2620,7 @@ async def _run_analysis_inner(job_id: str):
                     subject_tracks=_subject_tracks,
                     target_aspect=9/16,
                     job_id=job_id,
+                    interpolated_timeline=_interpolated_timeline,
                 )
                 if reframe_segments:
                     from backend.models import SceneDescription

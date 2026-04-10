@@ -27,6 +27,7 @@ def aggregate_scene_focus(
     object_detections: list = None,
     subject_tracks: list = None,
     job_id: str = "",
+    interpolated_timeline=None,
 ) -> SceneFocusRegion:
     """Collect all required and non-required features in [shot_start, shot_end],
     compute the minimum bounding rect of required features, and decide whether
@@ -59,6 +60,30 @@ def aggregate_scene_focus(
                     weight=1.0,
                     must_be_in_frame=True,
                     identity=int(sid) if sid >= 0 else None,
+                ))
+
+    # 1b. Supplement with interpolated timeline (denser per-frame positions)
+    #     Only add non-anchor frames from the timeline — anchor frames already
+    #     came from dense_faces above. This fills the gaps with tracker data.
+    if interpolated_timeline is not None:
+        for s in interpolated_timeline.samples:
+            if s.timestamp < shot_start or s.timestamp >= shot_end:
+                continue
+            if s.is_anchor:
+                continue  # already covered by dense_faces
+            for slot_id, (cx, cy, w, h) in s.bboxes.items():
+                conf = s.confidences.get(slot_id, 0.5)
+                required.append(RequiredFeature(
+                    t_start=s.timestamp,
+                    t_end=s.timestamp,
+                    x=float(cx),
+                    y=float(cy),
+                    w=float(w),
+                    h=float(h),
+                    kind=FeatureKind.FACE,
+                    weight=float(conf),
+                    must_be_in_frame=True,
+                    identity=int(slot_id) if slot_id >= 0 else None,
                 ))
 
     # 2. Collect persistent regions
