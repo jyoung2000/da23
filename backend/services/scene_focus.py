@@ -116,6 +116,7 @@ def aggregate_scene_focus(
                     kind=FeatureKind.HUD,
                     weight=0.9,
                     must_be_in_frame=True,
+                    excluded_from_centroid=True,
                 ))
         # Generic persistent regions as non-required
         for reg in getattr(persistent_regions, 'regions', []):
@@ -259,23 +260,36 @@ def aggregate_scene_focus(
                               min_bounding_rect[3] <= 100)
 
     # 6. Optimal crop center
-    if fits_target_aspect and required:
-        cx = min_bounding_rect[0]
-        cy = min_bounding_rect[1]
+    #    Text/HUD features marked excluded_from_centroid are constraints (must
+    #    stay in frame) but do NOT pull the crop center toward them. The crop
+    #    center is derived only from human subjects.
+    centroid_features = [rf for rf in required if not rf.excluded_from_centroid]
+
+    if fits_target_aspect and centroid_features:
+        # Use centroid of non-excluded features for crop center
+        total_w = sum(rf.weight for rf in centroid_features)
+        if total_w > 0:
+            cx = sum(rf.x * rf.weight for rf in centroid_features) / total_w
+            cy = sum(rf.y * rf.weight for rf in centroid_features) / total_w
+        else:
+            cx, cy = 50, 50
         # Clamp so crop window stays within [0, 100]
         half_cw = crop_width_pct / 2
         cx = max(half_cw, min(100 - half_cw, cx))
         cy = max(0, min(100, cy))
         optimal_crop_center = (cx, cy)
-    elif required:
-        # Weighted centroid of required features
-        total_w = sum(rf.weight for rf in required)
+    elif centroid_features:
+        # Weighted centroid of centroid-eligible features
+        total_w = sum(rf.weight for rf in centroid_features)
         if total_w > 0:
-            cx = sum(rf.x * rf.weight for rf in required) / total_w
-            cy = sum(rf.y * rf.weight for rf in required) / total_w
+            cx = sum(rf.x * rf.weight for rf in centroid_features) / total_w
+            cy = sum(rf.y * rf.weight for rf in centroid_features) / total_w
         else:
             cx, cy = 50, 50
         optimal_crop_center = (cx, cy)
+    elif required:
+        # Only excluded features (text/HUD only, no human subjects) → center
+        optimal_crop_center = (50, 50)
     else:
         optimal_crop_center = (50, 50)
 
@@ -293,6 +307,7 @@ def aggregate_scene_focus(
             timestamps_seen.add(df.timestamp)
 
             visible = [rf for rf in required if rf.must_be_in_frame and
+                       not rf.excluded_from_centroid and
                        abs(rf.t_start - df.timestamp) < 0.01]
             if visible:
                 total_w = sum(rf.weight for rf in visible)
@@ -313,6 +328,7 @@ def aggregate_scene_focus(
                     continue
                 timestamps_seen.add(t)
                 visible = [rf for rf in required if rf.must_be_in_frame and
+                           not rf.excluded_from_centroid and
                            abs(rf.t_start - t) < 0.01]
                 if visible:
                     total_w = sum(rf.weight for rf in visible)

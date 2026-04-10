@@ -32,6 +32,7 @@ class RequiredFeature:
     weight: float              # 0.0-1.0
     must_be_in_frame: bool
     identity: Optional[int] = None  # face slot id or object class id
+    excluded_from_centroid: bool = False  # True for text/HUD: must stay in frame but doesn't pull the crop center
 
     @property
     def left(self) -> float:

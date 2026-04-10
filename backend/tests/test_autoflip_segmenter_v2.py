@@ -193,8 +193,9 @@ class TestSaliencyOnlyShot:
         )
 
         assert len(segments) >= 1
-        # Saliency is non-required, so no required features -> STATIONARY or PADDING
-        assert segments[0].strategy in ("stationary", "blur_fill")
+        # Saliency is non-required, no face → zero confidence → fallback to
+        # blur_fill or wide_master (confidence ladder now enforced correctly)
+        assert segments[0].strategy in ("stationary", "blur_fill", "wide_master")
 
 
 class TestFaceAndObjectMixed:
