@@ -629,18 +629,66 @@ def build_face_registry_with_embeddings(
         frames_with_faces=sum(1 for fr in face_results if fr.faces),
     )
 
-    # Validate: if any cluster spans > 40% of frame width, embeddings are
-    # producing garbage (different people chained together). Fall back to
-    # position-based clustering which is more reliable for this content.
-    garbage_clusters = [s for s in slots if (s.x_max - s.x_min) > 40]
-    if garbage_clusters:
-        logger.warning(
-            "Embedding clustering produced %d garbage cluster(s) (span > 40%% width): %s. "
-            "Falling back to position-based registry.",
-            len(garbage_clusters),
-            [(f"slot{s.slot_id}: [{s.x_min:.0f}-{s.x_max:.0f}]") for s in garbage_clusters],
-        )
-        return build_face_registry(face_results, min_appearances)
+    # Validate clusters by embedding cohesion, not x-span.
+    # A cluster with wide x-span (>40%) but high cosine cohesion (>0.55) is one
+    # person moving across the stage. A cluster with low cohesion (<0.55) is
+    # different people accidentally chained together. (Bug A fix)
+    if REGISTRY_USE_COHESION_GATE:
+        # Build slot → face indices map for cohesion check
+        slot_face_indices = {}
+        for slot_idx, group_indices in enumerate(
+            [gi for gi in groups.values() if len(set(all_faces[i][4] for i in gi)) >= min_appearances]
+        ):
+            slot_face_indices[slot_idx] = group_indices
+
+        incoherent_clusters = []
+        for slot_idx, (slot, face_idxs) in enumerate(zip(slots, slot_face_indices.values())):
+            span = slot.x_max - slot.x_min
+            if len(face_idxs) < 3:
+                continue  # not enough data to assess cohesion
+            slot_embs = np.stack([all_faces[i][0] for i in face_idxs])
+            slot_norms = np.linalg.norm(slot_embs, axis=1, keepdims=True)
+            slot_norms = np.maximum(slot_norms, 1e-8)
+            slot_embs_norm = slot_embs / slot_norms
+            centroid = slot_embs_norm.mean(axis=0)
+            c_norm = np.linalg.norm(centroid)
+            if c_norm > 1e-8:
+                centroid = centroid / c_norm
+            sims = slot_embs_norm @ centroid
+            cohesion = float(np.mean(sims))
+            logger.info(
+                "  Slot %d: span=%.0f%%, cohesion=%.3f (%d faces)",
+                slot.slot_id, span, cohesion, len(face_idxs),
+            )
+            if cohesion < 0.55:
+                incoherent_clusters.append(slot)
+
+        if incoherent_clusters:
+            logger.warning(
+                "Embedding clustering: %d cluster(s) with low cohesion (<0.55): %s. "
+                "Falling back to position-based registry for those.",
+                len(incoherent_clusters),
+                [(f"slot{s.slot_id}: span=[{s.x_min:.0f}-{s.x_max:.0f}]") for s in incoherent_clusters],
+            )
+            # Only fall back if ALL clusters are incoherent
+            if len(incoherent_clusters) == len(slots):
+                return build_face_registry(face_results, min_appearances)
+            # Otherwise, remove only the incoherent slots
+            incoherent_ids = {s.slot_id for s in incoherent_clusters}
+            slots = [s for s in slots if s.slot_id not in incoherent_ids]
+            for i, s in enumerate(slots):
+                s.slot_id = i
+    else:
+        # Legacy span-based check (behind flag for rollback)
+        garbage_clusters = [s for s in slots if (s.x_max - s.x_min) > 40]
+        if garbage_clusters:
+            logger.warning(
+                "Embedding clustering produced %d garbage cluster(s) (span > 40%% width): %s. "
+                "Falling back to position-based registry.",
+                len(garbage_clusters),
+                [(f"slot{s.slot_id}: [{s.x_min:.0f}-{s.x_max:.0f}]") for s in garbage_clusters],
+            )
+            return build_face_registry(face_results, min_appearances)
 
     # Also validate: must have 2+ slots for multi-speaker, or same count as position-based
     if len(slots) < 2:
