@@ -1278,6 +1278,32 @@ async def _run_analysis_inner(job_id: str):
             if face_registry:
                 for frame in frames:
                     frame.face_registry = face_registry
+
+                # ── Audio-first sanity log ──
+                # Compare face registry slot count with transcript speaker count
+                # (if available) as a sanity check. Large discrepancies suggest
+                # the registry is undercounting.
+                transcript_speakers = set()
+                if transcript_result:
+                    for seg in transcript_result:
+                        spk = getattr(seg, 'speaker', None)
+                        if spk:
+                            transcript_speakers.add(spk)
+                if transcript_speakers:
+                    audio_est = len(transcript_speakers)
+                    face_est = len(face_registry.slots)
+                    if audio_est > face_est:
+                        logger.info(
+                            "[%s] audio_speaker_estimate=%d vs face_registry_slots=%d — "
+                            "audio suggests more speakers than face registry detected",
+                            job_id, audio_est, face_est,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] audio_speaker_estimate=%d vs face_registry_slots=%d — consistent",
+                            job_id, audio_est, face_est,
+                        )
+
                 if face_registry.multi_speaker:
                     slot_info = ", ".join(f"slot{s.slot_id}@{s.x_center:.0f}%" for s in face_registry.slots)
                     logger.info(
