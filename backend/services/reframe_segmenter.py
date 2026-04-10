@@ -70,6 +70,7 @@ class ReframeSegment:
     hard_constraints: Optional[list] = None  # [(x, y, w, h), ...] HUD rects
     subject_source: str = ""  # which code path produced subject_x
     fallback_reason: Optional[str] = None  # why a fallback was applied
+    confidence_breakdown: Optional[dict] = None  # {face_in_crop, speaker_agree, stability, transcript}
 
 
 def build_reframe_segments(

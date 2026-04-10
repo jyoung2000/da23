@@ -274,7 +274,7 @@ def build_autoflip_segments(
                 motion_path=None,
             ))
 
-    # 4. Run confidence estimator on each segment
+    # 4. Run confidence estimator on each segment (with breakdown)
     try:
         from backend.services.subject_confidence import SubjectConfidenceEstimator
         estimator = SubjectConfidenceEstimator(
@@ -287,11 +287,13 @@ def build_autoflip_segments(
             source_height=source_height,
         )
         for seg in segments:
-            conf, reason = estimator.evaluate(
+            conf, reason, breakdown = estimator.evaluate_with_breakdown(
                 seg.start, seg.end, seg.active_slot, seg.subject_x,
                 target_aspect_ratio=target_aspect,
             )
             seg.confidence = conf
+            seg.confidence_breakdown = breakdown
+            seg.fallback_reason = reason if conf < 0.70 else None
     except Exception as e:
         logger.warning("[%s] AutoFlip confidence estimation failed: %s", job_id, e)
         for seg in segments:

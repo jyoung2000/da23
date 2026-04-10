@@ -136,6 +136,74 @@ class SubjectConfidenceEstimator:
         reason = "; ".join(reasons) if reasons else "all_checks_passed"
         return confidence, reason
 
+    def evaluate_with_breakdown(
+        self,
+        seg_start: float,
+        seg_end: float,
+        candidate_slot: Optional[int],
+        candidate_x: int,
+        target_aspect_ratio: float = 9 / 16,
+    ) -> tuple:
+        """Like evaluate(), but also returns a breakdown dict of the four input
+        components for debugging.
+
+        Returns:
+            (confidence: float, reason: str, breakdown: dict)
+            breakdown keys: face_in_crop, speaker_agree, stability, transcript
+        """
+        breakdown = {
+            "face_in_crop": 0.0,
+            "speaker_agree": 0.0,
+            "stability": 0.0,
+            "transcript": 0.0,
+        }
+        confidence = 0.0
+        reasons = []
+
+        # Check 1: Face-in-window
+        face_in_crop, face_check_detail = self._check_face_in_crop_window(
+            seg_start, seg_end, candidate_x, target_aspect_ratio,
+        )
+        if face_in_crop:
+            confidence += 0.40
+            breakdown["face_in_crop"] = 0.40
+        else:
+            reasons.append(f"no_face_in_crop_window ({face_check_detail})")
+            confidence = min(0.30, confidence)
+            breakdown["face_in_crop"] = confidence
+            reason = "; ".join(reasons) if reasons else "no_face_in_crop"
+            return confidence, reason, breakdown
+
+        # Check 2: Speaker agreement
+        speaker_agrees = self._check_speaker_agreement(
+            seg_start, seg_end, candidate_slot,
+        )
+        if speaker_agrees:
+            confidence += 0.20
+            breakdown["speaker_agree"] = 0.20
+        else:
+            reasons.append("speaker_disagrees")
+
+        # Check 3: Dense-face stability
+        stability = self._check_face_stability(seg_start, seg_end, candidate_slot)
+        stability_contrib = 0.20 * stability
+        confidence += stability_contrib
+        breakdown["stability"] = round(stability_contrib, 4)
+        if stability < 0.5:
+            reasons.append(f"unstable_face(stability={stability:.2f})")
+
+        # Check 4: Transcript coverage
+        transcript_covers = self._check_transcript_coverage(seg_start, seg_end)
+        if transcript_covers:
+            confidence += 0.20
+            breakdown["transcript"] = 0.20
+        else:
+            reasons.append("no_transcript_coverage")
+
+        confidence = max(0.0, min(1.0, confidence))
+        reason = "; ".join(reasons) if reasons else "all_checks_passed"
+        return confidence, reason, breakdown
+
     def _check_face_in_crop_window(
         self,
         seg_start: float,
