@@ -197,9 +197,14 @@ class TestTurnTaking:
 
 
 class TestRapidSwitchSuppression:
-    """3. Speaker A for 10s, B for 0.5s, A for 10s → 1 segment (B merged away)."""
+    """3. Speaker A for 10s, B for 0.5s, A for 10s.
 
-    def test_brief_interjection_merged(self):
+    With MIN_HOLD=0.12, a 0.5s high-confidence switch survives — this is
+    correct human-editor behavior.  A *low-confidence* sub-0.12s blip would
+    be merged, but 0.5s at confidence 0.9 is a genuine speaker turn.
+    """
+
+    def test_brief_high_confidence_interjection_survives(self):
         registry = _make_registry_2(x0=30, x1=70)
         speaker_to_slot = {"Speaker 1": 0, "Speaker 2": 1}
 
@@ -229,9 +234,11 @@ class TestRapidSwitchSuppression:
             video_duration=20.5,
         )
 
-        # The 0.5s B segment should be merged away
-        assert len(segments) == 1
+        # 0.5s B at confidence 0.9 should survive (A, B, A = 3 segments)
+        assert len(segments) == 3
         assert segments[0].active_slot == 0
+        assert segments[1].active_slot == 1
+        assert segments[2].active_slot == 0
 
 
 class TestShotCutSnap:

@@ -40,7 +40,7 @@ USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "false")
 USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "false").lower() in ("true", "1", "yes")
 
 # ── Default tunables (used when no content profile is provided) ──
-MIN_HOLD_SECONDS = 0.4
+MIN_HOLD_SECONDS = 0.12  # 3 frames @ 24fps, 4 @ 30fps — absolute floor
 ANTICIPATION_MS = 200
 SPEAKER_CONFIDENCE_THRESHOLD = 0.6
 SPEAKER_COVERAGE_THRESHOLD = 0.60
@@ -253,7 +253,16 @@ def build_reframe_segments(
             subject_source=subject_source,
         ))
 
-    # ── Merge short segments (< min_hold, adaptive per-segment) ──
+    # ── Confidence-gated merge of short segments ──
+    # A short segment is merged ONLY if:
+    #   - confidence < 0.6 (low-confidence blip), OR
+    #   - it has no shot-cut boundary on either side
+    # High-confidence short segments at shot-cut boundaries are preserved.
+    _shot_cut_set = set(shot_cuts)
+
+    def _is_at_shot_cut(t: float) -> bool:
+        return any(abs(t - sc) < 0.05 for sc in _shot_cut_set)
+
     merged_count = 0
     changed = True
     while changed:
@@ -262,12 +271,21 @@ def build_reframe_segments(
         while i < len(raw_segments):
             seg = raw_segments[i]
             dur = seg.end - seg.start
-            # Use adaptive min_hold at the segment's midpoint
+            # Use adaptive min_hold at the segment's midpoint, clamped to 0.12 floor
             seg_mid = (seg.start + seg.end) / 2.0
             local_min_hold = pacing_estimator.min_hold_at(seg_mid) if _has_pacing else _min_hold
+            local_min_hold = max(local_min_hold, MIN_HOLD_SECONDS)  # enforce 0.12s floor
             if dur < local_min_hold and len(raw_segments) > 1:
-                # Find best neighbor to merge into
-                merged_into = _merge_short_segment(raw_segments, i)
+                # Gate: preserve high-confidence segments at shot boundaries
+                at_shot_boundary = (
+                    _is_at_shot_cut(seg.start) or _is_at_shot_cut(seg.end)
+                    or seg.reason == "shot_cut"
+                )
+                if seg.confidence >= 0.6 and at_shot_boundary:
+                    i += 1
+                    continue  # preserve: high confidence + shot-cut anchor
+                # Gate: never merge across shot cuts
+                merged_into = _merge_short_segment(raw_segments, i, _shot_cut_set)
                 if merged_into is not None:
                     merged_count += 1
                     changed = True
@@ -275,7 +293,7 @@ def build_reframe_segments(
             i += 1
 
     if merged_count > 0:
-        _log("merged %d short segments (adaptive min_hold)", merged_count)
+        _log("merged %d short segments (confidence-gated, min_hold=%.2f)", merged_count, MIN_HOLD_SECONDS)
 
     # ── Stage 3: Multi-speaker detection (content-aware) ──
     wide_count = 0
@@ -469,52 +487,10 @@ def build_reframe_segments(
     if motion_tracking_count > 0:
         _log("%d segments set to TRACKING (motion-aware)", motion_tracking_count)
 
-    # ── Stage 4: Two-pass look-ahead hysteresis ──
-    # When intent tracking is enabled, the intent timeline handles subject
-    # switching natively via EMA + margin. The legacy hysteresis is bypassed.
-    hysteresis_removed = 0
-    if not USE_INTENT_TRACKING:
-        # Instead of blindly removing short B segments, look ahead up to 3s:
-        # If the change is "speaker B for <1s then back to A," suppress.
-        # If it's "speaker B for 3+ seconds," commit.
-        # Fallback hold threshold from TuningConfig (replaces hardcoded 1.5)
-        _intent_hold_fallback = _tuning.intent_min_hold_fallback if _tuning else 1.5
-        i = 1
-        while i < len(raw_segments) - 1:
-            a = raw_segments[i - 1]
-            b = raw_segments[i]
-            c = raw_segments[i + 1]
-            b_dur = b.end - b.start
-            # Adaptive hysteresis threshold based on local pacing
-            b_mid = (b.start + b.end) / 2.0
-            local_min_hold = pacing_estimator.min_hold_at(b_mid) if _has_pacing else _intent_hold_fallback
-            hysteresis_thresh = max(local_min_hold, 0.5)  # at least 0.5s
-
-            if b_dur < hysteresis_thresh and c.active_slot == a.active_slot:
-                # Look ahead: does speaker B come back for a sustained period?
-                # Cap look-ahead to 3 segments for calm content (pacing < 0.3),
-                # full 5 for fast content where rapid back-and-forth is real.
-                local_pacing = pacing_estimator.pacing[min(int(b_mid), pacing_estimator.duration - 1)] if _has_pacing else 0.5
-                max_lookahead = 3 if local_pacing < 0.3 else 5
-                b_returns = False
-                if i + 2 < len(raw_segments):
-                    for j in range(i + 2, min(i + max_lookahead, len(raw_segments))):
-                        future_seg = raw_segments[j]
-                        if (future_seg.active_slot == b.active_slot
-                                and (future_seg.end - future_seg.start) >= hysteresis_thresh * 2):
-                            b_returns = True
-                            break
-
-                if not b_returns:
-                    # Absorb B into A
-                    a.end = b.end
-                    raw_segments.pop(i)
-                    hysteresis_removed += 1
-                    continue  # Don't increment — check the new pair
-            i += 1
-
-    if hysteresis_removed > 0:
-        _log("hysteresis removed %d blip segments (look-ahead)", hysteresis_removed)
+    # ── Stage 4: Legacy look-ahead hysteresis — REMOVED (Bug 2) ──
+    # The legacy two-pass hysteresis was a second independent filter that deleted
+    # valid short speaker switches. Removed entirely; the confidence-gated merge
+    # in the merge loop above is now the sole short-segment filter.
 
     # ── Stage 4b: Consolidate consecutive same-slot segments ──
     consolidated = 0
@@ -1051,46 +1027,57 @@ def _slot_to_x(active_slot: Optional[int], face_registry) -> int:
     return WIDE_MASTER_X
 
 
-def _merge_short_segment(segments: list[ReframeSegment], idx: int) -> Optional[int]:
+def _merge_short_segment(
+    segments: list[ReframeSegment],
+    idx: int,
+    shot_cut_set: set[float] = frozenset(),
+) -> Optional[int]:
     """Merge a short segment into the best neighbor.
 
     Uses half-open [start, end) semantics. After merge the absorbed segment's
     entire time range is covered by the neighbor and contiguity is preserved.
 
+    Never merges across shot-cut boundaries — shot cuts are hard boundaries.
+
     Returns neighbor index or None.
     """
     seg = segments[idx]
 
+    def _is_shot_cut_between(t: float) -> bool:
+        return any(abs(t - sc) < 0.05 for sc in shot_cut_set)
+
     left = segments[idx - 1] if idx > 0 else None
     right = segments[idx + 1] if idx < len(segments) - 1 else None
 
+    # Never merge across shot cuts
+    left_ok = left and not _is_shot_cut_between(seg.start)
+    right_ok = right and not _is_shot_cut_between(seg.end)
+
     def _absorb_into_left():
-        # left absorbs seg: left.end extends to seg.end (half-open)
         left.end = seg.end
         segments.pop(idx)
         return idx - 1
 
     def _absorb_into_right():
-        # right absorbs seg: right.start retracts to seg.start (half-open)
         right.start = seg.start
         segments.pop(idx)
         return idx
 
     # Prefer neighbor with same active_slot
-    if left and left.active_slot == seg.active_slot:
+    if left_ok and left.active_slot == seg.active_slot:
         return _absorb_into_left()
-    if right and right.active_slot == seg.active_slot:
+    if right_ok and right.active_slot == seg.active_slot:
         return _absorb_into_right()
-    # Merge into the longer neighbor
-    if left and right:
+    # Merge into the longer neighbor (respecting shot-cut barriers)
+    if left_ok and right_ok:
         left_dur = left.end - left.start
         right_dur = right.end - right.start
         if left_dur >= right_dur:
             return _absorb_into_left()
         else:
             return _absorb_into_right()
-    elif left:
+    elif left_ok:
         return _absorb_into_left()
-    elif right:
+    elif right_ok:
         return _absorb_into_right()
     return None
