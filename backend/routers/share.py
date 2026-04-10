@@ -7,36 +7,25 @@ if user-agent detection fails on some new platform, the unfurl works.
 
 import os
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from backend.middleware.og_injection import render_og_html
+from backend.middleware.og_injection import render_og_html, _get_base_url_from_request
 from backend import database
 
 router = APIRouter()
 
 
-def _get_base_url() -> str:
-    base = os.environ.get("PUBLIC_BASE_URL", "")
-    if not base:
-        try:
-            from backend.config import settings
-            base = getattr(settings, "PUBLIC_BASE_URL", "")
-        except Exception:
-            pass
-    return base.rstrip("/")
-
-
 @router.get("/share/analysis/{job_id}", response_class=HTMLResponse)
-async def share_analysis(job_id: str):
+async def share_analysis(job_id: str, request: Request):
     """Server-rendered share page for analysis results.
 
     Always returns HTML with OG tags regardless of user agent.
     Includes meta refresh to redirect human visitors to the SPA.
     """
-    base_url = _get_base_url()
+    base_url = _get_base_url_from_request(request)
     if not base_url:
-        raise HTTPException(status_code=500, detail="PUBLIC_BASE_URL not configured")
+        raise HTTPException(status_code=500, detail="Cannot determine base URL")
 
     job = await database.get_job(job_id)
     if not job:
@@ -63,15 +52,15 @@ async def share_analysis(job_id: str):
 
 
 @router.get("/share/clip/{job_id}/{clip_id}", response_class=HTMLResponse)
-async def share_clip(job_id: str, clip_id: int):
+async def share_clip(job_id: str, clip_id: int, request: Request):
     """Server-rendered share page for a specific clip.
 
     Always returns HTML with OG tags regardless of user agent.
     Includes meta refresh to redirect human visitors to the SPA.
     """
-    base_url = _get_base_url()
+    base_url = _get_base_url_from_request(request)
     if not base_url:
-        raise HTTPException(status_code=500, detail="PUBLIC_BASE_URL not configured")
+        raise HTTPException(status_code=500, detail="Cannot determine base URL")
 
     job = await database.get_job(job_id)
     if not job:

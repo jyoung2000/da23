@@ -116,6 +116,19 @@ def _get_base_url() -> str:
     return base.rstrip("/")
 
 
+def _get_base_url_from_request(request) -> str:
+    """Derive the base URL from the incoming request when PUBLIC_BASE_URL is not set."""
+    base = _get_base_url()
+    if base:
+        return base
+    # Fall back to deriving from the request
+    scheme = request.url.scheme or "http"
+    host = request.headers.get("host") or request.url.netloc
+    if host:
+        return f"{scheme}://{host}"
+    return ""
+
+
 class OGInjectionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         ua = request.headers.get("user-agent", "")
@@ -135,9 +148,9 @@ class OGInjectionMiddleware(BaseHTTPMiddleware):
         try:
             from backend import database
 
-            base_url = _get_base_url()
+            base_url = _get_base_url_from_request(request)
             if not base_url:
-                logger.warning("OGInjection: PUBLIC_BASE_URL not set, falling through")
+                logger.warning("OGInjection: cannot determine base URL, falling through")
                 return await call_next(request)
 
             if analysis_match:

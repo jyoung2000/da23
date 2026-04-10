@@ -43,11 +43,23 @@ class TestShareAnalysis:
                 resp = client.get("/share/analysis/nonexistent")
         assert resp.status_code == 404
 
-    def test_no_base_url_returns_500(self):
-        """Without PUBLIC_BASE_URL, returns 500."""
+    def test_works_without_public_base_url(self):
+        """Without PUBLIC_BASE_URL, derives base URL from request Host header."""
+        mock_job = MagicMock()
+        mock_job.filename = "test.mp4"
+        mock_job.summary = None
+
         with patch.dict("os.environ", {"PUBLIC_BASE_URL": ""}, clear=False):
-            resp = client.get("/share/analysis/test123")
-        assert resp.status_code == 500
+            with patch("backend.database.get_job", new_callable=AsyncMock, return_value=mock_job):
+                resp = client.get(
+                    "/share/analysis/test123",
+                    headers={"Host": "192.168.8.119:1353"},
+                )
+
+        assert resp.status_code == 200
+        assert "og:title" in resp.text
+        # Should derive base URL from Host header
+        assert "/thumbnails/test123.jpg" in resp.text
 
     def test_meta_refresh_present(self):
         """Response includes meta refresh redirect to canonical URL."""
