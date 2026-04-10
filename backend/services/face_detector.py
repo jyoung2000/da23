@@ -554,11 +554,13 @@ def _merge_detections(
 def _verify_faces_in_results(results: list, frame_paths: list) -> list:
     """Run human face verification on all detected faces.
 
-    For each face in each FrameFaces result, check if a human pose
-    (shoulders + neck) is detected below the face. Faces without a
-    human body are marked is_human=False.
+    When USE_STRICT_POSE_MATCHING=true (default), uses per-frame strict
+    containment: the pose nose must be INSIDE the face bbox.
 
-    When USE_HUMAN_VERIFICATION is False or the verifier is unavailable,
+    When USE_STRICT_POSE_MATCHING=false, uses the legacy per-face proximity
+    check for backward compatibility.
+
+    When USE_HUMAN_VERIFICATION=false or the verifier is unavailable,
     all faces are left as is_human=True (fail-open).
     """
     import os
@@ -569,6 +571,10 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
     if not use_verification:
         logger.info("Human face verification disabled (USE_HUMAN_VERIFICATION=false)")
         return results
+
+    use_strict = os.environ.get(
+        "USE_STRICT_POSE_MATCHING", "true"
+    ).lower() in ("true", "1", "yes")
 
     try:
         from backend.services.human_face_verifier import get_verifier
@@ -598,23 +604,33 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
         if frame_bgr is None:
             continue
 
-        for face in fr.faces:
-            is_human, pose_conf = verifier.verify_face(
-                frame_bgr,
-                face.nose_x,
-                face.nose_y,
-                face.width,
-                face.height,
-            )
-            face.is_human = is_human
-            face.pose_confidence = pose_conf
-            verified += 1
-            if not is_human:
-                non_human += 1
+        if use_strict:
+            # Strict mode: per-frame containment check
+            h, w = frame_bgr.shape[:2]
+            verifier.verify_faces_in_frame(frame_bgr, fr.faces, w, h)
+            for face in fr.faces:
+                verified += 1
+                if not face.is_human:
+                    non_human += 1
+        else:
+            # Legacy mode: per-face proximity check
+            for face in fr.faces:
+                is_human, pose_conf = verifier.verify_face(
+                    frame_bgr,
+                    face.nose_x,
+                    face.nose_y,
+                    face.width,
+                    face.height,
+                )
+                face.is_human = is_human
+                face.pose_confidence = pose_conf
+                verified += 1
+                if not is_human:
+                    non_human += 1
 
     logger.info(
-        "Human face verification: %d faces checked, %d non-human detected",
-        verified, non_human,
+        "Human face verification (%s): %d faces checked, %d non-human detected",
+        "strict" if use_strict else "legacy", verified, non_human,
     )
     return results
 
