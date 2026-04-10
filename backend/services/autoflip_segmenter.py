@@ -11,6 +11,7 @@ Key architectural differences from the current segmenter:
 """
 
 import logging
+import os
 from typing import Optional
 
 from backend.services.reframe_segmenter import ReframeSegment
@@ -18,6 +19,8 @@ from backend.services.reframe_segmenter import ReframeSegment
 logger = logging.getLogger(__name__)
 
 SUBJECT_Y_DEFAULT = 40
+
+USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "false").lower() in ("true", "1", "yes")
 
 
 def build_autoflip_segments(
@@ -69,6 +72,42 @@ def build_autoflip_segments(
          len(saliency_keyframes) if saliency_keyframes else 0,
          video_duration, source_width, source_height)
 
+    # ── Intent tracking (feature-flagged) ──
+    intent_timeline = None
+    intent_switches = []
+    if USE_INTENT_TRACKING:
+        from backend.services.content_type_config import get_tuning_from_profile
+        from backend.services.intent_tracker import (
+            IntentSignal, compute_intent_signal,
+            smooth_intent_timeline, derive_switches,
+        )
+        tuning = get_tuning_from_profile(
+            getattr(subject_tracks, '__content_profile__', None)
+            if subject_tracks else None
+        )
+
+        raw = []
+        for df in (dense_faces or []):
+            cands = compute_intent_signal(
+                timestamp=df.timestamp,
+                subject_tracks=subject_tracks or [],
+                active_speaker_events=active_speaker_events or [],
+                dense_faces_at_t=df,
+                saliency_regions_at_t=saliency_regions or [],
+            )
+            raw.append(IntentSignal(timestamp=df.timestamp, candidates=cands))
+
+        intent_timeline = smooth_intent_timeline(raw, ema_alpha=tuning.intent_ema_alpha)
+        intent_switches = derive_switches(
+            intent_timeline,
+            switch_margin=tuning.intent_switch_margin,
+            min_switch_confidence=tuning.intent_min_switch_confidence,
+            job_id=job_id,
+        )
+        _log("intent: %d frames, %d switches (ema=%.2f margin=%.2f)",
+             len(intent_timeline), len(intent_switches),
+             tuning.intent_ema_alpha, tuning.intent_switch_margin)
+
     segments = []
 
     for shot_start, shot_end in shots:
@@ -105,29 +144,57 @@ def build_autoflip_segments(
              shot_start, shot_end, mode.value, len(focus.required), len(focus.optional),
              focus.fits_target_aspect)
 
-        # Determine active_slot from speaker data
-        active_slot = _resolve_active_slot(
-            shot_start, shot_end, active_speaker_events,
-            transcript_segments, speaker_to_slot,
-        )
+        # Determine active_slot from speaker data (legacy) or intent timeline
+        if USE_INTENT_TRACKING and intent_timeline:
+            active_slot = _resolve_active_slot_from_intent(
+                shot_start, shot_end, intent_timeline,
+            )
+        else:
+            active_slot = _resolve_active_slot(
+                shot_start, shot_end, active_speaker_events,
+                transcript_segments, speaker_to_slot,
+            )
 
         if mode == CameraMode.STATIONARY:
             # 2c. Single segment with optimal crop center
             cx, cy = focus.optimal_crop_center
-            segments.append(ReframeSegment(
-                start=shot_start,
-                end=shot_end,
-                subject_x=int(round(cx)),
-                subject_y=int(round(cy)) if cy != 50 else SUBJECT_Y_DEFAULT,
-                layout="single",
-                active_slot=active_slot,
-                confidence=0.0,  # filled by estimator below
-                reason="shot_cut",
-                ease_in_ms=0,
-                strategy="stationary",
-                content_type="unknown",
-                motion_path=None,
-            ))
+
+            # When intent tracking is on, create sub-segments at switch boundaries
+            sub_boundaries = _get_intent_sub_boundaries(
+                shot_start, shot_end, intent_switches, intent_timeline,
+            ) if USE_INTENT_TRACKING and intent_switches else None
+
+            if sub_boundaries and len(sub_boundaries) > 1:
+                for sub_start, sub_end, sub_slot in sub_boundaries:
+                    segments.append(ReframeSegment(
+                        start=sub_start,
+                        end=sub_end,
+                        subject_x=int(round(cx)),
+                        subject_y=int(round(cy)) if cy != 50 else SUBJECT_Y_DEFAULT,
+                        layout="single",
+                        active_slot=sub_slot,
+                        confidence=0.0,
+                        reason="intent_switch" if sub_start > shot_start else "shot_cut",
+                        ease_in_ms=0,
+                        strategy="stationary",
+                        content_type="unknown",
+                        motion_path=None,
+                    ))
+            else:
+                segments.append(ReframeSegment(
+                    start=shot_start,
+                    end=shot_end,
+                    subject_x=int(round(cx)),
+                    subject_y=int(round(cy)) if cy != 50 else SUBJECT_Y_DEFAULT,
+                    layout="single",
+                    active_slot=active_slot,
+                    confidence=0.0,
+                    reason="shot_cut",
+                    ease_in_ms=0,
+                    strategy="stationary",
+                    content_type="unknown",
+                    motion_path=None,
+                ))
 
         elif mode in (CameraMode.TRACKING, CameraMode.PANNING):
             # 2d. Optimize trajectory
@@ -150,20 +217,43 @@ def build_autoflip_segments(
             motion_path = [(t, x, SUBJECT_Y_DEFAULT) for t, x in optimized] if len(optimized) >= 2 else None
 
             cx = int(round(focus.optimal_crop_center[0]))
-            segments.append(ReframeSegment(
-                start=shot_start,
-                end=shot_end,
-                subject_x=cx,
-                subject_y=SUBJECT_Y_DEFAULT,
-                layout="single",
-                active_slot=active_slot,
-                confidence=0.0,
-                reason="shot_cut",
-                ease_in_ms=0,
-                strategy=mode.value,
-                content_type="unknown",
-                motion_path=motion_path,
-            ))
+
+            # Sub-segments share the same motion_path and mode
+            sub_boundaries = _get_intent_sub_boundaries(
+                shot_start, shot_end, intent_switches, intent_timeline,
+            ) if USE_INTENT_TRACKING and intent_switches else None
+
+            if sub_boundaries and len(sub_boundaries) > 1:
+                for sub_start, sub_end, sub_slot in sub_boundaries:
+                    segments.append(ReframeSegment(
+                        start=sub_start,
+                        end=sub_end,
+                        subject_x=cx,
+                        subject_y=SUBJECT_Y_DEFAULT,
+                        layout="single",
+                        active_slot=sub_slot,
+                        confidence=0.0,
+                        reason="intent_switch" if sub_start > shot_start else "shot_cut",
+                        ease_in_ms=0,
+                        strategy=mode.value,
+                        content_type="unknown",
+                        motion_path=motion_path,
+                    ))
+            else:
+                segments.append(ReframeSegment(
+                    start=shot_start,
+                    end=shot_end,
+                    subject_x=cx,
+                    subject_y=SUBJECT_Y_DEFAULT,
+                    layout="single",
+                    active_slot=active_slot,
+                    confidence=0.0,
+                    reason="shot_cut",
+                    ease_in_ms=0,
+                    strategy=mode.value,
+                    content_type="unknown",
+                    motion_path=motion_path,
+                ))
 
         elif mode == CameraMode.PADDING:
             # 2e. Blur fill segment
@@ -258,6 +348,67 @@ def _resolve_active_slot(
             return slot_time.most_common(1)[0][0]
 
     return None
+
+
+def _resolve_active_slot_from_intent(
+    start: float,
+    end: float,
+    intent_timeline: list,
+) -> Optional[int]:
+    """Find the dominant chosen_id from the intent timeline within [start, end]."""
+    from collections import Counter
+    slot_count = Counter()
+    for sig in intent_timeline:
+        if sig.timestamp < start or sig.timestamp > end:
+            continue
+        if sig.chosen_id is not None:
+            slot_count[sig.chosen_id] += 1
+    if slot_count:
+        return slot_count.most_common(1)[0][0]
+    return None
+
+
+def _get_intent_sub_boundaries(
+    shot_start: float,
+    shot_end: float,
+    intent_switches: list,
+    intent_timeline: list,
+) -> list:
+    """Build sub-segment boundaries from intent switches within a shot.
+
+    Returns [(sub_start, sub_end, active_slot), ...] or None if no switches
+    fall within this shot. Sub-segments share the parent shot's camera mode.
+    """
+    # Find switches within this shot (exclude initial switches)
+    shot_switches = [
+        sw for sw in intent_switches
+        if shot_start < sw.timestamp < shot_end and sw.from_id is not None
+    ]
+    if not shot_switches:
+        return None
+
+    # Determine the initial slot (from the intent timeline at shot_start)
+    initial_slot = None
+    for sig in intent_timeline:
+        if sig.timestamp >= shot_start:
+            initial_slot = sig.chosen_id
+            break
+
+    boundaries = []
+    prev_start = shot_start
+    prev_slot = initial_slot
+
+    for sw in sorted(shot_switches, key=lambda s: s.timestamp):
+        if sw.timestamp > prev_start:
+            boundaries.append((prev_start, sw.timestamp, prev_slot))
+        prev_start = sw.timestamp
+        prev_slot = sw.to_id
+
+    # Final sub-segment to shot end
+    if prev_start < shot_end:
+        boundaries.append((prev_start, shot_end, prev_slot))
+
+    return boundaries if len(boundaries) > 1 else None
 
 
 def _build_hard_constraints(required_features, source_width, source_height, target_aspect):
