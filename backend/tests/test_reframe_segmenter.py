@@ -132,7 +132,7 @@ def _make_registry_4():
 # ── Tests ──
 
 class TestStability:
-    """1. Single-speaker 30s clip with noisy dense data → 1 segment, subject_x=56."""
+    """1. Single-speaker 30s clip with noisy dense data → 1 segment, stable subject_x."""
 
     def test_single_speaker_no_jitter(self):
         random.seed(42)
@@ -152,7 +152,9 @@ class TestStability:
         )
 
         assert len(segments) == 1
-        assert segments[0].subject_x == 56
+        # subject_x is now in pixel space: 56/100 * 1920 = 1075.2
+        expected_px = 56.0 / 100.0 * 1920
+        assert abs(segments[0].subject_x - expected_px) < 1.0
 
 
 class TestTurnTaking:
@@ -356,7 +358,8 @@ class TestWideMasterOnCrowd:
         # Should have wide master for this segment
         wide_segs = [s for s in segments if s.layout == "wide_master"]
         assert len(wide_segs) >= 1, "Should have at least one WIDE_MASTER segment"
-        assert wide_segs[0].subject_x == WIDE_MASTER_X
+        # subject_x is now in pixel space: center = 1920/2 = 960
+        assert abs(wide_segs[0].subject_x - 960.0) < 1.0
 
 
 class TestAnticipation:

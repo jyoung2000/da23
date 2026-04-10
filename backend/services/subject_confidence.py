@@ -415,8 +415,13 @@ def face_in_proposed_crop(seg, face_registry, dense_faces,
     else:
         crop_w_pct = 100.0
 
-    crop_x_min = seg.subject_x - crop_w_pct / 2
-    crop_x_max = seg.subject_x + crop_w_pct / 2
+    # subject_x may be in pixel space (>100) or legacy 0-100 space
+    sx = seg.subject_x
+    if isinstance(sx, float) and sx > 100.0:
+        sx = sx / source_width * 100.0  # convert to 0-100
+
+    crop_x_min = sx - crop_w_pct / 2
+    crop_x_max = sx + crop_w_pct / 2
     if crop_x_min < 0:
         crop_x_min = 0
         crop_x_max = crop_w_pct

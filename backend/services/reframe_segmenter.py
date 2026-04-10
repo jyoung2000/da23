@@ -57,8 +57,8 @@ EASE_SUBJECT_WALK_MS = 250
 class ReframeSegment:
     start: float              # seconds
     end: float                # seconds, end - start >= MIN_HOLD
-    subject_x: int            # 0-100, snapped to a face slot OR 50 for wide
-    subject_y: int            # 0-100, default 40 (rule of thirds, eyes upper third)
+    subject_x: float          # Source pixel x-coordinate (pixel-precise crop center)
+    subject_y: float          # Source pixel y-coordinate (pixel-precise crop center)
     layout: str               # "single" | "split" | "triple" | "wide_master" | "blur_fill" | "stacked_gameplay" | "grid"
     active_slot: Optional[int]  # which face registry slot, or None for wide
     confidence: float         # 0..1
@@ -236,13 +236,13 @@ def build_reframe_segments(
             dense_faces, face_registry,
         )
 
-        subject_x = _slot_to_x(active_slot, face_registry)
+        subject_x = _slot_to_x(active_slot, face_registry, source_width)
 
         raw_segments.append(ReframeSegment(
             start=seg_start,
             end=seg_end,
             subject_x=subject_x,
-            subject_y=SUBJECT_Y_DEFAULT,
+            subject_y=SUBJECT_Y_DEFAULT / 100.0 * source_height,
             layout=layout,
             active_slot=active_slot,
             confidence=confidence,
@@ -316,7 +316,7 @@ def build_reframe_segments(
                     seg.layout = "wide_master"
                     seg.strategy = "wide_master"
                     seg.active_slot = None
-                    seg.subject_x = WIDE_MASTER_X
+                    seg.subject_x = source_width / 2.0
                     seg.reason = "wide_fallback"
                     seg.confidence = 0.8
                     wide_count += 1
@@ -335,7 +335,7 @@ def build_reframe_segments(
                 seg.layout = "wide_master"
                 seg.strategy = "wide_master"
                 seg.active_slot = None
-                seg.subject_x = WIDE_MASTER_X
+                seg.subject_x = source_width / 2.0
                 seg.reason = "wide_fallback"
                 seg.confidence = 0.8
                 wide_count += 1
@@ -363,7 +363,7 @@ def build_reframe_segments(
                 seg.layout = "wide_master"
                 seg.strategy = "wide_master"
                 seg.active_slot = None
-                seg.subject_x = WIDE_MASTER_X
+                seg.subject_x = source_width / 2.0
                 seg.reason = "action_sequence"
                 action_wide_count += 1
 
@@ -404,8 +404,10 @@ def build_reframe_segments(
                     last_confident_slot = seg.active_slot
                 continue
 
+            # Confidence estimator works in 0-100 space; convert at boundary
+            _sx_pct = int(round(seg.subject_x / source_width * 100.0))
             conf, conf_reason = _confidence_estimator.evaluate(
-                seg.start, seg.end, seg.active_slot, seg.subject_x,
+                seg.start, seg.end, seg.active_slot, _sx_pct,
             )
             seg.confidence = conf
 
@@ -418,18 +420,21 @@ def build_reframe_segments(
             # Apply fallback ladder
             try:
                 from backend.services.subject_confidence import get_fallback_strategy
+                _last_x_pct = int(round(last_confident_x / source_width * 100.0)) if last_confident_x is not None else None
+                _cand_x_pct = int(round(seg.subject_x / source_width * 100.0))
                 fallback = get_fallback_strategy(
                     conf, ct,
-                    last_confident_x=last_confident_x,
+                    last_confident_x=_last_x_pct,
                     last_confident_slot=last_confident_slot,
-                    candidate_x=seg.subject_x,
+                    candidate_x=_cand_x_pct,
                     candidate_slot=seg.active_slot,
                 )
                 if fallback is not None:
-                    strategy, layout, subject_x, active_slot, reason = fallback
+                    strategy, layout, fb_x_pct, active_slot, reason = fallback
                     seg.strategy = strategy
                     seg.layout = layout
-                    seg.subject_x = subject_x
+                    # Convert fallback subject_x from 0-100 back to pixel space
+                    seg.subject_x = float(fb_x_pct) / 100.0 * source_width
                     seg.active_slot = active_slot
                     seg.reason = reason
                     seg.subject_source = "last_known" if "inherit" in reason else "hardcoded_center"
@@ -479,7 +484,7 @@ def build_reframe_segments(
                     seg.strategy = "wide_master"
                     seg.layout = "wide_master"
                     seg.active_slot = None
-                    seg.subject_x = WIDE_MASTER_X
+                    seg.subject_x = source_width / 2.0
                     seg.reason = "chaotic_motion"
         except Exception as e:
             logger.warning("[%s] Motion tracking failed (non-fatal): %s", job_id, e)
@@ -559,9 +564,9 @@ def build_reframe_segments(
         else:
             seg.ease_in_ms = 0
 
-    # ── Stage 7: Position snapping ──
+    # ── Stage 7: Position snapping (pixel-precise) ──
     for seg in raw_segments:
-        seg.subject_x = _slot_to_x(seg.active_slot, face_registry)
+        seg.subject_x = _slot_to_x(seg.active_slot, face_registry, source_width)
 
     # ── Stage 8: Lead-room application (narrative/vlog) ──
     lead_room_count = 0
@@ -573,7 +578,10 @@ def build_reframe_segments(
                     continue
                 gaze = estimate_gaze_from_dense(dense_faces, seg.active_slot, seg.start, seg.end)
                 if gaze != "center":
-                    seg.subject_x = _apply_lr(seg.subject_x, gaze)
+                    # apply_lead_room works in 0-100 space; convert at boundary
+                    sx_pct = seg.subject_x / source_width * 100.0
+                    adjusted_pct = _apply_lr(int(round(sx_pct)), gaze)
+                    seg.subject_x = adjusted_pct / 100.0 * source_width
                     seg.lead_room_direction = gaze
                     lead_room_count += 1
         except Exception as e:
@@ -611,11 +619,13 @@ def build_reframe_segments(
     _log("  strategies: %s", strategy_str)
 
     x_parts = []
+    wide_px = source_width / 2.0
     if face_registry:
         for slot in face_registry.slots:
-            x_parts.append(f"slot{slot.slot_id}={int(round(slot.x_center))}")
-    if WIDE_MASTER_X in unique_x:
-        x_parts.append(f"wide={WIDE_MASTER_X}")
+            slot_px = slot.x_center / 100.0 * source_width
+            x_parts.append(f"slot{slot.slot_id}={slot_px:.1f}px")
+    if any(abs(x - wide_px) < 1.0 for x in unique_x):
+        x_parts.append(f"wide={wide_px:.0f}px")
     _log("  unique_x: %d (%s)", len(unique_x), ", ".join(x_parts))
     _log("  slots: {%s}", slot_str)
     if lead_room_count > 0:
@@ -642,7 +652,7 @@ def build_reframe_segments(
         except Exception:
             in_crop = "unknown"
         logger.info(
-            "[reframe] segment t=%.2f-%.2f strategy=%s subject_x=%d subject_y=%d "
+            "[reframe] segment t=%.2f-%.2f strategy=%s subject_x=%.1f subject_y=%.1f "
             "source_path=%s face_slots=%s active_slot=%s "
             "confidence=%.2f fallback_reason=%s face_in_crop_rect=%s",
             seg.start, seg.end, seg.strategy, seg.subject_x, seg.subject_y,
@@ -1016,15 +1026,20 @@ def _is_multi_speaker_crowd(
     return active_slots >= 3
 
 
-def _slot_to_x(active_slot: Optional[int], face_registry) -> int:
-    """Convert a slot id to subject_x. Returns WIDE_MASTER_X for None."""
+def _slot_to_x(active_slot: Optional[int], face_registry, source_width: int = 1920) -> float:
+    """Convert a slot id to pixel-precise subject_x.
+
+    Returns source pixel coordinate for the face slot's center,
+    or the source center pixel for None (wide fallback).
+    """
     if active_slot is None:
-        return WIDE_MASTER_X
+        return source_width / 2.0  # center pixel
     if face_registry:
         slot = face_registry.slot_by_id(active_slot)
         if slot:
-            return int(round(slot.x_center))
-    return WIDE_MASTER_X
+            # x_center is 0-100 in the face registry; convert to pixels
+            return slot.x_center / 100.0 * source_width
+    return source_width / 2.0  # center pixel
 
 
 def _merge_short_segment(

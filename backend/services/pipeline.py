@@ -2627,13 +2627,16 @@ async def _run_analysis_inner(job_id: str):
                     ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
                     for seg in reframe_segments:
                         _desc = f"[autoflip:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}:{seg.confidence:.2f}]"
+                        # Convert pixel-space subject_x/y to 0-100 int for SceneDescription
+                        _sx_int = int(round(seg.subject_x / source_width * 100.0)) if source_width > 0 else 50
+                        _asx = _sx_int if seg.active_slot is not None else None
                         ai_scenes.append(SceneDescription(
                             timestamp=float(seg.start),
                             description=_desc,
                             importance_score=5,
                             thumbnail_path="",
-                            subject_x=seg.subject_x,
-                            active_speaker_x=seg.subject_x if seg.active_slot is not None else None,
+                            subject_x=_sx_int,
+                            active_speaker_x=_asx,
                             layout_mode=seg.layout,
                             precise_x=float(seg.subject_x),
                             precise_y=float(seg.subject_y),
@@ -2719,13 +2722,16 @@ async def _run_analysis_inner(job_id: str):
                     ai_scenes = [s for s in scenes if s.description != "[dense face tracking]"]
                     for seg in reframe_segments:
                         _desc = f"[reframe:{seg.reason}:{seg.ease_in_ms}:{seg.strategy}:{seg.confidence:.2f}:{seg.subject_source or 'unknown'}]"
+                        # Convert pixel-space subject_x/y to 0-100 int for SceneDescription
+                        _sx_int = int(round(seg.subject_x / source_width * 100.0)) if source_width > 0 else 50
+                        _asx = _sx_int if seg.active_slot is not None else None
                         ai_scenes.append(SceneDescription(
                             timestamp=float(seg.start),
                             description=_desc,
                             importance_score=5,
                             thumbnail_path="",
-                            subject_x=seg.subject_x,
-                            active_speaker_x=seg.subject_x if seg.active_slot is not None else None,
+                            subject_x=_sx_int,
+                            active_speaker_x=_asx,
                             layout_mode=seg.layout,
                             precise_x=float(seg.subject_x),
                             precise_y=float(seg.subject_y),

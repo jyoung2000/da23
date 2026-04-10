@@ -277,7 +277,7 @@ class SceneDeleteResponse(BaseModel):
 class RecenterResponse(BaseModel):
     job_id: str
     scenes_recentered: int
-    subject_x: int = 50
+    subject_x: float = 50.0
     per_scene: bool = False
     message: str = ""
 

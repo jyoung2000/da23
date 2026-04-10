@@ -326,13 +326,18 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
 
 
 def _compute_crop_rect(
-    subject_x: int,
-    subject_y: int,
+    subject_x,
+    subject_y,
     source_w: int,
     source_h: int,
     target_aspect: float,
 ) -> Rect:
     """Compute a normalized crop Rect for a 9:16 (or other) window.
+
+    subject_x/subject_y can be:
+      - Pixel values (float > 100 or float when source dims known)
+      - Legacy 0-100 scale (int)
+    Auto-detects based on value range and type.
 
     For vertical crops (target narrower than source):
       - Crop width determined by target aspect and source height
@@ -344,15 +349,28 @@ def _compute_crop_rect(
     """
     src_aspect = source_w / source_h if source_h > 0 else 1.0
 
+    # Normalize subject_x/y to 0.0-1.0 range
+    # If subject_x is in pixel space (> 100 or float), convert to normalized
+    sx = float(subject_x)
+    sy = float(subject_y)
+    if sx > 100.0 or (isinstance(subject_x, float) and source_w > 0 and sx > 1.0):
+        # Pixel space → normalized
+        center_x = sx / source_w
+    else:
+        # Legacy 0-100 space → normalized
+        center_x = sx / 100.0
+
+    if sy > 100.0 or (isinstance(subject_y, float) and source_h > 0 and sy > 1.0):
+        center_y = sy / source_h
+    else:
+        center_y = sy / 100.0
+
     if target_aspect < src_aspect:
         # Vertical crop: narrower than source (e.g., 9:16 from 16:9)
         crop_w_norm = (target_aspect * source_h) / source_w
         crop_h_norm = 1.0
 
-        # Center on subject_x (0-100 scale -> 0.0-1.0)
-        center_x = subject_x / 100.0
         x = center_x - crop_w_norm / 2.0
-
         # Clamp to [0, 1 - crop_w_norm]
         x = max(0.0, min(x, 1.0 - crop_w_norm))
         y = 0.0
@@ -363,7 +381,6 @@ def _compute_crop_rect(
         crop_h_norm = min(1.0, crop_h_norm)
 
         x = 0.0
-        center_y = subject_y / 100.0
         y = center_y - crop_h_norm / 2.0
         y = max(0.0, min(y, 1.0 - crop_h_norm))
 
