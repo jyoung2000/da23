@@ -25,6 +25,7 @@ def aggregate_scene_focus(
     target_aspect: float = 9 / 16,
     saliency_regions: list = None,
     object_detections: list = None,
+    subject_tracks: list = None,
     job_id: str = "",
 ) -> SceneFocusRegion:
     """Collect all required and non-required features in [shot_start, shot_end],
@@ -171,6 +172,37 @@ def aggregate_scene_focus(
                 must_be_in_frame=False,
             ))
 
+    # 3.7. Subject tracks (face_confirmed and face_like_promoted)
+    if subject_tracks:
+        for track in subject_tracks:
+            # Only include tracks whose trajectory overlaps this shot
+            if track.t_end < shot_start or track.t_start >= shot_end:
+                continue
+
+            if track.source == "face_like_promoted":
+                kind = FeatureKind.FACE_LIKE
+                must_be_in_frame = True
+            elif track.source == "face_confirmed":
+                kind = FeatureKind.FACE
+                must_be_in_frame = True
+            else:
+                continue
+
+            for (t, x, y, w, h) in track.bbox_trajectory:
+                if t < shot_start or t >= shot_end:
+                    continue
+                feature = RequiredFeature(
+                    t_start=float(t),
+                    t_end=float(t),
+                    x=float(x), y=float(y),
+                    w=float(w), h=float(h),
+                    kind=kind,
+                    weight=float(track.confidence),
+                    must_be_in_frame=must_be_in_frame,
+                    identity=int(track.persistent_id) if track.persistent_id >= 0 else None,
+                )
+                required.append(feature)
+
     # 4. Compute min bounding rect over required features
     if required:
         min_left = min(rf.left for rf in required)
@@ -221,8 +253,10 @@ def aggregate_scene_focus(
 
     # 7. Per-frame targets
     per_frame_target = []
+    # Collect all timestamps that have required features
+    timestamps_seen = set()
+
     if dense_faces:
-        timestamps_seen = set()
         for df in dense_faces:
             if df.timestamp < shot_start or df.timestamp >= shot_end:
                 continue
@@ -230,7 +264,6 @@ def aggregate_scene_focus(
                 continue
             timestamps_seen.add(df.timestamp)
 
-            # Weighted centroid of required features visible at this timestamp
             visible = [rf for rf in required if rf.must_be_in_frame and
                        abs(rf.t_start - df.timestamp) < 0.01]
             if visible:
@@ -241,6 +274,27 @@ def aggregate_scene_focus(
                 else:
                     tx, ty = optimal_crop_center
                 per_frame_target.append((df.timestamp, tx, ty))
+
+    # Also add per-frame targets from subject tracks (for faceless content)
+    if subject_tracks:
+        for track in subject_tracks:
+            for (t, x, y, w, h) in track.bbox_trajectory:
+                if t < shot_start or t >= shot_end:
+                    continue
+                if t in timestamps_seen:
+                    continue
+                timestamps_seen.add(t)
+                visible = [rf for rf in required if rf.must_be_in_frame and
+                           abs(rf.t_start - t) < 0.01]
+                if visible:
+                    total_w = sum(rf.weight for rf in visible)
+                    if total_w > 0:
+                        tx = sum(rf.x * rf.weight for rf in visible) / total_w
+                        ty = sum(rf.y * rf.weight for rf in visible) / total_w
+                    else:
+                        tx, ty = optimal_crop_center
+                    per_frame_target.append((t, tx, ty))
+        per_frame_target.sort(key=lambda pft: pft[0])
 
     return SceneFocusRegion(
         shot_start=shot_start,
