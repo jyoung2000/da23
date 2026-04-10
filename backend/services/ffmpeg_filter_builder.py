@@ -36,6 +36,7 @@ def build_ffmpeg_command(
     source_path: str,
     output_path: str,
     use_gpu: bool = True,
+    interpolated_timeline=None,
 ) -> Tuple[List[str], str]:
     """Build an FFmpeg command from a RenderPlan.
 
@@ -43,7 +44,7 @@ def build_ffmpeg_command(
         (cmd_args_list, filter_script_path) — the script path should be
         cleaned up after ffmpeg finishes.
     """
-    filter_graph = _build_filter_graph(plan)
+    filter_graph = _build_filter_graph(plan, interpolated_timeline=interpolated_timeline)
     script_path = _write_filter_script(filter_graph)
 
     cmd = []
@@ -85,7 +86,7 @@ def build_ffmpeg_command(
     return cmd, script_path
 
 
-def _build_filter_graph(plan: RenderPlan) -> str:
+def _build_filter_graph(plan: RenderPlan, interpolated_timeline=None) -> str:
     """Build the complete filter_complex string for a RenderPlan."""
     lines = []
     op_labels = []  # [v0], [v1], ...
@@ -95,7 +96,8 @@ def _build_filter_graph(plan: RenderPlan) -> str:
     tgt_h = plan.target_height
 
     for i, op in enumerate(plan.ops):
-        op_filter = _build_op_filter(op, i, src_w, src_h, tgt_w, tgt_h)
+        op_filter = _build_op_filter(op, i, src_w, src_h, tgt_w, tgt_h,
+                                     interpolated_timeline=interpolated_timeline)
         lines.append(op_filter)
         op_labels.append(f"[v{i}]")
 
@@ -122,6 +124,7 @@ def _build_op_filter(
     src_h: int,
     tgt_w: int,
     tgt_h: int,
+    interpolated_timeline=None,
 ) -> str:
     """Build the filter chain for a single RenderOp."""
     label = f"v{index}"
@@ -131,6 +134,13 @@ def _build_op_filter(
     if op.kind == RenderOpKind.CROP:
         return _filter_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind == RenderOpKind.TRACKING_CROP:
+        if interpolated_timeline is not None:
+            result = _filter_tracking_crop_from_timeline(
+                op, label, src_w, src_h, tgt_w, tgt_h, start, end,
+                interpolated_timeline,
+            )
+            if result is not None:
+                return result
         return _filter_tracking_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end)
     elif op.kind == RenderOpKind.WIDE_MASTER:
         return _filter_wide_master(op, label, tgt_w, tgt_h, start, end)
@@ -175,6 +185,84 @@ def _filter_tracking_crop(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> 
     return (
         f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
         f"crop={pw}:{ph}:{x_expr_clamped}:0,"
+        f"scale={tgt_w}:{tgt_h}:flags=lanczos[{label}]"
+    )
+
+
+FFMPEG_EXPR_MAX_LEN = 8000  # FFmpeg expression parser limit
+
+
+def _filter_tracking_crop_from_timeline(
+    op, label, src_w, src_h, tgt_w, tgt_h, start, end,
+    interpolated_timeline,
+) -> str:
+    """Build a TRACKING_CROP filter from interpolated timeline samples.
+
+    Returns None if timeline doesn't have enough samples, falling back
+    to the standard piecewise expression.
+    """
+    # Pull per-frame samples from the timeline within this op's range
+    samples = []
+    for s in interpolated_timeline.samples:
+        if s.timestamp < start or s.timestamp > end:
+            continue
+        if not s.bboxes:
+            continue
+        # Use the first available slot's bbox center
+        slot_id, bbox = next(iter(s.bboxes.items()))
+        cx_pct, cy_pct, _, _ = bbox
+        samples.append((s.timestamp - start, cx_pct))  # Rebased to 0
+
+    if len(samples) < 2:
+        return None
+
+    first_rect = op.motion_path[0].rect if op.motion_path else op.primary_rect
+    _, _, pw, ph = first_rect.to_pixels(src_w, src_h)
+    max_x = src_w - pw
+
+    # Downsample if expression would be too long
+    # Each segment adds ~60 chars: "if(between(t,0.033,0.067),100.0+(5.0)*(t-0.033)/(0.033),"
+    max_segments = FFMPEG_EXPR_MAX_LEN // 65
+    if len(samples) - 1 > max_segments:
+        step = max(1, len(samples) // max_segments)
+        downsampled = samples[::step]
+        if downsampled[-1] != samples[-1]:
+            downsampled.append(samples[-1])
+        logger.warning(
+            "FFmpeg timeline expression downsampled from %d to %d samples "
+            "(max expression length %d chars)",
+            len(samples), len(downsampled), FFMPEG_EXPR_MAX_LEN,
+        )
+        samples = downsampled
+
+    # Build piecewise-linear expression
+    expr_parts = []
+    for i in range(len(samples) - 1):
+        t0, x0_pct = samples[i]
+        t1, x1_pct = samples[i + 1]
+        x0_px = (x0_pct / 100 * src_w) - pw / 2
+        x1_px = (x1_pct / 100 * src_w) - pw / 2
+        dt = t1 - t0
+        if dt <= 0:
+            continue
+        dx = x1_px - x0_px
+        if dx == 0:
+            seg_expr = f"{x0_px:.1f}"
+        else:
+            seg_expr = f"{x0_px:.1f}+{dx:.1f}*(t-{t0:.3f})/{dt:.3f}"
+        expr_parts.append(f"if(between(t\\,{t0:.3f}\\,{t1:.3f})\\,{seg_expr}\\,")
+
+    if not expr_parts:
+        return None
+
+    # Final fallback value (last sample's position)
+    last_x_px = (samples[-1][1] / 100 * src_w) - pw / 2
+    expr = "".join(expr_parts) + f"{last_x_px:.1f}" + ")" * len(expr_parts)
+    expr_clamped = f"clip({expr}\\,0\\,{max_x})"
+
+    return (
+        f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS,"
+        f"crop={pw}:{ph}:{expr_clamped}:0,"
         f"scale={tgt_w}:{tgt_h}:flags=lanczos[{label}]"
     )
 
