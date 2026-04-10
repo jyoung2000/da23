@@ -1664,7 +1664,22 @@ export default function ClipSEO() {
                   <button
                     onClick={() => {
                       const shareUrl = `${window.location.origin}/share/clip/${jobId}/${clipId}`;
-                      copyToClipboard(shareUrl, 'share');
+                      const ta = document.createElement('textarea');
+                      ta.value = shareUrl;
+                      ta.style.position = 'fixed';
+                      ta.style.left = '-9999px';
+                      ta.style.opacity = '0';
+                      document.body.appendChild(ta);
+                      ta.focus();
+                      ta.select();
+                      try {
+                        document.execCommand('copy');
+                        setCopied('share');
+                        setTimeout(() => setCopied(null), 2000);
+                      } catch (err) {
+                        // silent fallback
+                      }
+                      document.body.removeChild(ta);
                     }}
                     style={{
                       padding: '6px 14px', fontSize: 11, fontWeight: 600,

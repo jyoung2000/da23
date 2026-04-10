@@ -277,6 +277,7 @@ export default function Analysis() {
   const [clipPreview, setClipPreview] = useState(null);
   const [videoCurrentTime, setVideoCurrentTime] = useState(0);
   const [cancellingJob, setCancellingJob] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
   const [selectedClips, setSelectedClips] = useState(new Set());
   const [filters, setFilters] = useState({ minScore: 0, platform: 'all', type: 'all', sort: 'viral_score' });
   const wsRef = useRef(null);
@@ -2636,26 +2637,39 @@ export default function Analysis() {
           <button
             onClick={() => {
               const shareUrl = `${window.location.origin}/share/analysis/${jobId}`;
-              navigator.clipboard.writeText(shareUrl).then(() => {
+              const ta = document.createElement('textarea');
+              ta.value = shareUrl;
+              ta.style.position = 'fixed';
+              ta.style.left = '-9999px';
+              ta.style.opacity = '0';
+              document.body.appendChild(ta);
+              ta.focus();
+              ta.select();
+              try {
+                document.execCommand('copy');
+                setShareCopied(true);
                 showToast('Share link copied!', 'success');
-              }).catch(() => {
+                setTimeout(() => setShareCopied(false), 2000);
+              } catch (err) {
                 showToast('Failed to copy link', 'error');
-              });
+              }
+              document.body.removeChild(ta);
             }}
             style={{
               marginLeft: 'auto',
               padding: '3px 10px',
               fontSize: 11,
               fontWeight: 500,
-              background: 'var(--bg-elevated)',
-              border: '1px solid var(--border)',
-              color: 'var(--text-secondary)',
+              background: shareCopied ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
+              border: `1px solid ${shareCopied ? 'var(--accent-cyan)' : 'var(--border)'}`,
+              color: shareCopied ? 'var(--bg-base)' : 'var(--text-secondary)',
               borderRadius: 'var(--radius-sm)',
               cursor: 'pointer',
               whiteSpace: 'nowrap',
+              transition: 'all 0.15s ease',
             }}
           >
-            Share
+            {shareCopied ? 'Copied!' : 'Share'}
           </button>
         )}
       </div>
