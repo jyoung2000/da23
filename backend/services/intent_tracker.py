@@ -114,3 +114,68 @@ def smooth_intent_timeline(
         output.append(sig)
 
     return output
+
+
+@dataclass
+class SubjectSwitch:
+    """Record of a subject switch decision."""
+    timestamp: float
+    from_id: Optional[int]
+    to_id: int
+    conf_from: float
+    conf_to: float
+    margin: float
+    reason: str
+
+
+def derive_switches(
+    smoothed_signals: list,
+    switch_margin: float = 0.15,
+    min_switch_confidence: float = 0.35,
+    job_id: str = "",
+) -> list:
+    """Walk smoothed timeline, emit a SubjectSwitch whenever a new candidate
+    sustainably exceeds the current chosen subject by `switch_margin`.
+
+    The switch_margin replaces every hardcoded hold threshold in the codebase.
+    There is no time-based hold — holding emerges naturally when no candidate
+    exceeds the current one by margin.
+    """
+    switches = []
+    current_id = None
+
+    for sig in smoothed_signals:
+        if not sig.smoothed:
+            sig.chosen_id = current_id
+            sig.chosen_confidence = 0.0
+            continue
+
+        best_id, best_conf = max(sig.smoothed.items(), key=lambda kv: kv[1])
+
+        if current_id is None:
+            if best_conf >= min_switch_confidence:
+                current_id = best_id
+                switches.append(SubjectSwitch(
+                    timestamp=sig.timestamp, from_id=None, to_id=best_id,
+                    conf_from=0.0, conf_to=best_conf,
+                    margin=best_conf, reason="initial",
+                ))
+        elif best_id != current_id:
+            current_conf = sig.smoothed.get(current_id, 0.0)
+            margin = best_conf - current_conf
+            if margin >= switch_margin and best_conf >= min_switch_confidence:
+                logger.info("[%s] subject_switch t=%.2f from=%s to=%s "
+                            "conf_old=%.2f conf_new=%.2f margin=%.2f",
+                            job_id, sig.timestamp, current_id, best_id,
+                            current_conf, best_conf, margin)
+                switches.append(SubjectSwitch(
+                    timestamp=sig.timestamp, from_id=current_id, to_id=best_id,
+                    conf_from=current_conf, conf_to=best_conf,
+                    margin=margin, reason="confidence_overtook",
+                ))
+                current_id = best_id
+
+        sig.chosen_id = current_id
+        sig.chosen_confidence = sig.smoothed.get(current_id, 0.0) if current_id is not None else 0.0
+
+    return switches
