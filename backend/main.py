@@ -16,6 +16,7 @@ from backend.routers import agent as agent_router
 from backend.routers import media as media_router
 from backend.routers import chunked_upload
 from backend.routers import diagnostics as diagnostics_router
+from backend.routers import thumbnails as thumbnails_router
 from backend.routers.api_v1 import router as api_v1_router
 
 LOG_FILE = "/data/logs/app.log"
@@ -376,6 +377,7 @@ app.include_router(ws.router)
 app.include_router(agent_router.router)
 app.include_router(media_router.router)
 app.include_router(diagnostics_router.router)
+app.include_router(thumbnails_router.router)
 app.include_router(api_v1_router)
 
 # Mount MCP server at /mcp (if mcp package is available)
