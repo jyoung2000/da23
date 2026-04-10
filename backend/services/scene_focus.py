@@ -316,6 +316,16 @@ def aggregate_scene_focus(
                     ty = sum(rf.y * rf.weight for rf in visible) / total_w
                 else:
                     tx, ty = optimal_crop_center
+                # Fix 4: min_face_margin = 0.10 -- keep at least 10% padding
+                # around the widest visible face. If tx drifts too far from
+                # the face center, clamp it so the face + margin cannot fall
+                # outside the crop window.
+                widest = max(visible, key=lambda rf: (rf.right - rf.left))
+                face_cx = (widest.left + widest.right) / 2.0
+                face_half = (widest.right - widest.left) / 2.0
+                max_drift = face_half + 10.0  # 10 frame-pct units of padding
+                if abs(tx - face_cx) > max_drift:
+                    tx = face_cx + (max_drift if tx > face_cx else -max_drift)
                 per_frame_target.append((df.timestamp, tx, ty))
 
     # Also add per-frame targets from subject tracks (for faceless content)

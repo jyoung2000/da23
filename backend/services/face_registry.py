@@ -138,7 +138,8 @@ def build_face_registry(
         for face in fr.faces:
             # is_human: weight down rather than gate (Bug C fix)
             is_human = getattr(face, 'is_human', True)
-            if REGISTRY_USE_HUMAN_WEIGHT:
+            _drop = _should_drop_non_human_cached(face_results)
+            if REGISTRY_USE_HUMAN_WEIGHT and not _drop:
                 weight = 1.0 if is_human else 0.35
                 if not is_human:
                     non_human_kept += 1
@@ -476,7 +477,7 @@ def build_face_registry_with_embeddings(
     for fi, fr in enumerate(face_results):
         for face in fr.faces:
             is_human = getattr(face, 'is_human', True)
-            if REGISTRY_USE_HUMAN_WEIGHT:
+            if REGISTRY_USE_HUMAN_WEIGHT and not _should_drop_non_human_cached(face_results):
                 if not is_human:
                     non_human_kept += 1
             else:
@@ -690,21 +691,34 @@ def build_face_registry_with_embeddings(
             )
             return build_face_registry(face_results, min_appearances)
 
-    # Take max(embedding_count, position_count): whichever finds more identities wins.
-    # Embeddings are the primary source of truth, but position-based may catch
-    # speakers that the embedding clusterer missed (e.g., no embeddings available).
+    # Fix 1: Fragmentation-gated selector (replaces "max wins").
+    # Accept the embedding result only when it has 3-8 slots AND <30% of slots
+    # are fragments (<20 frames) AND emb_count <= pos_count*2.5. Otherwise
+    # fall back to position-based + merge-near-duplicates pass.
     pos_registry = build_face_registry(face_results, min_appearances)
-    if len(pos_registry.slots) > len(slots):
+    emb_n = len(slots); pos_n = len(pos_registry.slots)
+    frag = sum(1 for s in slots if s.frame_count < 20)
+    frag_ratio = (frag / emb_n) if emb_n else 1.0
+    accept = (3 <= emb_n <= 8 and frag_ratio < 0.30
+              and emb_n <= max(1, pos_n) * 2.5)
+    if not accept:
         logger.info(
-            "Embedding registry found %d slots but position-based found %d — using position-based (max wins)",
-            len(slots), len(pos_registry.slots),
+            "Embedding registry rejected (slots=%d pos=%d frag=%.2f) -- "
+            "using position-based + merge pass",
+            emb_n, pos_n, frag_ratio,
         )
+        pos_registry.slots = _merge_near_duplicate_slots(
+            pos_registry.slots, [], x_tol_pct=6.0, cos_thresh=0.7,
+        )
+        for _i, _sl in enumerate(pos_registry.slots):
+            _sl.slot_id = _i
         return pos_registry
-    elif len(pos_registry.slots) < len(slots):
-        logger.info(
-            "Embedding registry found %d slots, position-based found %d — using embeddings (max wins)",
-            len(slots), len(pos_registry.slots),
-        )
+    logger.info("Embedding registry accepted (slots=%d pos=%d frag=%.2f)",
+                emb_n, pos_n, frag_ratio)
+    slots = _merge_near_duplicate_slots(slots, all_faces, x_tol_pct=6.0, cos_thresh=0.7)
+    for _i, _sl in enumerate(slots):
+        _sl.slot_id = _i
+    registry.slots = slots
 
     logger.info(
         "Face registry (embeddings): %d slots from %d faces (%d with embeddings)",
@@ -782,3 +796,106 @@ def assign_identities(face_results: list, registry: "FaceRegistry") -> None:
             slot = registry.nearest_slot(face.nose_x)
             if slot:
                 face.identity_id = slot.slot_id
+
+
+
+# ─────────────────────────── Fix 1 + Fix 2 helpers ───────────────────────────
+
+_drop_cache = {}
+
+def _should_drop_non_human_cached(face_results):
+    """Fix 2: drop non-human faces entirely when they are a minority
+    (<25% of detections) AND content is not flagged as gameplay/animation
+    (via REGISTRY_KEEP_NON_HUMAN env var). Cached per face_results id().
+    """
+    key = id(face_results)
+    if key in _drop_cache:
+        return _drop_cache[key]
+    non_human = total = 0
+    for fr in face_results:
+        for face in fr.faces:
+            total += 1
+            if not getattr(face, 'is_human', True):
+                non_human += 1
+    if total == 0:
+        _drop_cache[key] = False
+        return False
+    ratio = non_human / total
+    keep_env = os.environ.get("REGISTRY_KEEP_NON_HUMAN", "").lower() in ("true", "1", "yes")
+    if keep_env:
+        result = False
+    elif ratio < 0.25:
+        logger.info("Dropping non-human faces entirely: %d/%d=%.1f%% (<25%%)",
+                    non_human, total, ratio * 100)
+        result = True
+    else:
+        logger.info("Keeping non-human at weight=0.35: %d/%d=%.1f%% (>=25%%)",
+                    non_human, total, ratio * 100)
+        result = False
+    _drop_cache[key] = result
+    return result
+
+
+def _merge_near_duplicate_slots(slots, all_faces, x_tol_pct=6.0, cos_thresh=0.7):
+    """Fix 1: Merge slots whose x-centers are within x_tol_pct AND (if
+    embeddings available) whose centroids cosine-sim > cos_thresh."""
+    if len(slots) < 2:
+        return slots
+    try:
+        import numpy as np
+    except ImportError:
+        return slots
+
+    centroids = {}
+    has_emb = bool(all_faces) and hasattr(all_faces[0][0], 'shape')
+    if has_emb:
+        buckets = {s.slot_id: [] for s in slots}
+        for emb, nose_x, _w, _h, _fi in all_faces:
+            nearest = min(slots, key=lambda s: abs(s.x_center - nose_x))
+            buckets[nearest.slot_id].append(emb)
+        for sid, embs in buckets.items():
+            if not embs:
+                continue
+            arr = np.stack(embs).astype(np.float32)
+            arr = arr / np.maximum(np.linalg.norm(arr, axis=1, keepdims=True), 1e-8)
+            c = arr.mean(axis=0)
+            cn = np.linalg.norm(c)
+            if cn > 1e-8:
+                centroids[sid] = c / cn
+
+    merged = []
+    consumed = set()
+    for i, a in enumerate(slots):
+        if a.slot_id in consumed:
+            continue
+        group = [a]
+        for b in slots[i + 1:]:
+            if b.slot_id in consumed:
+                continue
+            if abs(a.x_center - b.x_center) > x_tol_pct:
+                continue
+            if has_emb:
+                if a.slot_id not in centroids or b.slot_id not in centroids:
+                    continue
+                sim = float(np.dot(centroids[a.slot_id], centroids[b.slot_id]))
+                if sim <= cos_thresh:
+                    continue
+            group.append(b)
+            consumed.add(b.slot_id)
+        if len(group) == 1:
+            merged.append(a)
+            continue
+        tf = sum(s.frame_count for s in group)
+        mx = sum(s.x_center * s.frame_count for s in group) / tf
+        mw = sum(s.avg_width * s.frame_count for s in group) / tf
+        mh = sum(s.avg_height * s.frame_count for s in group) / tf
+        logger.info("Merging slots %s at x=%.1f (%d frames)",
+                    [s.slot_id for s in group], mx, tf)
+        merged.append(FaceSlot(
+            slot_id=a.slot_id, x_center=round(mx, 1),
+            x_min=min(s.x_min for s in group),
+            x_max=max(s.x_max for s in group),
+            frame_count=tf,
+            avg_width=round(mw, 1), avg_height=round(mh, 1),
+        ))
+    return merged

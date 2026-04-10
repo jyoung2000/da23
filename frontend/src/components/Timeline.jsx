@@ -30,14 +30,16 @@ const TRACK_ICONS = {
   crop: '\u2702',
 };
 
-// Crop segment cluster colors
-const CROP_CLUSTER_COLORS = [
-  '#3B82F6', // blue — speaker 0
-  '#10B981', // green — speaker 1
-  '#F59E0B', // amber — speaker 2
-  '#EC4899', // pink — speaker 3
-  '#8B5CF6', // purple — manual override / unknown
+// Fix 5: Use the same speaker palette as VideoEditor's SPEAKER COLORS legend
+// so crop track segments (colored by seg.clusterId == face_registry slot idx)
+// visually match the legend for each speaker_id.
+const SPEAKER_PALETTE = [
+  '#00D9FF', '#F59E0B', '#10B981', '#A78BFA', '#EF4444', '#EC4899',
+  '#06B6D4', '#8B5CF6', '#F97316', '#14B8A6', '#E879F9', '#84CC16',
+  '#FB7185', '#38BDF8', '#FBBF24', '#34D399', '#C084FC', '#F472B6',
+  '#22D3EE', '#A3E635', '#FB923C', '#2DD4BF', '#818CF8', '#F87171',
 ];
+const MANUAL_OVERRIDE_COLOR = '#8B5CF6';
 
 function formatTime(s) {
   if (!s || isNaN(s) || s < 0) return '0:00';
@@ -361,9 +363,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const clipCX = Math.max(cx1, contentLeft);
             const clipCW = Math.min(cw, canvasW - clipCX);
 
-            // Color by cluster or manual override
-            const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
-            const baseColor = CROP_CLUSTER_COLORS[clrIdx % CROP_CLUSTER_COLORS.length];
+            // Color by speaker_id (clusterId == face_registry slot index)
+            // so crop segments match the SPEAKER COLORS legend in VideoEditor.
+            const spk = seg.speaker_id != null ? seg.speaker_id : seg.clusterId;
+            const baseColor = seg.isManualOverride
+              ? MANUAL_OVERRIDE_COLOR
+              : SPEAKER_PALETTE[Math.max(0, spk) % SPEAKER_PALETTE.length];
             const isSelCrop = seg.id === selectedCropSegmentId;
             ctx.fillStyle = isSelCrop ? baseColor + 'DD' : baseColor + '88';
             ctx.beginPath();

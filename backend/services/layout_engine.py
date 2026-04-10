@@ -181,14 +181,22 @@ def _smooth_layout_votes(
     # Backward pass: walk right-to-left, absorb remaining short segments.
     stabilized = _merge_consecutive(raw_segments)
 
+    # Fix 3: Detect speaker-identity changes (mode strings like "speaker_focus:3")
+    # and never absorb across them -- AutoFlip-style hard cut at scene boundaries.
+    def _spk(mode):
+        if isinstance(mode, str) and ":" in mode:
+            return mode.split(":", 1)[1]
+        return None
+
     # Forward pass
     forward = [stabilized[0]]
     for i in range(1, len(stabilized)):
         start, end, mode = stabilized[i]
         duration = end - start
-        if duration < min_duration and len(stabilized) > 1:
-            # Extend predecessor
-            prev = forward[-1]
+        prev = forward[-1]
+        ps, cs = _spk(prev[2]), _spk(mode)
+        is_boundary = ps is not None and cs is not None and ps != cs
+        if duration < min_duration and len(stabilized) > 1 and not is_boundary:
             forward[-1] = (prev[0], end, prev[2])
         else:
             forward.append((start, end, mode))
@@ -199,13 +207,31 @@ def _smooth_layout_votes(
     for i in range(len(forward) - 2, -1, -1):
         start, end, mode = forward[i]
         duration = end - start
-        if duration < min_duration and len(forward) > 1:
-            # Extend successor (which is backward[0] since we're going right-to-left)
-            succ = backward[0]
+        succ = backward[0]
+        cs, ns = _spk(mode), _spk(succ[2])
+        is_boundary = cs is not None and ns is not None and cs != ns
+        if duration < min_duration and len(forward) > 1 and not is_boundary:
             backward[0] = (start, succ[1], succ[2])
         else:
             backward.insert(0, (start, end, mode))
     stabilized = _merge_consecutive(backward)
+
+    # Fix 3 (cont): 150ms lock after any speaker-identity hard cut. If the
+    # segment immediately after a boundary is shorter than 0.15s, extend it
+    # and push the next segment's start forward so the downstream easer
+    # cannot begin a transition inside the lock window.
+    LOCK = 0.15
+    i = 1
+    while i < len(stabilized):
+        ps_s, pe_s, pm_s = stabilized[i - 1]
+        st, en, md = stabilized[i]
+        if _spk(pm_s) != _spk(md) and _spk(md) is not None and (en - st) < LOCK:
+            new_end = st + LOCK
+            stabilized[i] = (st, new_end, md)
+            if i + 1 < len(stabilized):
+                nst, nen, nmd = stabilized[i + 1]
+                stabilized[i + 1] = (max(nst, new_end), nen, nmd)
+        i += 1
 
     return stabilized
 
