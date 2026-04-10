@@ -73,6 +73,13 @@ class CrossOriginIsolationMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(CrossOriginIsolationMiddleware)
 
+# OG injection middleware: serves minimal HTML with Open Graph tags to crawler
+# user agents (Slackbot, Twitterbot, etc.) so link previews show thumbnails.
+# Must be added AFTER CrossOriginIsolation (runs BEFORE it in the request chain)
+# so crawlers get the OG stub before any other middleware processes the request.
+from backend.middleware.og_injection import OGInjectionMiddleware
+app.add_middleware(OGInjectionMiddleware)
+
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error_handler(request: Request, exc: RequestValidationError):
