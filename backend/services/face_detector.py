@@ -27,6 +27,8 @@ class FaceInfo:
     identity_id: int = -1       # Assigned face slot from registry (-1 = unassigned)
     is_speaking: bool = False   # Set by active speaker detection
     y_bottom: float = 0.0      # Bottom of face bbox as % of frame (for vertical positioning)
+    is_human: bool = True       # Set by HumanFaceVerifier (default True = fail-open)
+    pose_confidence: float = 0.0  # Pose verification confidence (0 if not verified)
 
     def __post_init__(self):
         """Ensure all numeric fields are native Python types, not numpy."""
@@ -549,6 +551,74 @@ def _merge_detections(
     return merged
 
 
+def _verify_faces_in_results(results: list, frame_paths: list) -> list:
+    """Run human face verification on all detected faces.
+
+    For each face in each FrameFaces result, check if a human pose
+    (shoulders + neck) is detected below the face. Faces without a
+    human body are marked is_human=False.
+
+    When USE_HUMAN_VERIFICATION is False or the verifier is unavailable,
+    all faces are left as is_human=True (fail-open).
+    """
+    import os
+    use_verification = os.environ.get(
+        "USE_HUMAN_VERIFICATION", "true"
+    ).lower() in ("true", "1", "yes")
+
+    if not use_verification:
+        logger.info("Human face verification disabled (USE_HUMAN_VERIFICATION=false)")
+        return results
+
+    try:
+        from backend.services.human_face_verifier import get_verifier
+        verifier = get_verifier()
+    except Exception as e:
+        logger.warning("Human face verifier import failed: %s", e)
+        return results
+
+    if not verifier.available:
+        logger.info("Human face verifier unavailable — all faces accepted (fail-open)")
+        return results
+
+    import cv2
+
+    # Build a path lookup from frame_paths
+    path_lookup = {round(t, 3): p for t, p in frame_paths}
+
+    verified = 0
+    non_human = 0
+    for fr in results:
+        if not fr.faces:
+            continue
+
+        # Try to load the frame image
+        frame_path = path_lookup.get(round(fr.timestamp, 3), fr.frame_path)
+        frame_bgr = cv2.imread(str(frame_path)) if frame_path else None
+        if frame_bgr is None:
+            continue
+
+        for face in fr.faces:
+            is_human, pose_conf = verifier.verify_face(
+                frame_bgr,
+                face.nose_x,
+                face.nose_y,
+                face.width,
+                face.height,
+            )
+            face.is_human = is_human
+            face.pose_confidence = pose_conf
+            verified += 1
+            if not is_human:
+                non_human += 1
+
+    logger.info(
+        "Human face verification: %d faces checked, %d non-human detected",
+        verified, non_human,
+    )
+    return results
+
+
 def detect_faces_batch(
     frame_paths: list[tuple[float, str]],
     min_confidence: float = 0.3,
@@ -564,6 +634,8 @@ def detect_faces_batch(
     import time as _t
     t0 = _t.monotonic()
 
+    final_results = None
+
     # Try FaceMesh first (gives lip landmarks for active speaker detection)
     facemesh_results = None
     try:
@@ -574,9 +646,6 @@ def detect_faces_batch(
             _log_summary(facemesh_results)
 
             # Always supplement FaceMesh with YuNet to catch faces that FaceMesh missed.
-            # FaceMesh has a max_num_faces limit and struggles with small/angled faces.
-            # YuNet is more aggressive and catches faces FaceMesh misses in group shots.
-            # The merge is additive — only adds non-overlapping faces (IoU > 10% threshold).
             with_faces = sum(1 for r in facemesh_results if r.faces)
             multi = sum(1 for r in facemesh_results if len(r.faces) >= 2)
             max_faces_per_frame = max((len(r.faces) for r in facemesh_results), default=0)
@@ -598,7 +667,7 @@ def detect_faces_batch(
                                 max_faces_per_frame, new_total - fm_total,
                             )
                             _log_summary(merged)
-                            return merged
+                            final_results = merged
                         else:
                             logger.info(
                                 "YuNet supplement: no extra faces (FaceMesh=%d, YuNet=%d)",
@@ -607,39 +676,48 @@ def detect_faces_batch(
                 except Exception as e:
                     logger.debug("YuNet supplement failed: %s", e)
 
-            return facemesh_results
+            if final_results is None:
+                final_results = facemesh_results
     except Exception as e:
         logger.info("FaceMesh unavailable (%s), trying FaceDetection", e)
 
     # Try MediaPipe FaceDetection (no lip landmarks but more robust)
-    try:
-        results = _detect_with_mediapipe(frame_paths, min_confidence)
-        if results is not None:
-            elapsed = _t.monotonic() - t0
-            logger.info("Face detection using MediaPipe FaceDetection (%.1fs for %d frames)", elapsed, len(frame_paths))
-            _log_summary(results)
-            return results
-    except Exception as e:
-        logger.info("MediaPipe FaceDetection unavailable (%s), trying OpenCV", e)
+    if final_results is None:
+        try:
+            results = _detect_with_mediapipe(frame_paths, min_confidence)
+            if results is not None:
+                elapsed = _t.monotonic() - t0
+                logger.info("Face detection using MediaPipe FaceDetection (%.1fs for %d frames)", elapsed, len(frame_paths))
+                _log_summary(results)
+                final_results = results
+        except Exception as e:
+            logger.info("MediaPipe FaceDetection unavailable (%s), trying OpenCV", e)
 
     # Fall back to OpenCV (YuNet DNN → Haar cascade)
-    try:
-        results = _detect_with_opencv_dnn(frame_paths, min_confidence)
-        if results is not None:
-            elapsed = _t.monotonic() - t0
-            logger.info("Face detection using OpenCV DNN/Haar (%.1fs for %d frames)", elapsed, len(frame_paths))
-            _log_summary(results)
-            return results
-    except Exception as e:
-        logger.warning("OpenCV face detection failed: %s", e)
+    if final_results is None:
+        try:
+            results = _detect_with_opencv_dnn(frame_paths, min_confidence)
+            if results is not None:
+                elapsed = _t.monotonic() - t0
+                logger.info("Face detection using OpenCV DNN/Haar (%.1fs for %d frames)", elapsed, len(frame_paths))
+                _log_summary(results)
+                final_results = results
+        except Exception as e:
+            logger.warning("OpenCV face detection failed: %s", e)
 
-    # Both failed — return empty results (graceful degradation)
-    elapsed = _t.monotonic() - t0
-    logger.warning("All face detection methods failed (%.1fs) — using AI estimates only", elapsed)
-    return [
-        FrameFaces(timestamp=ts, frame_path=str(p))
-        for ts, p in frame_paths
-    ]
+    # All methods failed — return empty results (graceful degradation)
+    if final_results is None:
+        elapsed = _t.monotonic() - t0
+        logger.warning("All face detection methods failed (%.1fs) — using AI estimates only", elapsed)
+        final_results = [
+            FrameFaces(timestamp=ts, frame_path=str(p))
+            for ts, p in frame_paths
+        ]
+
+    # Run human face verification on all detected faces
+    final_results = _verify_faces_in_results(final_results, frame_paths)
+
+    return final_results
 
 
 def detect_faces_dense(

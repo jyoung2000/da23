@@ -76,6 +76,8 @@ def build_subject_tracks(
         by_slot = defaultdict(list)
         for df in dense_faces:
             for f in df.faces:
+                if not getattr(f, 'is_human', True):
+                    continue
                 sid = getattr(f, 'identity_id', -1)
                 if sid < 0:
                     continue

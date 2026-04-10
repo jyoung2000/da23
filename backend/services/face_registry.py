@@ -133,6 +133,9 @@ def build_face_registry(
             # Skip faces that are suspiciously wide (merged detections)
             if face.width > 18.0 and 30 < face.x_center < 70:
                 continue
+            # Skip non-human faces (figurines, posters, etc.)
+            if not getattr(face, 'is_human', True):
+                continue
             all_faces.append((face.nose_x, face.width, face.height, fi))
 
     if not all_faces:
@@ -439,11 +442,13 @@ def build_face_registry_with_embeddings(
     """
     import numpy as np
 
-    # Collect all faces with embeddings
+    # Collect all faces with embeddings (skip non-human faces)
     all_faces = []  # [(embedding, nose_x, width, height, frame_idx)]
     total_faces = 0
     for fi, fr in enumerate(face_results):
         for face in fr.faces:
+            if not getattr(face, 'is_human', True):
+                continue
             total_faces += 1
             if face.identity_embedding is not None:
                 all_faces.append((

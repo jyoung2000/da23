@@ -39,11 +39,14 @@ def aggregate_scene_focus(
     # 1. Collect required features from dense faces
     #    Use half-open interval [shot_start, shot_end) so boundary frames
     #    belong to the next shot, not both.
+    #    Skip non-human faces (figurines, posters, etc.) when verification is available.
     if dense_faces:
         for df in dense_faces:
             if df.timestamp < shot_start or df.timestamp >= shot_end:
                 continue
             for f in df.faces:
+                if not getattr(f, 'is_human', True):
+                    continue
                 sid = getattr(f, 'identity_id', -1)
                 face_x = getattr(f, 'nose_x', getattr(f, 'x', 50))
                 face_y = getattr(f, 'nose_y', getattr(f, 'y', 50))
