@@ -1655,6 +1655,29 @@ export default function ClipSEO() {
             </div>
           ) : (
             <>
+              {/* Share Link */}
+              <div style={{ ...sectionStyle, background: 'var(--bg-panel)', borderColor: 'var(--border)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)' }}>
+                    Share link (with preview)
+                  </div>
+                  <button
+                    onClick={() => {
+                      const shareUrl = `${window.location.origin}/share/clip/${jobId}/${clipId}`;
+                      copyToClipboard(shareUrl, 'share');
+                    }}
+                    style={{
+                      padding: '6px 14px', fontSize: 11, fontWeight: 600,
+                      background: copied === 'share' ? 'var(--accent-cyan)' : 'var(--bg-panel)',
+                      color: copied === 'share' ? 'var(--bg-base)' : 'var(--text-secondary)',
+                      border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+                    }}
+                  >
+                    {copied === 'share' ? 'Copied!' : 'Copy Share Link'}
+                  </button>
+                </div>
+              </div>
+
               {/* Copy All — ready to paste */}
               <div style={{ ...sectionStyle, background: 'var(--accent-cyan-dim)', borderColor: 'var(--accent-cyan)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

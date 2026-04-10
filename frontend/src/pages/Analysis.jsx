@@ -2632,6 +2632,32 @@ export default function Analysis() {
               : `${Math.floor(job.analysis_duration_seconds / 60)}m ${Math.round(job.analysis_duration_seconds % 60)}s`}
           </span>
         )}
+        {job.status === 'complete' && (
+          <button
+            onClick={() => {
+              const shareUrl = `${window.location.origin}/share/analysis/${jobId}`;
+              navigator.clipboard.writeText(shareUrl).then(() => {
+                showToast('Share link copied!', 'success');
+              }).catch(() => {
+                showToast('Failed to copy link', 'error');
+              });
+            }}
+            style={{
+              marginLeft: 'auto',
+              padding: '3px 10px',
+              fontSize: 11,
+              fontWeight: 500,
+              background: 'var(--bg-elevated)',
+              border: '1px solid var(--border)',
+              color: 'var(--text-secondary)',
+              borderRadius: 'var(--radius-sm)',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Share
+          </button>
+        )}
       </div>
 
       {/* Tabs — iOS segmented control on mobile, standard tabs on desktop */}
