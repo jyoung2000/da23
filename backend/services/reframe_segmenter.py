@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # ── Feature flags ──
 USE_REFRAME_SEGMENTER = os.environ.get("USE_REFRAME_SEGMENTER", "true").lower() in ("true", "1", "yes")
 USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "false").lower() in ("true", "1", "yes")
+USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "false").lower() in ("true", "1", "yes")
 
 # ── Default tunables (used when no content profile is provided) ──
 MIN_HOLD_SECONDS = 0.8
@@ -110,13 +111,21 @@ def build_reframe_segments(
     # ── Load content-type config ──
     ct = "unknown"
     cfg = None
+    _tuning = None
     if content_profile and USE_CONTENT_AWARE_REFRAME:
         ct = getattr(content_profile, 'content_type', 'unknown') or 'unknown'
         try:
-            from backend.services.content_type_config import get_config
+            from backend.services.content_type_config import get_config, get_tuning_from_profile
             cfg = get_config(ct)
+            _tuning = get_tuning_from_profile(content_profile)
         except ImportError:
             cfg = None
+    if _tuning is None:
+        try:
+            from backend.services.content_type_config import get_tuning_from_profile
+            _tuning = get_tuning_from_profile(None)
+        except ImportError:
+            pass
 
     # Use content-type-specific tunables or fall back to module defaults
     # NOTE: min_hold_seconds and anticipation_ms are NO LONGER from config.
@@ -456,43 +465,48 @@ def build_reframe_segments(
         _log("%d segments set to TRACKING (motion-aware)", motion_tracking_count)
 
     # ── Stage 4: Two-pass look-ahead hysteresis ──
-    # Instead of blindly removing short B segments, look ahead up to 3s:
-    # If the change is "speaker B for <1s then back to A," suppress.
-    # If it's "speaker B for 3+ seconds," commit.
+    # When intent tracking is enabled, the intent timeline handles subject
+    # switching natively via EMA + margin. The legacy hysteresis is bypassed.
     hysteresis_removed = 0
-    i = 1
-    while i < len(raw_segments) - 1:
-        a = raw_segments[i - 1]
-        b = raw_segments[i]
-        c = raw_segments[i + 1]
-        b_dur = b.end - b.start
-        # Adaptive hysteresis threshold based on local pacing
-        b_mid = (b.start + b.end) / 2.0
-        local_min_hold = pacing_estimator.min_hold_at(b_mid) if _has_pacing else 1.5
-        hysteresis_thresh = max(local_min_hold, 0.5)  # at least 0.5s
+    if not USE_INTENT_TRACKING:
+        # Instead of blindly removing short B segments, look ahead up to 3s:
+        # If the change is "speaker B for <1s then back to A," suppress.
+        # If it's "speaker B for 3+ seconds," commit.
+        # Fallback hold threshold from TuningConfig (replaces hardcoded 1.5)
+        _intent_hold_fallback = _tuning.intent_min_hold_fallback if _tuning else 1.5
+        i = 1
+        while i < len(raw_segments) - 1:
+            a = raw_segments[i - 1]
+            b = raw_segments[i]
+            c = raw_segments[i + 1]
+            b_dur = b.end - b.start
+            # Adaptive hysteresis threshold based on local pacing
+            b_mid = (b.start + b.end) / 2.0
+            local_min_hold = pacing_estimator.min_hold_at(b_mid) if _has_pacing else _intent_hold_fallback
+            hysteresis_thresh = max(local_min_hold, 0.5)  # at least 0.5s
 
-        if b_dur < hysteresis_thresh and c.active_slot == a.active_slot:
-            # Look ahead: does speaker B come back for a sustained period?
-            # Cap look-ahead to 3 segments for calm content (pacing < 0.3),
-            # full 5 for fast content where rapid back-and-forth is real.
-            local_pacing = pacing_estimator.pacing[min(int(b_mid), pacing_estimator.duration - 1)] if _has_pacing else 0.5
-            max_lookahead = 3 if local_pacing < 0.3 else 5
-            b_returns = False
-            if i + 2 < len(raw_segments):
-                for j in range(i + 2, min(i + max_lookahead, len(raw_segments))):
-                    future_seg = raw_segments[j]
-                    if (future_seg.active_slot == b.active_slot
-                            and (future_seg.end - future_seg.start) >= hysteresis_thresh * 2):
-                        b_returns = True
-                        break
+            if b_dur < hysteresis_thresh and c.active_slot == a.active_slot:
+                # Look ahead: does speaker B come back for a sustained period?
+                # Cap look-ahead to 3 segments for calm content (pacing < 0.3),
+                # full 5 for fast content where rapid back-and-forth is real.
+                local_pacing = pacing_estimator.pacing[min(int(b_mid), pacing_estimator.duration - 1)] if _has_pacing else 0.5
+                max_lookahead = 3 if local_pacing < 0.3 else 5
+                b_returns = False
+                if i + 2 < len(raw_segments):
+                    for j in range(i + 2, min(i + max_lookahead, len(raw_segments))):
+                        future_seg = raw_segments[j]
+                        if (future_seg.active_slot == b.active_slot
+                                and (future_seg.end - future_seg.start) >= hysteresis_thresh * 2):
+                            b_returns = True
+                            break
 
-            if not b_returns:
-                # Absorb B into A
-                a.end = b.end
-                raw_segments.pop(i)
-                hysteresis_removed += 1
-                continue  # Don't increment — check the new pair
-        i += 1
+                if not b_returns:
+                    # Absorb B into A
+                    a.end = b.end
+                    raw_segments.pop(i)
+                    hysteresis_removed += 1
+                    continue  # Don't increment — check the new pair
+            i += 1
 
     if hysteresis_removed > 0:
         _log("hysteresis removed %d blip segments (look-ahead)", hysteresis_removed)
