@@ -5,24 +5,25 @@ the optimal layout mode at each timestamp. Produces a layout timeline
 that the FFmpeg export pipeline uses to composite the output.
 
 Layout modes:
-  SINGLE     — One subject. Crop + pan to follow them. (current ClipAI behavior)
+  SINGLE     — One subject. Crop + pan to follow them. (default, only path)
   SPLIT      — Two subjects visible. Side-by-side vertical split.
   TRIPLE     — Three subjects. 2-up top + 1 bottom, or 1 top + 2 bottom.
   PIP        — Primary speaker large + secondary speaker small overlay.
   SCREENSHARE — Screen/slides content top half + speaker bottom half.
   GAMEPLAY   — Game footage top 70% + speaker webcam bottom 30%.
 
-Decision hierarchy:
-  1. If frame has screen_content AND a face → SCREENSHARE
-  2. If 3+ faces detected consistently → TRIPLE
-  3. If 2 faces detected AND both speak → SPLIT
-  4. If 2 faces detected AND only 1 speaks → PIP or SINGLE (prefer SINGLE if
-     non-speaker is small/background)
-  5. If 1 face or 0 faces → SINGLE (with object tracking fallback)
+Multi-layout modes (SPLIT, TRIPLE, etc.) are reachable only behind the
+ALLOW_MULTI_LAYOUT flag (default False). When disabled, the engine always
+emits SINGLE — pure reframing, no layout gimmicks.
 """
 import logging
+import os
 from collections import Counter
 from dataclasses import dataclass, field
+
+# When False (default), layout is always SINGLE — pure reframing.
+# Multi-layout (split, triple, pip, etc.) is dead code behind this flag.
+ALLOW_MULTI_LAYOUT = os.environ.get("ALLOW_MULTI_LAYOUT", "false").lower() in ("true", "1", "yes")
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +232,7 @@ def build_layout_timeline(
     from backend.models import LayoutMode
     from backend.services.active_speaker import get_active_slot_at_time
 
-    if prefer_single or not face_results:
+    if prefer_single or not face_results or not ALLOW_MULTI_LAYOUT:
         return LayoutTimeline(
             segments=[LayoutSegment(
                 start=clip_start, end=clip_end,
