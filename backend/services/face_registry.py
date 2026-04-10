@@ -10,9 +10,14 @@ These slots are ground truth. The AI model's only job is to pick
 which slot is the active speaker.
 """
 import logging
+import os
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# ── Config flags for new behavior ──
+REGISTRY_USE_HUMAN_WEIGHT = os.environ.get("REGISTRY_USE_HUMAN_WEIGHT", "true").lower() in ("true", "1", "yes")
+REGISTRY_USE_COHESION_GATE = os.environ.get("REGISTRY_USE_COHESION_GATE", "true").lower() in ("true", "1", "yes")
 
 
 @dataclass
@@ -125,18 +130,25 @@ def build_face_registry(
     # from landmarks) rather than x_center (bbox center). nose_x is more
     # accurate: FaceMesh gives sub-pixel nose tip, YuNet gives nose keypoint.
     # The bbox center can be 10-20% off for side-profile faces.
-    all_faces = []  # [(nose_x, width, height, frame_idx)]
+    all_faces = []  # [(nose_x, width, height, frame_idx, weight)]
+    non_human_kept = 0
     for fi, fr in enumerate(face_results):
         if not fr.faces:
             continue
         for face in fr.faces:
-            # Skip faces that are suspiciously wide (merged detections)
-            if face.width > 18.0 and 30 < face.x_center < 70:
-                continue
-            # Skip non-human faces (figurines, posters, etc.)
-            if not getattr(face, 'is_human', True):
-                continue
-            all_faces.append((face.nose_x, face.width, face.height, fi))
+            # is_human: weight down rather than gate (Bug C fix)
+            is_human = getattr(face, 'is_human', True)
+            if REGISTRY_USE_HUMAN_WEIGHT:
+                weight = 1.0 if is_human else 0.35
+                if not is_human:
+                    non_human_kept += 1
+            else:
+                if not is_human:
+                    continue
+                weight = 1.0
+            all_faces.append((face.nose_x, face.width, face.height, fi, weight))
+    if non_human_kept > 0:
+        logger.info("is_human weight: kept %d non-human faces with weight=0.35", non_human_kept)
 
     if not all_faces:
         return FaceRegistry(
@@ -295,8 +307,16 @@ def build_face_registry(
     # Also trim extreme outliers (outside IQR * 1.5) before computing.
     slots = []
     for cluster in clusters:
-        unique_frames = len(set(f[3] for f in cluster))
-        if unique_frames < min_appearances:
+        # Use weighted frame count: sum of weights per unique frame
+        frame_weights = {}
+        for f in cluster:
+            fi = f[3]
+            w = f[4] if len(f) > 4 else 1.0
+            frame_weights[fi] = max(frame_weights.get(fi, 0.0), w)
+        weighted_frames = sum(frame_weights.values())
+        unique_frames = len(frame_weights)
+        # Threshold on weighted evidence, not raw count
+        if weighted_frames < min_appearances:
             continue
         x_positions = sorted([f[0] for f in cluster])
         widths = [f[1] for f in cluster]
@@ -374,8 +394,15 @@ def build_face_registry(
                         peak_faces.extend(bins[i + 1])
 
                     x_positions = sorted([f[0] for f in peak_faces])
-                    unique_frames = len(set(f[3] for f in peak_faces))
-                    if unique_frames < min_appearances:
+                    # Weighted frame count for histogram path too
+                    pf_weights = {}
+                    for f in peak_faces:
+                        fi = f[3]
+                        w = f[4] if len(f) > 4 else 1.0
+                        pf_weights[fi] = max(pf_weights.get(fi, 0.0), w)
+                    unique_frames = len(pf_weights)
+                    weighted_frames = sum(pf_weights.values())
+                    if weighted_frames < min_appearances:
                         continue
 
                     mid = len(x_positions) // 2
@@ -442,13 +469,19 @@ def build_face_registry_with_embeddings(
     """
     import numpy as np
 
-    # Collect all faces with embeddings (skip non-human faces)
+    # Collect all faces with embeddings (is_human=False weighted down, not gated)
     all_faces = []  # [(embedding, nose_x, width, height, frame_idx)]
     total_faces = 0
+    non_human_kept = 0
     for fi, fr in enumerate(face_results):
         for face in fr.faces:
-            if not getattr(face, 'is_human', True):
-                continue
+            is_human = getattr(face, 'is_human', True)
+            if REGISTRY_USE_HUMAN_WEIGHT:
+                if not is_human:
+                    non_human_kept += 1
+            else:
+                if not is_human:
+                    continue
             total_faces += 1
             if face.identity_embedding is not None:
                 all_faces.append((
