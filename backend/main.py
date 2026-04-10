@@ -59,6 +59,12 @@ class CrossOriginIsolationMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(CrossOriginIsolationMiddleware)
 
+# OG injection middleware — must be added after CrossOriginIsolation so it
+# runs first on incoming requests. Intercepts crawler UAs on analysis/SEO
+# pages to serve OG tag stubs before the SPA catch-all can respond.
+from backend.middleware.og_injection import OGInjectionMiddleware
+app.add_middleware(OGInjectionMiddleware)
+
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error_handler(request: Request, exc: RequestValidationError):
