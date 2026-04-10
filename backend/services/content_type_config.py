@@ -55,6 +55,9 @@ CONTENT_TYPE_CONFIG = {
         "multi_speaker_threshold": 0.20,
         "action_cut_rate_threshold": 6.0,  # cuts per 10s window → WIDE_MASTER
         "action_window_seconds": 10.0,
+        # Intent tracking
+        "intent_ema_alpha": 0.40,
+        "intent_switch_margin": 0.15,
     },
     ContentType.PODCAST: {
         "apply_lead_room": False,
@@ -72,6 +75,9 @@ CONTENT_TYPE_CONFIG = {
         "speaker_coverage_threshold": 0.60,
         "dense_dominance_threshold": 0.70,
         "multi_speaker_threshold": 0.20,
+        # Intent tracking — slower, ambiguous overlaps common
+        "intent_ema_alpha": 0.25,
+        "intent_switch_margin": 0.20,
     },
     ContentType.GAMING: {
         "apply_lead_room": False,
@@ -90,6 +96,9 @@ CONTENT_TYPE_CONFIG = {
         "speaker_coverage_threshold": 0.60,
         "dense_dominance_threshold": 0.70,
         "multi_speaker_threshold": 0.20,
+        # Intent tracking — heavily resist switching, center-bias content
+        "intent_ema_alpha": 0.20,
+        "intent_switch_margin": 0.30,
     },
     ContentType.VLOG: {
         "apply_lead_room": True,
@@ -107,6 +116,9 @@ CONTENT_TYPE_CONFIG = {
         "speaker_coverage_threshold": 0.60,
         "dense_dominance_threshold": 0.70,
         "multi_speaker_threshold": 0.20,
+        # Intent tracking
+        "intent_ema_alpha": 0.30,
+        "intent_switch_margin": 0.18,
     },
     ContentType.SPORTS: {
         "apply_lead_room": False,
@@ -125,6 +137,9 @@ CONTENT_TYPE_CONFIG = {
         "speaker_coverage_threshold": 0.60,
         "dense_dominance_threshold": 0.70,
         "multi_speaker_threshold": 0.20,
+        # Intent tracking — snappy, fast cuts demand fast response
+        "intent_ema_alpha": 0.55,
+        "intent_switch_margin": 0.10,
     },
     ContentType.MUSIC_VIDEO: {
         "apply_lead_room": False,
@@ -140,6 +155,9 @@ CONTENT_TYPE_CONFIG = {
         "speaker_coverage_threshold": 0.60,
         "dense_dominance_threshold": 0.70,
         "multi_speaker_threshold": 0.20,
+        # Intent tracking — snappy for fast cuts
+        "intent_ema_alpha": 0.50,
+        "intent_switch_margin": 0.12,
     },
     ContentType.ANIME: {
         "apply_lead_room": True,
@@ -155,6 +173,9 @@ CONTENT_TYPE_CONFIG = {
         "speaker_coverage_threshold": 0.60,
         "dense_dominance_threshold": 0.70,
         "multi_speaker_threshold": 0.20,
+        # Intent tracking — snappiest, fast cuts demand fast response
+        "intent_ema_alpha": 0.55,
+        "intent_switch_margin": 0.10,
     },
     ContentType.UNKNOWN: {
         "apply_lead_room": False,
@@ -181,3 +202,44 @@ def get_config(content_type: str) -> dict:
     except ValueError:
         ct = ContentType.UNKNOWN
     return CONTENT_TYPE_CONFIG.get(ct, CONTENT_TYPE_CONFIG[ContentType.UNKNOWN])
+
+
+class TuningConfig:
+    """Structured access to per-content-type tuning parameters.
+
+    Wraps the raw config dict and provides typed attributes with defaults
+    for intent tracking fields.
+    """
+
+    # Intent tracking defaults
+    _DEFAULTS = {
+        "intent_ema_alpha": 0.4,
+        "intent_switch_margin": 0.15,
+        "intent_min_switch_confidence": 0.35,
+        "intent_min_hold_fallback": 1.5,
+    }
+
+    def __init__(self, cfg: dict):
+        self._cfg = cfg
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name in self._DEFAULTS:
+            return self._cfg.get(name, self._DEFAULTS[name])
+        if name in self._cfg:
+            return self._cfg[name]
+        raise AttributeError(f"TuningConfig has no attribute {name!r}")
+
+
+def get_tuning_from_profile(content_profile) -> TuningConfig:
+    """Build a TuningConfig from a ContentProfile (or None).
+
+    Accepts a ContentProfile object, a content_type string, or None.
+    """
+    ct = "unknown"
+    if content_profile is not None:
+        ct = getattr(content_profile, "content_type", content_profile)
+        if not isinstance(ct, str):
+            ct = "unknown"
+    return TuningConfig(get_config(ct))
