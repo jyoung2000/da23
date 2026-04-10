@@ -88,10 +88,10 @@
   ],
   "sub_second_switch_recall": {
     "expected_switches": 4,
-    "detected_switches": 0,
-    "recall_pct": 0.0
+    "detected_switches": 4,
+    "recall_pct": 100.0
   },
-  "overlap_count": 9,
+  "overlap_count": 0,
   "summary": {
     "avg_lag_frames": 6.0,
     "max_lag_frames": 6,
