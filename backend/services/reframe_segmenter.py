@@ -597,6 +597,55 @@ def build_reframe_segments(
             for seg in raw_segments:
                 seg.hard_constraints = rects
 
+    # ── Stage 10: L1 camera path per segment ──
+    # For each single-layout segment, solve a TV-denoised camera path from
+    # dense face centroids. This gives "hold still, snap, hold still" motion.
+    # The solver only overrides subject_x for tracking/panning modes where
+    # motion is significant. Stationary segments keep their registry-based position.
+    # The solver never overrides ease_in_ms — that's set by Stage 6 based on
+    # editorial context (shot cut vs speaker turn vs subject walk).
+    l1_count = 0
+    try:
+        from backend.services.l1_camera_path import (
+            solve_camera_path,
+            get_dense_face_positions_for_segment,
+        )
+        for seg in raw_segments:
+            if seg.layout not in ("single",) or seg.active_slot is None:
+                continue
+            if not dense_faces:
+                continue
+
+            # Convert dense face positions to pixel space for the solver
+            positions = get_dense_face_positions_for_segment(
+                dense_faces, seg.active_slot, seg.start, seg.end,
+            )
+            if len(positions) < 2:
+                continue
+
+            # Convert nose_x from 0-100 to pixel space for the solver
+            positions_px = [(t, x / 100.0 * source_width) for t, x in positions]
+            result = solve_camera_path(positions_px, source_width)
+            seg.strategy = result["mode"]
+
+            if result["mode"] == "stationary":
+                # Keep the face-registry-based subject_x (more stable than
+                # the average of noisy dense positions)
+                pass
+            elif result["mode"] == "tracking":
+                seg.subject_x = result["path"][0][1] if result["path"] else seg.subject_x
+                seg.motion_path = result["path"]
+            elif result["mode"] == "panning":
+                seg.subject_x = result["path"][0][1] if result["path"] else seg.subject_x
+                seg.motion_path = result["path"]
+
+            l1_count += 1
+    except Exception as e:
+        logger.warning("[%s] L1 camera path failed (non-fatal): %s", job_id, e)
+
+    if l1_count > 0:
+        _log("L1 camera path solved for %d segments", l1_count)
+
     # ── Summary logging ──
     slot_counts = Counter()
     strategy_counts = Counter()
