@@ -164,6 +164,7 @@ class JobResult(BaseModel):
     game_type: str = ""  # "overwatch" | "valorant" | "apex_legends" | "marvel_rivals" | "fortnite" | "generic_fps" | "auto"
     filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
     emphasis_keywords: list[str] = []  # Words to highlight in captions
+    thumbnail_path: Optional[str] = None  # Absolute path to OG preview thumbnail JPG
 
 
 class ClipSEO(BaseModel):

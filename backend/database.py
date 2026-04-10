@@ -189,6 +189,16 @@ async def delete_job(job_id: str) -> bool:
     return True
 
 
+async def update_job_thumbnail(job_id: str, thumbnail_path: str) -> Optional[JobResult]:
+    """Store the thumbnail path for a job."""
+    return await update_job_status(job_id, thumbnail_path=thumbnail_path)
+
+
+async def get_job(job_id: str) -> Optional[JobResult]:
+    """Alias for load_job, used by OG injection and share routes."""
+    return await load_job(job_id)
+
+
 async def update_job_status(
     job_id: str,
     status: Optional[str] = None,

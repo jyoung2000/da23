@@ -3576,6 +3576,25 @@ async def _run_analysis_inner(job_id: str):
         f"Analysis complete in {dur_str} — "
         f"{len(transcript)} segments, {len(scenes)} scenes, {len(clips)} clips"
     )
+    # ── Thumbnail extraction (non-fatal) ──
+    # Extract a representative thumbnail frame for rich preview unfurls (OG/Twitter Card).
+    try:
+        from backend.services.thumbnail_extractor import extract_thumbnail
+        _video_dur = metadata.get("duration", 0) if metadata else 0
+        _reframe_segs = reframe_segments if 'reframe_segments' in dir() else None
+        thumb_path = extract_thumbnail(
+            job_id=job_id,
+            source_video_path=video_path,
+            video_duration=_video_dur,
+            scenes=scenes,
+            reframe_segments=_reframe_segs,
+        )
+        if thumb_path:
+            await database.update_job_thumbnail(job_id, str(thumb_path))
+            logger.info("[%s] thumbnail saved: %s", job_id, thumb_path)
+    except Exception as e:
+        logger.warning("[%s] thumbnail step failed (non-fatal): %s", job_id, e)
+
     # FINAL SAVE: ensure ALL scenes (including 589+ synthetic per-second tracking scenes)
     # are persisted. This is the authoritative save — if the earlier save at synthetic
     # creation time was skipped or failed, this catches it.
