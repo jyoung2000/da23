@@ -270,6 +270,7 @@ export default function Analysis() {
   const navigate = useNavigate();
   const [job, setJob] = useState(null);
   const [tab, setTab] = useState(0);
+  const [shareCopied, setShareCopied] = useState(false);
   const prevTabRef = useRef(0);
   const [transcriptInitTime, setTranscriptInitTime] = useState(null);
   const stickyPlayerRef = useRef(null);
@@ -2400,6 +2401,26 @@ export default function Analysis() {
               ? `${Math.round(job.analysis_duration_seconds)}s`
               : `${Math.floor(job.analysis_duration_seconds / 60)}m ${Math.round(job.analysis_duration_seconds % 60)}s`}
           </span>
+        )}
+        {job.status === 'complete' && (
+          <button
+            onClick={() => {
+              const shareUrl = `${window.location.origin}/share/analysis/${jobId}`;
+              navigator.clipboard.writeText(shareUrl).then(() => {
+                setShareCopied(true);
+                setTimeout(() => setShareCopied(false), 2000);
+              });
+            }}
+            style={{
+              marginLeft: 'auto', padding: '4px 10px', fontSize: 11,
+              background: shareCopied ? 'var(--success)' : 'var(--bg-elevated)',
+              color: shareCopied ? '#fff' : 'var(--text-secondary)',
+              border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+              cursor: 'pointer', transition: 'all 0.2s',
+            }}
+          >
+            {shareCopied ? 'Copied!' : 'Share Link'}
+          </button>
         )}
       </div>
 
