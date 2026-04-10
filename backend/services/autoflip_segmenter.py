@@ -34,6 +34,7 @@ def build_autoflip_segments(
     persistent_regions=None,
     saliency_regions: list = None,
     object_detections: list = None,
+    subject_tracks: list = None,
     target_aspect: float = 9 / 16,
     job_id: str = "",
 ) -> list:
@@ -87,6 +88,7 @@ def build_autoflip_segments(
             target_aspect=target_aspect,
             saliency_regions=saliency_regions,
             object_detections=object_detections,
+            subject_tracks=subject_tracks,
             job_id=job_id,
         )
 

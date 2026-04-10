@@ -2554,6 +2554,31 @@ async def _run_analysis_inner(job_id: str):
                 from backend.services.autoflip_segmenter import build_autoflip_segments
                 _video_dur = metadata.get("duration", 0)
                 _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
+
+                # ── Subject Fusion (optional, behind feature flag) ──
+                USE_SUBJECT_FUSION = os.environ.get("USE_SUBJECT_FUSION", "false").lower() in ("true", "1", "yes")
+                _subject_tracks = None
+                if USE_SUBJECT_FUSION:
+                    try:
+                        from backend.services.subject_fusion import build_subject_tracks
+                        _subject_tracks = build_subject_tracks(
+                            face_registry=face_registry,
+                            dense_faces=dense_face_results,
+                            saliency_regions=_saliency_regions if '_saliency_regions' in dir() else [],
+                            frame_paths=[(f.timestamp, f.path) for f in frames],
+                            source_width=metadata.get("width", 1920),
+                            source_height=metadata.get("height", 1080),
+                            shot_cuts=_shot_cuts,
+                            job_id=job_id,
+                        )
+                        logger.info("[%s] SubjectFusion: %d unified tracks", job_id,
+                                    len(_subject_tracks) if _subject_tracks else 0)
+                    except Exception as e:
+                        logger.warning("[%s] Subject fusion failed (non-fatal): %s", job_id, e)
+
+                logger.info("[%s] Reframe mode: AUTOFLIP (fusion: %s)", job_id,
+                            "enabled" if USE_SUBJECT_FUSION else "disabled")
+
                 reframe_segments = build_autoflip_segments(
                     shot_cuts=_shot_cuts,
                     face_registry=face_registry,
@@ -2568,6 +2593,7 @@ async def _run_analysis_inner(job_id: str):
                     persistent_regions=_persistent_regions,
                     saliency_regions=_saliency_regions,
                     object_detections=_object_detections,
+                    subject_tracks=_subject_tracks,
                     target_aspect=9/16,
                     job_id=job_id,
                 )
