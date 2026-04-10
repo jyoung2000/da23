@@ -291,61 +291,53 @@ def build_active_speaker_timeline(
                 merged.append(ev)
         events = merged
 
-    # ── Dominant speaker momentum ──
-    # If one speaker dominates (>40% of time), require higher confidence
-    # to switch away. This prevents brief reactions/laughing from causing
-    # false speaker switches.
-    if events:
-        cumulative_time: dict[int, float] = {}
-        for ev in events:
-            if ev.slot_id >= 0:
-                cumulative_time[ev.slot_id] = cumulative_time.get(ev.slot_id, 0) + (ev.end - ev.start)
+    # ── Asymmetric hysteresis: fast attack, slower release ──
+    # Replaces the old "dominant speaker momentum" symmetric smoothing.
+    # Two-threshold state machine:
+    #   Attack: confidence >= ATTACK_THRESHOLD → emit switch immediately
+    #   Release: confidence < RELEASE_THRESHOLD → release lock
+    # The event is back-dated to the attack-trigger timestamp so the crop
+    # arrives *with* the speaker, not after.
+    ATTACK_THRESHOLD = 0.7
+    RELEASE_THRESHOLD = 0.3
 
-        if cumulative_time:
-            total_time = sum(cumulative_time.values())
-            dominant_slot = max(cumulative_time, key=cumulative_time.get)
-            dominant_frac = cumulative_time[dominant_slot] / max(total_time, 0.1)
-
-            # Scale threshold based on speaker count — aggressive momentum
-            # suppresses minority speakers in 4+ person panels
-            num_speakers = len([s for s in cumulative_time if cumulative_time[s] > 5.0])
-            if num_speakers >= 4:
-                MIN_SWITCH_CONFIDENCE = 0.3 if dominant_frac > 0.70 else None
-            elif dominant_frac > 0.4:
-                MIN_SWITCH_CONFIDENCE = 0.5
-            else:
-                MIN_SWITCH_CONFIDENCE = None
-
-            if MIN_SWITCH_CONFIDENCE is not None:
-                reverted = 0
-                for i in range(1, len(events)):
-                    if (events[i - 1].slot_id == dominant_slot and
-                            events[i].slot_id != dominant_slot and
-                            events[i].confidence < MIN_SWITCH_CONFIDENCE):
-                        events[i] = SpeakerEvent(
-                            start=events[i].start, end=events[i].end,
-                            slot_id=dominant_slot,
-                            confidence=events[i - 1].confidence * 0.9,
-                        )
-                        reverted += 1
-                if reverted > 0:
-                    logger.info(
-                        "Dominant speaker momentum: slot %d (%.0f%% of time, %d speakers), "
-                        "reverted %d low-confidence switches (threshold=%.1f)",
-                        dominant_slot, dominant_frac * 100, num_speakers,
-                        reverted, MIN_SWITCH_CONFIDENCE,
+    if events and len(events) >= 2:
+        refined = [events[0]]
+        for ev in events[1:]:
+            prev = refined[-1]
+            if ev.slot_id != prev.slot_id and ev.slot_id >= 0:
+                # Attack: new speaker with high confidence → immediate switch
+                if ev.confidence >= ATTACK_THRESHOLD:
+                    refined.append(ev)
+                # Low confidence switch → only accept if previous speaker
+                # has released (low confidence in previous)
+                elif prev.confidence < RELEASE_THRESHOLD:
+                    refined.append(ev)
+                else:
+                    # Suppress: extend previous speaker through this segment
+                    refined[-1] = SpeakerEvent(
+                        start=prev.start, end=ev.end,
+                        slot_id=prev.slot_id,
+                        confidence=prev.confidence * 0.95,
                     )
-                    merged2 = [events[0]]
-                    for ev in events[1:]:
-                        if ev.slot_id == merged2[-1].slot_id and ev.start - merged2[-1].end < 1.0:
-                            merged2[-1] = SpeakerEvent(
-                                start=merged2[-1].start, end=ev.end,
-                                slot_id=ev.slot_id,
-                                confidence=max(merged2[-1].confidence, ev.confidence),
-                            )
-                        else:
-                            merged2.append(ev)
-                    events = merged2
+            elif ev.slot_id == prev.slot_id:
+                # Same speaker: merge
+                refined[-1] = SpeakerEvent(
+                    start=prev.start, end=ev.end,
+                    slot_id=ev.slot_id,
+                    confidence=max(prev.confidence, ev.confidence),
+                )
+            else:
+                refined.append(ev)
+
+        suppressed = len(events) - len(refined)
+        if suppressed > 0:
+            logger.info(
+                "Asymmetric hysteresis: suppressed %d low-confidence switches "
+                "(attack=%.1f, release=%.1f)",
+                suppressed, ATTACK_THRESHOLD, RELEASE_THRESHOLD,
+            )
+        events = refined
 
     logger.info(
         "Active speaker timeline: %d events, %d unique speakers, avg confidence=%.2f",
