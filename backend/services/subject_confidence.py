@@ -443,6 +443,8 @@ def get_fallback_strategy(
     content_type: str,
     last_confident_x: Optional[int] = None,
     last_confident_slot: Optional[int] = None,
+    candidate_x: Optional[int] = None,
+    candidate_slot: Optional[int] = None,
 ) -> tuple:
     """Determine the fallback strategy based on confidence level.
 
@@ -450,7 +452,8 @@ def get_fallback_strategy(
 
     The fallback ladder:
       >= 0.70: no fallback needed (caller uses the candidate)
-      >= 0.50: inherit last known confident position
+      >= 0.50: USE the current candidate position (face IS detected,
+               just with medium confidence — don't discard it)
       >= 0.30: content-type-dependent (blur_fill or wide_master)
       <  0.30: wide_master (absolute last resort)
     """
@@ -458,16 +461,22 @@ def get_fallback_strategy(
         return None  # No fallback — use the candidate as-is
 
     if confidence >= CONFIDENCE_MEDIUM:
-        # Inherit last known confident position
-        if last_confident_x is not None:
+        # Medium confidence: a face IS detected but with lower certainty.
+        # Use the CURRENT candidate position — not the stale last-known one.
+        # The previous behavior of inheriting last_confident_x caused the
+        # "subject at 51% but crop at 24%" bug when the face moved but
+        # confidence dropped slightly.
+        use_x = candidate_x if candidate_x is not None else last_confident_x
+        use_slot = candidate_slot if candidate_slot is not None else last_confident_slot
+        if use_x is not None:
             return (
                 "stationary",
                 "single",
-                last_confident_x,
-                last_confident_slot,
-                "confidence_medium_inherit",
+                use_x,
+                use_slot,
+                "confidence_medium_current",
             )
-        # No history — fall through to blur/wide
+        # No position at all — fall through to blur/wide
         pass
 
     preference = FALLBACK_PREFERENCE.get(content_type, "blur_fill")

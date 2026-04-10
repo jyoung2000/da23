@@ -134,17 +134,33 @@ class TestConfidentSpeaker:
 class TestLastKnownInheritance:
     """Confident at t=10, brief low at t=12, resume at t=13."""
 
-    def test_medium_confidence_inherits(self):
+    def test_medium_confidence_uses_current_position(self):
+        """Medium confidence uses the CURRENT candidate position, not stale last-known."""
         fallback = get_fallback_strategy(
             0.55, "podcast",
             last_confident_x=30,
             last_confident_slot=0,
+            candidate_x=51,
+            candidate_slot=2,
         )
         assert fallback is not None
         strategy, layout, subject_x, active_slot, reason = fallback
-        assert subject_x == 30, "Should inherit last confident position"
-        assert active_slot == 0
-        assert "inherit" in reason
+        assert subject_x == 51, "Should use current candidate position, not stale last_confident_x"
+        assert active_slot == 2
+        assert "current" in reason
+
+    def test_medium_confidence_falls_back_to_last_when_no_candidate(self):
+        """When no candidate position, medium confidence uses last_confident_x."""
+        fallback = get_fallback_strategy(
+            0.55, "podcast",
+            last_confident_x=30,
+            last_confident_slot=0,
+            candidate_x=None,
+            candidate_slot=None,
+        )
+        assert fallback is not None
+        strategy, layout, subject_x, active_slot, reason = fallback
+        assert subject_x == 30, "Should fall back to last confident when no candidate"
 
     def test_medium_confidence_no_history_falls_through(self):
         fallback = get_fallback_strategy(

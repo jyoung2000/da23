@@ -168,10 +168,16 @@ def build_autoflip_segments(
 
             if sub_boundaries and len(sub_boundaries) > 1:
                 for sub_start, sub_end, sub_slot in sub_boundaries:
+                    # Resolve per-sub-segment crop center from face position
+                    sub_cx = cx
+                    if sub_slot is not None and face_registry:
+                        slot = face_registry.slot_by_id(sub_slot) if hasattr(face_registry, 'slot_by_id') else None
+                        if slot:
+                            sub_cx = slot.x_center
                     segments.append(ReframeSegment(
                         start=sub_start,
                         end=sub_end,
-                        subject_x=int(round(cx)),
+                        subject_x=int(round(sub_cx)),
                         subject_y=int(round(cy)) if cy != 50 else SUBJECT_Y_DEFAULT,
                         layout="single",
                         active_slot=sub_slot,
@@ -183,20 +189,49 @@ def build_autoflip_segments(
                         motion_path=None,
                     ))
             else:
-                segments.append(ReframeSegment(
-                    start=shot_start,
-                    end=shot_end,
-                    subject_x=int(round(cx)),
-                    subject_y=int(round(cy)) if cy != 50 else SUBJECT_Y_DEFAULT,
-                    layout="single",
-                    active_slot=active_slot,
-                    confidence=0.0,
-                    reason="shot_cut",
-                    ease_in_ms=0,
-                    strategy="stationary",
-                    content_type="unknown",
-                    motion_path=None,
-                ))
+                # ── Speaker-turn sub-segmentation ──
+                # Even without intent tracking, split the shot at speaker
+                # turn boundaries so the crop follows each speaker.
+                speaker_subs = _get_speaker_sub_boundaries(
+                    shot_start, shot_end, active_speaker_events,
+                    transcript_segments, speaker_to_slot,
+                )
+                if speaker_subs and len(speaker_subs) > 1:
+                    for sub_start, sub_end, sub_slot in speaker_subs:
+                        sub_cx = cx
+                        if sub_slot is not None and face_registry:
+                            slot = face_registry.slot_by_id(sub_slot) if hasattr(face_registry, 'slot_by_id') else None
+                            if slot:
+                                sub_cx = slot.x_center
+                        segments.append(ReframeSegment(
+                            start=sub_start,
+                            end=sub_end,
+                            subject_x=int(round(sub_cx)),
+                            subject_y=SUBJECT_Y_DEFAULT,
+                            layout="single",
+                            active_slot=sub_slot,
+                            confidence=0.0,
+                            reason="speaker_turn" if sub_start > shot_start else "shot_cut",
+                            ease_in_ms=200 if sub_start > shot_start else 0,
+                            strategy="stationary",
+                            content_type="unknown",
+                            motion_path=None,
+                        ))
+                else:
+                    segments.append(ReframeSegment(
+                        start=shot_start,
+                        end=shot_end,
+                        subject_x=int(round(cx)),
+                        subject_y=int(round(cy)) if cy != 50 else SUBJECT_Y_DEFAULT,
+                        layout="single",
+                        active_slot=active_slot,
+                        confidence=0.0,
+                        reason="shot_cut",
+                        ease_in_ms=0,
+                        strategy="stationary",
+                        content_type="unknown",
+                        motion_path=None,
+                    ))
 
         elif mode in (CameraMode.TRACKING, CameraMode.PANNING):
             # 2d. Optimize trajectory
@@ -323,6 +358,8 @@ def build_autoflip_segments(
                 seg.confidence, seg.content_type,
                 last_confident_x=last_confident_x,
                 last_confident_slot=last_confident_slot,
+                candidate_x=seg.subject_x,
+                candidate_slot=seg.active_slot,
             )
             if fallback is not None:
                 strategy, layout, subject_x, active_slot, reason = fallback
@@ -397,6 +434,78 @@ def _resolve_active_slot(
             return slot_time.most_common(1)[0][0]
 
     return None
+
+
+def _get_speaker_sub_boundaries(
+    shot_start: float,
+    shot_end: float,
+    active_speaker_events: list,
+    transcript_segments: list,
+    speaker_to_slot: dict,
+    min_hold: float = 0.4,
+) -> list:
+    """Build sub-segment boundaries from speaker turns within a shot.
+
+    Returns [(sub_start, sub_end, active_slot), ...] or None if there's
+    only one speaker. Minimum hold time prevents jitter on rapid turns.
+    """
+    from collections import Counter
+
+    # Build a timeline of speaker changes from transcript and active speaker events
+    events = []
+
+    # From transcript segments
+    if transcript_segments and speaker_to_slot:
+        for seg in transcript_segments:
+            s_start = getattr(seg, 'start', 0)
+            s_end = getattr(seg, 'end', 0)
+            if s_end <= shot_start or s_start >= shot_end:
+                continue
+            speaker = getattr(seg, 'speaker', None) or ''
+            slot_id = speaker_to_slot.get(speaker)
+            if slot_id is not None:
+                events.append((max(s_start, shot_start), min(s_end, shot_end), slot_id))
+
+    # From active speaker events (if no transcript)
+    if not events and active_speaker_events:
+        for ev in active_speaker_events:
+            if ev.end <= shot_start or ev.start >= shot_end:
+                continue
+            if ev.slot_id >= 0:
+                events.append((max(ev.start, shot_start), min(ev.end, shot_end), ev.slot_id))
+
+    if not events:
+        return None
+
+    events.sort(key=lambda e: e[0])
+
+    # Merge into sub-segments: walk events and create boundaries at speaker changes
+    boundaries = []
+    current_slot = events[0][2]
+    current_start = shot_start
+
+    for ev_start, ev_end, slot_id in events:
+        if slot_id != current_slot:
+            # Speaker changed — emit boundary if hold is long enough
+            if ev_start - current_start >= min_hold:
+                boundaries.append((current_start, ev_start, current_slot))
+                current_start = ev_start
+                current_slot = slot_id
+            else:
+                # Too short — skip this boundary (merge with current)
+                pass
+
+    # Final sub-segment
+    if shot_end - current_start >= min_hold:
+        boundaries.append((current_start, shot_end, current_slot))
+    elif boundaries:
+        # Extend the last boundary to shot_end
+        last = boundaries[-1]
+        boundaries[-1] = (last[0], shot_end, last[2])
+    else:
+        boundaries.append((shot_start, shot_end, current_slot))
+
+    return boundaries if len(boundaries) > 1 else None
 
 
 def _resolve_active_slot_from_intent(

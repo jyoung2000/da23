@@ -25,15 +25,9 @@ def _make_segment(strategy="stationary", confidence=0.85, layout="single",
 
 
 class TestConfidenceFloorEnforcement:
-    def test_53_percent_face_downgraded(self):
-        """Screenshot reproduction: 53% face confidence + stationary → blur_fill."""
-        seg = _make_segment(strategy="stationary", confidence=0.53)
-        result = enforce_confidence_floor([seg], job_id="test")
-        assert result[0].strategy == "blur_fill"
-        assert result[0].layout == "blur_fill"
-        assert result[0].subject_x == 50
-        assert result[0].active_slot is None
-        assert "forced_downgrade" in result[0].fallback_reason
+    def test_floor_is_050(self):
+        """Confidence floor is 0.50 — faces detected at 0.55 should crop."""
+        assert CONFIDENCE_FLOOR_FOR_CROP == 0.50
 
     def test_high_confidence_unchanged(self):
         """85% confidence stationary segment stays unchanged."""
@@ -43,6 +37,12 @@ class TestConfidenceFloorEnforcement:
         assert result[0].layout == "single"
         assert result[0].subject_x == 30
 
+    def test_medium_confidence_unchanged(self):
+        """55% confidence stationary segment stays unchanged (above 0.50 floor)."""
+        seg = _make_segment(strategy="stationary", confidence=0.55)
+        result = enforce_confidence_floor([seg], job_id="test")
+        assert result[0].strategy == "stationary"
+
     def test_blur_fill_already_fallback_unchanged(self):
         """blur_fill at 30% confidence stays unchanged (already a fallback)."""
         seg = _make_segment(strategy="blur_fill", confidence=0.30, layout="blur_fill")
@@ -51,14 +51,14 @@ class TestConfidenceFloorEnforcement:
         assert result[0].fallback_reason is None  # not re-tagged
 
     def test_tracking_low_confidence_downgraded(self):
-        """Tracking strategy at 0.40 confidence is downgraded."""
+        """Tracking strategy at 0.40 confidence is downgraded (below 0.50)."""
         seg = _make_segment(strategy="tracking", confidence=0.40)
         result = enforce_confidence_floor([seg], job_id="test")
         assert result[0].strategy == "blur_fill"
 
-    def test_panning_low_confidence_downgraded(self):
-        """Panning strategy at 0.60 confidence is downgraded."""
-        seg = _make_segment(strategy="panning", confidence=0.60)
+    def test_panning_below_floor_downgraded(self):
+        """Panning strategy at 0.45 confidence is downgraded."""
+        seg = _make_segment(strategy="panning", confidence=0.45)
         result = enforce_confidence_floor([seg], job_id="test")
         assert result[0].strategy == "blur_fill"
 
@@ -66,7 +66,7 @@ class TestConfidenceFloorEnforcement:
         """Multiple violations in one list → all downgraded, summary log emitted."""
         segs = [
             _make_segment(strategy="stationary", confidence=0.24, start=0.0, end=1.0),
-            _make_segment(strategy="tracking", confidence=0.53, start=1.0, end=2.0),
+            _make_segment(strategy="tracking", confidence=0.30, start=1.0, end=2.0),
             _make_segment(strategy="stationary", confidence=0.90, start=2.0, end=3.0),
         ]
         with caplog.at_level(logging.WARNING):
@@ -78,13 +78,13 @@ class TestConfidenceFloorEnforcement:
         assert "downgraded 2 segments" in caplog.text
 
     def test_exactly_at_floor_unchanged(self):
-        """Segment at exactly 0.70 confidence is NOT downgraded."""
-        seg = _make_segment(strategy="stationary", confidence=0.70)
+        """Segment at exactly 0.50 confidence is NOT downgraded."""
+        seg = _make_segment(strategy="stationary", confidence=0.50)
         result = enforce_confidence_floor([seg], job_id="test")
         assert result[0].strategy == "stationary"
 
     def test_24_percent_face_downgraded(self):
-        """Screenshot reproduction: 24% face confidence → blur_fill."""
+        """24% face confidence → blur_fill (well below 0.50 floor)."""
         seg = _make_segment(strategy="stationary", confidence=0.24)
         result = enforce_confidence_floor([seg], job_id="test")
         assert result[0].strategy == "blur_fill"

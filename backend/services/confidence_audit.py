@@ -17,7 +17,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CONFIDENCE_FLOOR_FOR_CROP = 0.70
+CONFIDENCE_FLOOR_FOR_CROP = 0.50
 CROP_STRATEGIES = {"stationary", "tracking", "panning"}
 
 

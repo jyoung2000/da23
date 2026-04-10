@@ -38,8 +38,8 @@ USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "false")
 USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "false").lower() in ("true", "1", "yes")
 
 # ── Default tunables (used when no content profile is provided) ──
-MIN_HOLD_SECONDS = 0.8
-ANTICIPATION_MS = 350
+MIN_HOLD_SECONDS = 0.4
+ANTICIPATION_MS = 200
 SPEAKER_CONFIDENCE_THRESHOLD = 0.6
 SPEAKER_COVERAGE_THRESHOLD = 0.60
 DENSE_DOMINANCE_THRESHOLD = 0.70
@@ -402,6 +402,8 @@ def build_reframe_segments(
                     conf, ct,
                     last_confident_x=last_confident_x,
                     last_confident_slot=last_confident_slot,
+                    candidate_x=seg.subject_x,
+                    candidate_slot=seg.active_slot,
                 )
                 if fallback is not None:
                     strategy, layout, subject_x, active_slot, reason = fallback
