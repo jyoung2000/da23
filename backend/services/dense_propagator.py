@@ -115,6 +115,7 @@ def build_interpolated_timeline(
         )
 
         # ── Advance existing trackers ──
+        slots_before_update = set(slot_trackers.keys())
         for slot_id, tracker in list(slot_trackers.items()):
             bbox_px = tracker.update(img)
             if bbox_px is None:
@@ -169,6 +170,12 @@ def build_interpolated_timeline(
                         sample.had_reset = True
                         logger.debug("[%s] tracker_reset slot=%d t=%.2f reason=drift_%.1f%%",
                                      job_id, slot_id, timestamp, drift)
+                elif slot_id in slots_before_update:
+                    # Tracker was active but lost the target — also a reset
+                    n_resets += 1
+                    sample.had_reset = True
+                    logger.debug("[%s] tracker_reset slot=%d t=%.2f reason=tracker_lost",
+                                 job_id, slot_id, timestamp)
 
                 if needs_reset or slot_id not in slot_trackers:
                     if slot_id in slot_trackers:
