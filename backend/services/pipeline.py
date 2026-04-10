@@ -1879,6 +1879,24 @@ async def _run_analysis_inner(job_id: str):
         f"Analysis complete in {dur_str} — "
         f"{len(transcript)} segments, {len(scenes)} scenes, {len(clips)} clips"
     )
+
+    # Extract thumbnail for rich preview unfurls (non-fatal)
+    _thumb_path = None
+    try:
+        from backend.services.thumbnail_extractor import extract_thumbnail
+        _video_dur = metadata.get("duration", 0) if metadata else 0
+        _thumb = extract_thumbnail(
+            job_id=job_id,
+            source_video_path=video_path,
+            video_duration=_video_dur,
+            scenes=scenes,
+        )
+        if _thumb:
+            _thumb_path = str(_thumb)
+            logger.info("[%s] thumbnail saved: %s", job_id, _thumb_path)
+    except Exception as e:
+        logger.warning("[%s] thumbnail step failed (non-fatal): %s", job_id, e)
+
     await database.update_job_status(
         job_id,
         status=JobStatus.COMPLETE,
@@ -1886,6 +1904,7 @@ async def _run_analysis_inner(job_id: str):
         progress_message=completion_msg,
         analysis_duration_seconds=total_elapsed,
         estimated_cost_usd=estimated_cost if estimated_cost > 0 else None,
+        thumbnail_path=_thumb_path,
     )
     await broadcast_ws(job_id, {
         "type": "complete",

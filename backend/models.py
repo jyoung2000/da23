@@ -107,6 +107,7 @@ class JobResult(BaseModel):
     subtitle_settings: Optional[dict] = None  # Canonical subtitle settings — server is source of truth
     error: Optional[str] = None
     estimated_cost_usd: Optional[float] = None
+    thumbnail_path: Optional[str] = None  # Filesystem path to 1200x630 JPG for OG unfurls
 
 
 class ClipSEO(BaseModel):
