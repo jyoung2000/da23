@@ -22,6 +22,8 @@ crop. Instead falls back to blur_fill or wide_master showing the full source.
 Consumes shot cuts, face registry, active speaker events, dense faces,
 transcript segments, and speaker-to-slot mapping. Produces a list of
 ReframeSegment objects that the pipeline emits as scenes.
+
+Interval convention: all segments use half-open [start, end) semantics.
 """
 
 import logging
@@ -531,9 +533,11 @@ def build_reframe_segments(
         _log("consolidated %d consecutive same-slot segments", consolidated)
 
     # ── Stage 5: Anticipation offset (adaptive) ──
+    # When shifting a segment's start earlier, also trim the predecessor's end
+    # to maintain half-open [start, end) contiguity — no overlaps.
     shot_cut_set = set(shot_cuts)
     anticipated = 0
-    for seg in raw_segments:
+    for idx_seg, seg in enumerate(raw_segments):
         if seg.reason == "speaker_turn":
             at_shot_cut = any(abs(seg.start - sc) < 0.15 for sc in shot_cuts)
             if at_shot_cut:
@@ -550,6 +554,9 @@ def build_reframe_segments(
                     break
             new_start = max(prev_cut, seg.start - shift_s)
             if new_start < seg.start:
+                # Trim predecessor's end to match so intervals stay contiguous
+                if idx_seg > 0:
+                    raw_segments[idx_seg - 1].end = new_start
                 seg.start = new_start
                 anticipated += 1
 
@@ -669,6 +676,24 @@ def build_reframe_segments(
             seg.confidence,
             seg.fallback_reason or "none",
             in_crop,
+        )
+
+    # ── Exit: enforce half-open [start, end) contiguity ──
+    # Sort, snap adjacent boundaries to exact equality, and assert no overlaps.
+    raw_segments.sort(key=lambda s: s.start)
+    for a, b in zip(raw_segments, raw_segments[1:]):
+        # Snap to exact equality to kill float drift
+        b.start = a.end
+    if raw_segments:
+        assert raw_segments[0].start == 0.0, (
+            f"First segment starts at {raw_segments[0].start}, expected 0.0"
+        )
+        assert abs(raw_segments[-1].end - video_duration) < 1e-6, (
+            f"Last segment ends at {raw_segments[-1].end}, expected {video_duration}"
+        )
+    for a, b in zip(raw_segments, raw_segments[1:]):
+        assert a.end <= b.start, (
+            f"Overlap: segment ending at {a.end} > next starting at {b.start}"
         )
 
     return raw_segments
@@ -1027,39 +1052,45 @@ def _slot_to_x(active_slot: Optional[int], face_registry) -> int:
 
 
 def _merge_short_segment(segments: list[ReframeSegment], idx: int) -> Optional[int]:
-    """Merge a short segment into the best neighbor. Returns neighbor index or None."""
+    """Merge a short segment into the best neighbor.
+
+    Uses half-open [start, end) semantics. After merge the absorbed segment's
+    entire time range is covered by the neighbor and contiguity is preserved.
+
+    Returns neighbor index or None.
+    """
     seg = segments[idx]
 
     left = segments[idx - 1] if idx > 0 else None
     right = segments[idx + 1] if idx < len(segments) - 1 else None
 
-    # Prefer neighbor with same active_slot
-    if left and left.active_slot == seg.active_slot:
+    def _absorb_into_left():
+        # left absorbs seg: left.end extends to seg.end (half-open)
         left.end = seg.end
         segments.pop(idx)
         return idx - 1
-    if right and right.active_slot == seg.active_slot:
+
+    def _absorb_into_right():
+        # right absorbs seg: right.start retracts to seg.start (half-open)
         right.start = seg.start
         segments.pop(idx)
         return idx
+
+    # Prefer neighbor with same active_slot
+    if left and left.active_slot == seg.active_slot:
+        return _absorb_into_left()
+    if right and right.active_slot == seg.active_slot:
+        return _absorb_into_right()
     # Merge into the longer neighbor
     if left and right:
         left_dur = left.end - left.start
         right_dur = right.end - right.start
         if left_dur >= right_dur:
-            left.end = seg.end
-            segments.pop(idx)
-            return idx - 1
+            return _absorb_into_left()
         else:
-            right.start = seg.start
-            segments.pop(idx)
-            return idx
+            return _absorb_into_right()
     elif left:
-        left.end = seg.end
-        segments.pop(idx)
-        return idx - 1
+        return _absorb_into_left()
     elif right:
-        right.start = seg.start
-        segments.pop(idx)
-        return idx
+        return _absorb_into_right()
     return None
