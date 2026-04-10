@@ -345,26 +345,27 @@ def plan_layout(
     scene_descriptions: list = None,
     video_duration: float = 0,
     job_id: str = "",
+    content_type=None,
+    persistent_regions=None,
+    frame_objects: list = None,
+    frame_saliency: list = None,
 ) -> LayoutTimeline:
-    """Solver-first layout planner.
+    """Solver-first layout planner with content-type-aware routing.
 
     Runs shot detection → required regions → per-shot camera solver.
     For solver-handled shots (STATIONARY/PANNING/TRACKING), emits SINGLE
     layout with the solver's keyframes stored in face_positions.
-    For PADDED shots, falls through to the existing layout voter.
+    For PADDED shots, routes by content_type to specialized layout helpers.
 
     Wrapped in a try/except: on any failure, falls back to the existing
     build_layout_timeline().
     """
-    from backend.services.shot_detector import detect_shots
-    from backend.services.camera_solver import solve_all_shots, CameraMode
-    from backend.services.required_regions import build_required_regions
-
     try:
         return _plan_layout_impl(
             video_path, frame_faces, face_registry, active_speaker_events,
             source_width, source_height, scene_descriptions, video_duration,
-            job_id,
+            job_id, content_type, persistent_regions, frame_objects,
+            frame_saliency,
         )
     except Exception as e:
         logger.warning("[%s] plan_layout failed (%s) — falling back to legacy layout", job_id, e)
@@ -382,24 +383,45 @@ def plan_layout(
 def _plan_layout_impl(
     video_path, frame_faces, face_registry, active_speaker_events,
     source_width, source_height, scene_descriptions, video_duration, job_id,
+    content_type, persistent_regions, frame_objects, frame_saliency,
 ):
     from backend.models import LayoutMode
     from backend.services.shot_detector import detect_shots
-    from backend.services.camera_solver import solve_all_shots, CameraMode
-    from backend.services.required_regions import build_required_regions
+    from backend.services.camera_solver import (
+        solve_all_shots, CameraMode, get_params_for_content_type,
+    )
+    from backend.services.required_regions import (
+        build_required_regions, promote_preferred_to_required,
+    )
 
-    # 1. Detect shots
-    shots = detect_shots(video_path, video_duration=video_duration)
-    logger.info("[%s] plan_layout: %d shots detected", job_id, len(shots))
+    # Get content-type-specific solver params for shot detection threshold
+    params = get_params_for_content_type(content_type) if content_type else None
+    shot_threshold = params.shot_threshold if params else 27.0
 
-    # 2. Build required regions from existing face data
-    regions = build_required_regions(frame_faces, active_speaker_events)
+    # 1. Detect shots (with content-type-tuned threshold)
+    shots = detect_shots(video_path, threshold=shot_threshold,
+                         video_duration=video_duration)
+    logger.info("[%s] plan_layout: %d shots detected (threshold=%.0f)",
+                job_id, len(shots), shot_threshold)
 
-    # 3. Solve camera mode per shot
+    # 2. Build required regions (with optional object/saliency fusion)
+    regions = build_required_regions(
+        frame_faces, active_speaker_events,
+        frame_objects=frame_objects,
+        frame_saliency=frame_saliency,
+        content_type=content_type,
+    )
+
+    # Promote preferred → required for frames with no faces
+    # (critical for anime and gameplay where saliency is load-bearing)
+    promote_preferred_to_required(regions)
+
+    # 3. Solve camera mode per shot (with content-type tuning)
     shot_cameras = solve_all_shots(
         shots, regions,
         source_width=source_width,
         source_height=source_height,
+        content_type=content_type,
         job_id=job_id,
     )
 
@@ -413,7 +435,7 @@ def _plan_layout_impl(
             kf_positions = [
                 {
                     "timestamp": float(t),
-                    "x": float(cx * 100),  # convert 0-1 to 0-100 pct
+                    "x": float(cx * 100),
                     "y": float(cy * 100),
                     "solver_mode": sc.mode.value,
                 }
@@ -428,26 +450,17 @@ def _plan_layout_impl(
             )
             segments.append(seg)
         else:
-            # PADDED → existing layout voter decides SPLIT / PIP
+            # PADDED → route by content type
             padded_count += 1
-            pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
-            if pad_faces and ALLOW_MULTI_LAYOUT:
-                sub = build_layout_timeline(
-                    face_results=pad_faces,
-                    face_registry=face_registry,
-                    active_speaker_events=active_speaker_events,
-                    scene_descriptions=scene_descriptions,
-                    clip_start=sc.start,
-                    clip_end=sc.end,
-                )
-                segments.extend(sub.segments)
+            seg = _build_padded_segment(
+                sc, content_type, frame_faces, face_registry,
+                active_speaker_events, scene_descriptions, regions,
+                source_width, source_height,
+            )
+            if isinstance(seg, list):
+                segments.extend(seg)
             else:
-                segments.append(LayoutSegment(
-                    start=sc.start,
-                    end=sc.end,
-                    layout_mode=LayoutMode.SINGLE,
-                    transition_type="cut",
-                ))
+                segments.append(seg)
 
     segments.sort(key=lambda s: s.start)
 
@@ -467,8 +480,133 @@ def _plan_layout_impl(
 
     solver_handled = sum(1 for sc in shot_cameras if sc.mode != CameraMode.PADDED)
     logger.info(
-        "[%s] [Layout+Solver] %d segments, %d solver-handled, %d padded-fallback, default=%s",
-        job_id, len(segments), solver_handled, padded_count, default_mode,
+        "[%s] [Layout+Solver] %d segments, %d solver-handled, %d padded-fallback, "
+        "content_type=%s, default=%s",
+        job_id, len(segments), solver_handled, padded_count,
+        content_type.value if content_type else "none", default_mode,
     )
 
     return timeline
+
+
+# ─────────────── Content-type-aware PADDED routing ────────────────────────
+
+def _build_padded_segment(
+    sc, content_type, frame_faces, face_registry,
+    active_speaker_events, scene_descriptions, regions_per_frame,
+    source_width, source_height,
+):
+    """Route a PADDED shot to a content-type-appropriate layout.
+
+    Returns a single LayoutSegment or a list of LayoutSegments.
+    """
+    from backend.models import LayoutMode
+
+    try:
+        from backend.services.content_classifier import ClipContentType
+    except ImportError:
+        ClipContentType = None
+
+    # Content-type-specific routing
+    if content_type and ClipContentType:
+        if content_type == ClipContentType.TALKING_HEAD:
+            # Debates/podcasts: SPLIT layout with two speakers
+            pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
+            if pad_faces and face_registry and face_registry.multi_speaker and ALLOW_MULTI_LAYOUT:
+                sub = build_layout_timeline(
+                    face_results=pad_faces,
+                    face_registry=face_registry,
+                    active_speaker_events=active_speaker_events,
+                    scene_descriptions=scene_descriptions,
+                    clip_start=sc.start,
+                    clip_end=sc.end,
+                )
+                return sub.segments
+
+        elif content_type == ClipContentType.STREAM:
+            # Twitch streams: gameplay PIP layout (facecam in corner)
+            if ALLOW_MULTI_LAYOUT:
+                return LayoutSegment(
+                    start=sc.start, end=sc.end,
+                    layout_mode="gameplay",
+                    transition_type="cut",
+                )
+
+        elif content_type == ClipContentType.GAMEPLAY:
+            # Pure gameplay: center crop
+            return LayoutSegment(
+                start=sc.start, end=sc.end,
+                layout_mode=LayoutMode.SINGLE,
+                transition_type="cut",
+            )
+
+        elif content_type == ClipContentType.ANIMATION:
+            # Anime: saliency-dominant crop (no splitting)
+            seg = _build_saliency_dominant_crop(
+                sc, regions_per_frame, source_width, source_height,
+            )
+            if seg:
+                return seg
+
+        elif content_type == ClipContentType.MUSIC_VIDEO:
+            # Music video: center crop (widened aspect handled downstream)
+            return LayoutSegment(
+                start=sc.start, end=sc.end,
+                layout_mode=LayoutMode.SINGLE,
+                transition_type="cut",
+            )
+
+    # Generic fallback: existing layout voter or SINGLE
+    pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
+    if pad_faces and ALLOW_MULTI_LAYOUT:
+        sub = build_layout_timeline(
+            face_results=pad_faces,
+            face_registry=face_registry,
+            active_speaker_events=active_speaker_events,
+            scene_descriptions=scene_descriptions,
+            clip_start=sc.start,
+            clip_end=sc.end,
+        )
+        return sub.segments
+
+    return LayoutSegment(
+        start=sc.start, end=sc.end,
+        layout_mode=LayoutMode.SINGLE,
+        transition_type="cut",
+    )
+
+
+def _build_saliency_dominant_crop(sc, regions_per_frame, source_width, source_height):
+    """For anime PADDED shots: pick the single highest-score region per frame
+    and track it, rather than splitting (anime doesn't have two speakers).
+    """
+    from backend.models import LayoutMode
+
+    shot_regions = []
+    for regs in regions_per_frame:
+        if not regs:
+            continue
+        if not (sc.start <= regs[0].timestamp <= sc.end):
+            continue
+        best = max(regs, key=lambda r: r.score)
+        shot_regions.append(best)
+
+    if not shot_regions:
+        return None
+
+    kf_positions = [
+        {
+            "timestamp": float(r.timestamp),
+            "x": float(r.cx * 100),
+            "y": float(r.cy * 100),
+            "solver_mode": "saliency_dominant",
+        }
+        for r in shot_regions
+    ]
+
+    return LayoutSegment(
+        start=sc.start, end=sc.end,
+        layout_mode=LayoutMode.SINGLE,
+        face_positions=kf_positions,
+        transition_type="cut",
+    )

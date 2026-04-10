@@ -30,6 +30,83 @@ class CameraMode(str, Enum):
     PADDED = "padded"
 
 
+# ── Per-content-type solver tuning ──
+
+@dataclass
+class SolverParams:
+    smoothing_alpha: float           # tracking mode exponential smoothing
+    panning_residual_threshold: float  # not used yet (reserved for residual check)
+    stationary_slack: float          # extra width allowed for stationary mode
+    prefer_stationary: bool          # bias toward static crops
+    shot_threshold: float            # PySceneDetect threshold for this type
+
+
+# Import ClipContentType lazily to avoid circular imports
+def _get_content_params():
+    from backend.services.content_classifier import ClipContentType
+    return {
+        ClipContentType.TALKING_HEAD: SolverParams(
+            smoothing_alpha=0.25,
+            panning_residual_threshold=0.03,
+            stationary_slack=0.05,
+            prefer_stationary=True,
+            shot_threshold=30.0,
+        ),
+        ClipContentType.ANIMATION: SolverParams(
+            smoothing_alpha=0.4,
+            panning_residual_threshold=0.08,
+            stationary_slack=0.0,
+            prefer_stationary=False,
+            shot_threshold=27.0,
+        ),
+        ClipContentType.MUSIC_VIDEO: SolverParams(
+            smoothing_alpha=0.5,
+            panning_residual_threshold=0.1,
+            stationary_slack=0.02,
+            prefer_stationary=False,
+            shot_threshold=35.0,
+        ),
+        ClipContentType.GAMEPLAY: SolverParams(
+            smoothing_alpha=0.6,
+            panning_residual_threshold=0.05,
+            stationary_slack=0.1,
+            prefer_stationary=True,
+            shot_threshold=40.0,
+        ),
+        ClipContentType.STREAM: SolverParams(
+            smoothing_alpha=0.3,
+            panning_residual_threshold=0.03,
+            stationary_slack=0.0,
+            prefer_stationary=True,
+            shot_threshold=35.0,
+        ),
+        ClipContentType.GENERIC: SolverParams(
+            smoothing_alpha=0.35,
+            panning_residual_threshold=0.05,
+            stationary_slack=0.0,
+            prefer_stationary=False,
+            shot_threshold=27.0,
+        ),
+    }
+
+
+_DEFAULT_PARAMS = SolverParams(
+    smoothing_alpha=0.35,
+    panning_residual_threshold=0.05,
+    stationary_slack=0.0,
+    prefer_stationary=False,
+    shot_threshold=27.0,
+)
+
+
+def get_params_for_content_type(content_type) -> SolverParams:
+    """Get solver parameters tuned for a specific content type."""
+    try:
+        return _get_content_params().get(content_type, _DEFAULT_PARAMS)
+    except Exception:
+        return _DEFAULT_PARAMS
+
+
 @dataclass
 class ShotCamera:
     shot_index: int
@@ -56,6 +133,7 @@ def solve_shot(
     shot,
     regions_per_frame: list,
     source_aspect: float,
+    params: Optional[SolverParams] = None,
 ) -> ShotCamera:
     """Pick the simplest camera mode for a single shot.
 
@@ -63,15 +141,25 @@ def solve_shot(
         shot: Shot dataclass with .index, .start, .end
         regions_per_frame: list of list[RequiredRegion] from required_regions.py
         source_aspect: width/height of source video (e.g. 16/9 = 1.778)
+        params: Content-type-specific solver parameters (None = generic defaults)
 
     Returns:
         ShotCamera with mode and keyframes.
     """
-    # Filter to just this shot's frames
-    shot_frames = [
-        regs for regs in regions_per_frame
-        if regs and shot.start <= regs[0].timestamp <= shot.end
-    ]
+    if params is None:
+        params = _DEFAULT_PARAMS
+
+    # Filter to just this shot's frames — use only "required" tier regions
+    shot_frames = []
+    for regs in regions_per_frame:
+        if not regs or not (shot.start <= regs[0].timestamp <= shot.end):
+            continue
+        required = [r for r in regs if r.tier == "required"]
+        if required:
+            shot_frames.append(required)
+        elif regs:
+            # No required regions — use all (preferred gets a chance)
+            shot_frames.append(regs)
 
     if not shot_frames:
         return ShotCamera(
@@ -106,7 +194,7 @@ def solve_shot(
     shot_union_width = shot_right - shot_left
     shot_union_center = (shot_left + shot_right) / 2
 
-    if shot_union_width <= crop_half_width * 2:
+    if shot_union_width <= crop_half_width * 2 + params.stationary_slack:
         cx = float(np.clip(shot_union_center, crop_half_width, 1 - crop_half_width))
         cy = float(np.mean([b["cy"] for b in per_frame_bounds]))
         # Verify every frame's required bbox fits
@@ -151,8 +239,7 @@ def solve_shot(
 
     # ── Attempt 3: TRACKING ──
     centers = np.array([b["center"] for b in per_frame_bounds])
-    # Exponential smoothing, alpha tuned for ~0.5s time constant at 1fps
-    alpha = 0.35
+    alpha = params.smoothing_alpha
     smoothed = np.zeros_like(centers)
     smoothed[0] = centers[0]
     for i in range(1, len(centers)):
@@ -205,6 +292,7 @@ def solve_all_shots(
     regions_per_frame: list,
     source_width: int = 1920,
     source_height: int = 1080,
+    content_type=None,
     job_id: str = "",
 ) -> List[ShotCamera]:
     """Solve camera mode for all shots in a video.
@@ -213,19 +301,23 @@ def solve_all_shots(
         shots: list[Shot] from shot_detector
         regions_per_frame: list of list[RequiredRegion] from required_regions
         source_width, source_height: source video dimensions
+        content_type: ClipContentType for per-content-type tuning (None = generic)
         job_id: for logging
 
     Returns:
         list[ShotCamera], one per shot
     """
     source_aspect = source_width / source_height if source_height > 0 else 16 / 9
+    params = get_params_for_content_type(content_type) if content_type else _DEFAULT_PARAMS
 
     results = []
     mode_counts = {}
     for shot in shots:
-        camera = solve_shot(shot, regions_per_frame, source_aspect)
+        camera = solve_shot(shot, regions_per_frame, source_aspect, params)
         results.append(camera)
         mode_counts[camera.mode.value] = mode_counts.get(camera.mode.value, 0) + 1
 
-    logger.info("[%s] CameraSolver: %d shots → %s", job_id, len(results), mode_counts)
+    logger.info("[%s] CameraSolver (%s): %d shots → %s",
+                job_id, content_type.value if content_type else "generic",
+                len(results), mode_counts)
     return results

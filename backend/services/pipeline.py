@@ -3117,6 +3117,63 @@ async def _run_analysis_inner(job_id: str):
             if _solver_on and _layout_face_data and not _is_gameplay:
                 try:
                     from backend.services.layout_engine import plan_layout
+
+                    # ── Content-type classification for solver tuning ──
+                    _clip_content_type = None
+                    _solver_objects = None
+                    _solver_saliency = None
+                    _content_routing = os.environ.get("CLIPAI_CONTENT_ROUTING", "off").lower()
+                    _enabled_types = os.environ.get("CLIPAI_CONTENT_TYPES_ENABLED", "").lower().split(",")
+                    _enabled_types = [t.strip() for t in _enabled_types if t.strip()]
+
+                    if _content_routing == "on" and _content_profile:
+                        try:
+                            from backend.services.content_classifier import classify_clip, ClipContentType
+                            _clip_content_type = classify_clip(
+                                content_profile=_content_profile,
+                                persistent_regions=_persistent_regions,
+                                frame_faces=_layout_face_data,
+                                shot_count=len(scene_cut_timestamps) if scene_cut_timestamps else 0,
+                                duration=metadata.get("duration", 0),
+                            )
+                            # Filter by enabled types if specified
+                            if _enabled_types and _clip_content_type.value not in _enabled_types:
+                                logger.info(
+                                    "[%s] Content type %s not in enabled list %s — using generic",
+                                    job_id, _clip_content_type.value, _enabled_types,
+                                )
+                                _clip_content_type = ClipContentType.GENERIC
+
+                            # Conditional object/saliency detection by content type
+                            if _clip_content_type in (
+                                ClipContentType.ANIMATION, ClipContentType.MUSIC_VIDEO,
+                                ClipContentType.GENERIC,
+                            ):
+                                try:
+                                    from backend.services.object_detector import detect_objects_in_frames
+                                    _frame_list_obj = [(f.timestamp, f.path) for f in frames]
+                                    _solver_objects = detect_objects_in_frames(_frame_list_obj, face_results)
+                                    logger.info("[%s] Content-routed object detection: %d objects",
+                                                job_id, len(_solver_objects))
+                                except Exception as _oe:
+                                    logger.warning("[%s] Content-routed object detection failed: %s", job_id, _oe)
+
+                            if _clip_content_type in (
+                                ClipContentType.ANIMATION, ClipContentType.MUSIC_VIDEO,
+                                ClipContentType.GAMEPLAY,
+                            ):
+                                try:
+                                    from backend.services.saliency_tracker import track_saliency_in_frames
+                                    _frame_list_sal = [(f.timestamp, f.path) for f in frames]
+                                    _solver_saliency = track_saliency_in_frames(_frame_list_sal, face_results)
+                                    logger.info("[%s] Content-routed saliency detection: %d regions",
+                                                job_id, len(_solver_saliency))
+                                except Exception as _se:
+                                    logger.warning("[%s] Content-routed saliency detection failed: %s", job_id, _se)
+
+                        except Exception as _ct_err:
+                            logger.warning("[%s] Content classification for solver failed: %s", job_id, _ct_err)
+
                     layout_timeline = plan_layout(
                         video_path=video_path,
                         frame_faces=_layout_face_data,
@@ -3127,13 +3184,19 @@ async def _run_analysis_inner(job_id: str):
                         scene_descriptions=scenes,
                         video_duration=metadata.get("duration", 0),
                         job_id=job_id,
+                        content_type=_clip_content_type,
+                        persistent_regions=_persistent_regions,
+                        frame_objects=_solver_objects,
+                        frame_saliency=_solver_saliency,
                     )
                     default_layout_mode = layout_timeline.default_mode
                     logger.info(
-                        "[%s] [Layout+Solver] Video layout analysis: default=%s, %d segments, %d layout changes",
+                        "[%s] [Layout+Solver] Video layout analysis: default=%s, %d segments, "
+                        "%d layout changes, content_type=%s",
                         job_id, layout_timeline.default_mode,
                         len(layout_timeline.segments),
                         layout_timeline.total_layout_changes,
+                        _clip_content_type.value if _clip_content_type else "none",
                     )
                 except Exception as e:
                     logger.warning("[%s] Camera solver layout failed, falling back to legacy: %s", job_id, e)

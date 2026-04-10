@@ -6,11 +6,15 @@ distribution, face position stability, and scene description hints.
 
 Runs early in the pipeline (after frame extraction + face detection) so
 the ReframeSegmenter can apply content-specific editorial strategies.
+
+Also provides ClipContentType + classify_clip() for the camera solver's
+per-content-type tuning path.
 """
 
 import logging
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 from backend.services.content_type_config import ContentType
@@ -20,6 +24,31 @@ logger = logging.getLogger(__name__)
 USE_CONTENT_AWARE_REFRAME = os.environ.get(
     "USE_CONTENT_AWARE_REFRAME", "false"
 ).lower() in ("true", "1", "yes")
+
+
+# ── Camera-solver content types (maps from existing ContentType) ──
+
+class ClipContentType(str, Enum):
+    """Simplified content types for camera solver tuning."""
+    TALKING_HEAD = "talking_head"      # debates, podcasts, interviews
+    ANIMATION = "animation"            # anime, cartoons
+    MUSIC_VIDEO = "music_video"
+    GAMEPLAY = "gameplay"              # pure game footage
+    STREAM = "stream"                  # facecam + gameplay
+    GENERIC = "generic"
+
+
+# Map from existing ContentType to ClipContentType
+_CONTENT_TYPE_MAP = {
+    ContentType.PODCAST.value: ClipContentType.TALKING_HEAD,
+    ContentType.VLOG.value: ClipContentType.TALKING_HEAD,
+    ContentType.ANIME.value: ClipContentType.ANIMATION,
+    ContentType.MUSIC_VIDEO.value: ClipContentType.MUSIC_VIDEO,
+    ContentType.GAMING.value: ClipContentType.GAMEPLAY,
+    ContentType.NARRATIVE.value: ClipContentType.GENERIC,
+    ContentType.SPORTS.value: ClipContentType.GENERIC,
+    ContentType.UNKNOWN.value: ClipContentType.GENERIC,
+}
 
 
 @dataclass
@@ -247,3 +276,71 @@ def classify_content(
     )
 
     return profile
+
+
+# ─────────────── Camera-solver content classification ────────────────────
+
+def classify_clip(
+    content_profile: Optional[ContentProfile] = None,
+    persistent_regions=None,
+    frame_faces: list = None,
+    shot_count: int = 0,
+    duration: float = 0,
+) -> ClipContentType:
+    """Classify clip for camera solver tuning.
+
+    Uses the existing ContentProfile if available, then applies additional
+    heuristics for STREAM detection (HUD + corner facecam).
+
+    Args:
+        content_profile: From classify_content() — already populated in pipeline
+        persistent_regions: From persistent_region_detector — has_facecam, has_hud
+        frame_faces: Existing FrameFaces list for face ratio computation
+        shot_count: Number of detected shots
+        duration: Clip duration in seconds
+
+    Returns:
+        ClipContentType for solver parameter routing.
+    """
+    # Start from existing classification if available
+    base_type = ClipContentType.GENERIC
+    if content_profile:
+        base_type = _CONTENT_TYPE_MAP.get(
+            content_profile.content_type, ClipContentType.GENERIC
+        )
+
+    # STREAM override: gameplay HUD + corner facecam
+    if persistent_regions:
+        has_facecam = getattr(persistent_regions, 'has_facecam', False)
+        has_hud = getattr(persistent_regions, 'has_hud', False)
+
+        if has_facecam and base_type == ClipContentType.GAMEPLAY:
+            base_type = ClipContentType.STREAM
+        elif has_facecam and frame_faces:
+            # Check if face is consistently in a corner (stream pattern)
+            corner_ratio = _fraction_of_faces_in_corner(frame_faces)
+            if corner_ratio > 0.7:
+                base_type = ClipContentType.STREAM
+
+    logger.info("classify_clip: %s (from base=%s)",
+                base_type.value,
+                content_profile.content_type if content_profile else "none")
+    return base_type
+
+
+def _fraction_of_faces_in_corner(frame_faces: list) -> float:
+    """What fraction of detected faces appear in a screen corner?
+
+    Corner = x < 20% or x > 80%, AND y < 25% or y > 75%.
+    Used to detect facecam overlays in streams.
+    """
+    total = 0
+    corner = 0
+    for ff in frame_faces:
+        for face in ff.faces:
+            total += 1
+            x = getattr(face, 'nose_x', 50)
+            y = getattr(face, 'nose_y', 50)
+            if (x < 20 or x > 80) and (y < 25 or y > 75):
+                corner += 1
+    return corner / max(total, 1)

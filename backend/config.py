@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # Camera solver (per-shot AutoFlip-style crop planning)
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER
 
+    # Content-type routing for solver tuning (off by default until tested)
+    CLIPAI_CONTENT_ROUTING: str = "off"  # "on" | "off" — env CLIPAI_CONTENT_ROUTING
+    CLIPAI_CONTENT_TYPES_ENABLED: str = ""  # comma-separated: "talking_head,stream" — empty = all
+
     @property
     def active_provider_chain(self) -> list[str]:
         return [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]
