@@ -32,6 +32,7 @@ DRIFT_THRESHOLD_PCT = 8.0            # detection-vs-prediction reset threshold
 LK_VALIDATION_THRESHOLD_PCT = 6.0    # LK-vs-KCF disagreement threshold
 PROPAGATION_CONFIDENCE_DECAY = 0.05  # confidence drops per frame between anchors
 ANCHOR_CONFIDENCE = 0.95
+ABSENCE_KILL_THRESHOLD = 2           # consecutive anchors without detection → kill tracker
 
 
 def build_interpolated_timeline(
@@ -73,6 +74,8 @@ def build_interpolated_timeline(
     anchor_lookup = {round(d.timestamp, 3): d for d in sorted_anchors}
 
     slot_trackers: dict = {}  # {slot_id: SlotTracker}
+    slot_absence_counts: dict = {}  # {slot_id: consecutive anchors without detection}
+    n_tracker_kills = 0
     samples = []
     prev_gray = None
     next_shot_cut_idx = 0
@@ -95,6 +98,7 @@ def build_interpolated_timeline(
             for st in slot_trackers.values():
                 st._initialized = False
             slot_trackers.clear()
+            slot_absence_counts.clear()
             prev_gray = None
             frames_since_anchor = 0
             next_shot_cut_idx += 1
@@ -188,6 +192,31 @@ def build_interpolated_timeline(
                 # Always overwrite sample bbox with anchor truth
                 sample.bboxes[slot_id] = (fx_pct, fy_pct, fw_pct, fh_pct)
                 sample.confidences[slot_id] = ANCHOR_CONFIDENCE
+
+            # ── Absence detection: kill trackers for slots missing from anchor ──
+            anchor_slot_ids = set()
+            for face in anchor.faces:
+                if not getattr(face, 'is_human', True):
+                    continue
+                sid = getattr(face, 'identity_id', -1)
+                if sid >= 0:
+                    anchor_slot_ids.add(sid)
+
+            for sid in list(slot_trackers.keys()):
+                if sid in anchor_slot_ids:
+                    slot_absence_counts[sid] = 0
+                else:
+                    slot_absence_counts[sid] = slot_absence_counts.get(sid, 0) + 1
+                    if slot_absence_counts[sid] >= ABSENCE_KILL_THRESHOLD:
+                        logger.info("[%s] tracker_killed slot=%d t=%.2f "
+                                    "reason=absent_%d_anchors",
+                                    job_id, sid, timestamp,
+                                    slot_absence_counts[sid])
+                        del slot_trackers[sid]
+                        slot_absence_counts.pop(sid, None)
+                        sample.bboxes.pop(sid, None)
+                        sample.confidences.pop(sid, None)
+                        n_tracker_kills += 1
         else:
             frames_since_anchor += 1
 
@@ -226,6 +255,8 @@ def build_interpolated_timeline(
     timeline.build_index()
 
     elapsed = time.monotonic() - started
-    _log("FINAL: %d samples (%d anchors, %d resets) in %.1fs (budget=%ds, backend=%s)",
-         len(samples), n_anchors_used, n_resets, elapsed, int(runtime_budget_sec), backend)
+    _log("FINAL: %d samples (%d anchors, %d resets, %d tracker_kills) in %.1fs "
+         "(budget=%ds, backend=%s)",
+         len(samples), n_anchors_used, n_resets, n_tracker_kills,
+         elapsed, int(runtime_budget_sec), backend)
     return timeline

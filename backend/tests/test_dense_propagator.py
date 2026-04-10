@@ -294,3 +294,123 @@ class TestBuildInterpolatedTimeline:
             # No tracked bboxes since identity_id=-1 is skipped
             for s in tl.samples:
                 assert len(s.bboxes) == 0
+
+
+class TestAbsenceDetection:
+    """Tests for tracker killing on subject absence."""
+
+    def test_subject_absent_two_anchors_killed(self):
+        """Subject present at t=0.0 and absent at t=0.5 and t=1.0 → tracker killed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            w, h = 640, 480
+            # Generate 30 frames (1 second at 30fps)
+            frame_paths = []
+            for i in range(30):
+                frame = _make_frame_with_rect(w, h, 200, 150, 100, 100)
+                path = os.path.join(tmp, f"f_{i:04d}.png")
+                _save_frame(frame, path)
+                frame_paths.append((i / 30.0, path))
+
+            cx_pct = (250 / w) * 100
+            cy_pct = (200 / h) * 100
+            anchors = [
+                # Subject present at t=0.0
+                FakeFrameFaces(0.0, [
+                    FakeFace(identity_id=0, nose_x=cx_pct, nose_y=cy_pct,
+                             width=15.6, height=20.8),
+                ]),
+                # Subject ABSENT at t=0.5 (no faces)
+                FakeFrameFaces(0.5, []),
+                # Subject ABSENT at t=1.0 → should trigger kill
+                FakeFrameFaces(round(29 / 30.0, 3), []),
+            ]
+
+            tl = build_interpolated_timeline(
+                dense_face_results=anchors,
+                frame_paths=frame_paths,
+                source_width=w, source_height=h, source_fps=30.0,
+            )
+
+            # After second absent anchor, slot 0 should be killed
+            last_sample = tl.samples[-1]
+            assert 0 not in last_sample.bboxes, \
+                "Slot 0 should be killed after 2 consecutive absent anchors"
+
+    def test_brief_absence_then_reappear_not_killed(self):
+        """Subject absent for 1 anchor then reappears → NOT killed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            w, h = 640, 480
+            frame_paths = []
+            for i in range(45):
+                frame = _make_frame_with_rect(w, h, 200, 150, 100, 100)
+                path = os.path.join(tmp, f"f_{i:04d}.png")
+                _save_frame(frame, path)
+                frame_paths.append((i / 30.0, path))
+
+            cx_pct = (250 / w) * 100
+            cy_pct = (200 / h) * 100
+            anchors = [
+                # Present at t=0.0
+                FakeFrameFaces(0.0, [
+                    FakeFace(identity_id=0, nose_x=cx_pct, nose_y=cy_pct,
+                             width=15.6, height=20.8),
+                ]),
+                # Absent at t=0.5 (1 anchor)
+                FakeFrameFaces(0.5, []),
+                # Reappears at t=1.0 → counter should reset
+                FakeFrameFaces(1.0, [
+                    FakeFace(identity_id=0, nose_x=cx_pct, nose_y=cy_pct,
+                             width=15.6, height=20.8),
+                ]),
+            ]
+
+            tl = build_interpolated_timeline(
+                dense_face_results=anchors,
+                frame_paths=frame_paths,
+                source_width=w, source_height=h, source_fps=30.0,
+            )
+
+            # After reappearing, slot 0 should still be tracked
+            last_anchor_sample = None
+            for s in tl.samples:
+                if s.is_anchor and s.timestamp >= 1.0:
+                    last_anchor_sample = s
+                    break
+            assert last_anchor_sample is not None
+            assert 0 in last_anchor_sample.bboxes, \
+                "Slot 0 should survive brief absence when subject reappears"
+
+    def test_killed_slot_has_no_bbox(self):
+        """After a tracker is killed, subsequent samples have no bbox for that slot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            w, h = 640, 480
+            frame_paths = []
+            for i in range(45):
+                frame = _make_frame_with_rect(w, h, 200, 150, 100, 100)
+                path = os.path.join(tmp, f"f_{i:04d}.png")
+                _save_frame(frame, path)
+                frame_paths.append((i / 30.0, path))
+
+            cx_pct = (250 / w) * 100
+            cy_pct = (200 / h) * 100
+            anchors = [
+                FakeFrameFaces(0.0, [
+                    FakeFace(identity_id=0, nose_x=cx_pct, nose_y=cy_pct,
+                             width=15.6, height=20.8),
+                ]),
+                # 2 consecutive absent anchors → kill
+                FakeFrameFaces(0.5, []),
+                FakeFrameFaces(1.0, []),
+            ]
+
+            tl = build_interpolated_timeline(
+                dense_face_results=anchors,
+                frame_paths=frame_paths,
+                source_width=w, source_height=h, source_fps=30.0,
+            )
+
+            # Find samples after the kill point (t >= 1.0)
+            post_kill = [s for s in tl.samples if s.timestamp >= 1.0]
+            for s in post_kill:
+                assert 0 not in s.bboxes, \
+                    f"Killed slot 0 should not appear at t={s.timestamp:.3f}"
