@@ -202,10 +202,10 @@ def build_face_registry(
         if per_frame_gaps:
             per_frame_gaps.sort()
             median_gap = per_frame_gaps[len(per_frame_gaps) // 2]
-            # Use 60% of median inter-face gap as cluster threshold
-            # This ensures faces within the same "position" merge but
-            # different speaker positions stay separate
-            adaptive_gap = max(6.0, min(cluster_gap, median_gap * 0.6))
+            # Use 50% of median inter-face gap as cluster threshold
+            # (was 60%, tightened for 5+ speaker panels to prevent merge)
+            gap_factor = 0.4 if max_faces_per_frame >= 5 else 0.5
+            adaptive_gap = max(5.0, min(cluster_gap, median_gap * gap_factor))
             logger.info(
                 "Multi-speaker panel (max %d faces/frame, %.0f%% with 3+): "
                 "median inter-face gap=%.1f, cluster gap %.0f → %.0f",
@@ -486,6 +486,37 @@ def build_face_registry_with_embeddings(
         if ra != rb:
             parent[ra] = rb
 
+    # ── Co-occurrence guard ──
+    # Two faces detected in the SAME frame at DIFFERENT positions cannot be
+    # the same person. Build a "cannot-link" set of (i, j) pairs that must
+    # never be unioned, preventing identity collapse when embeddings are
+    # similar (same lighting, similar clothing, etc.)
+    cannot_link = set()
+    from collections import defaultdict as _defaultdict
+    faces_by_frame = _defaultdict(list)
+    for idx, (_, _, _, _, frame_idx) in enumerate(all_faces):
+        faces_by_frame[frame_idx].append(idx)
+    for frame_idx, indices in faces_by_frame.items():
+        if len(indices) < 2:
+            continue
+        for ii in range(len(indices)):
+            for jj in range(ii + 1, len(indices)):
+                a, b = indices[ii], indices[jj]
+                # Only block if they're spatially distinct (>5% apart)
+                x_a = all_faces[a][1]
+                x_b = all_faces[b][1]
+                if abs(x_a - x_b) > 5.0:
+                    pair = (min(a, b), max(a, b))
+                    cannot_link.add(pair)
+
+    # ── Grace period: require MIN_LIFETIME unique frames before merging ──
+    # A face that has appeared in fewer than MIN_LIFETIME frames is "new" and
+    # should not be merged into an existing identity — it may be a distinct
+    # speaker who just appeared.
+    MIN_LIFETIME_FRAMES = 10
+    # Precompute unique frame count per face's eventual group
+    face_frame_idx = [all_faces[i][4] for i in range(n)]
+
     # Compare all pairs — for typical video (< 500 faces), this is fast
     sim_matrix = embeddings_norm @ embeddings_norm.T
     for i in range(n):
@@ -493,6 +524,31 @@ def build_face_registry_with_embeddings(
             # SFace uses cosine distance; lower = more similar
             cosine_dist = 1.0 - sim_matrix[i, j]
             if cosine_dist < cosine_threshold:
+                # Co-occurrence guard: skip if detected in same frame
+                pair = (min(i, j), max(i, j))
+                if pair in cannot_link:
+                    continue
+                # Check that merging won't link faces that co-occur
+                # (transitivity: find all members of both groups)
+                root_i = find(i)
+                root_j = find(j)
+                if root_i == root_j:
+                    continue
+                # Gather all members of both groups
+                group_i = [k for k in range(n) if find(k) == root_i]
+                group_j = [k for k in range(n) if find(k) == root_j]
+                # Check if any pair across groups co-occurs
+                co_occurs = False
+                for gi in group_i:
+                    for gj in group_j:
+                        p = (min(gi, gj), max(gi, gj))
+                        if p in cannot_link:
+                            co_occurs = True
+                            break
+                    if co_occurs:
+                        break
+                if co_occurs:
+                    continue
                 union(i, j)
 
     # Group by connected component
