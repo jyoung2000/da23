@@ -690,16 +690,21 @@ def build_face_registry_with_embeddings(
             )
             return build_face_registry(face_results, min_appearances)
 
-    # Also validate: must have 2+ slots for multi-speaker, or same count as position-based
-    if len(slots) < 2:
-        # Try position-based to see if it finds more speakers
-        pos_registry = build_face_registry(face_results, min_appearances)
-        if len(pos_registry.slots) > len(slots):
-            logger.info(
-                "Embedding registry found %d slots but position-based found %d — using position-based",
-                len(slots), len(pos_registry.slots),
-            )
-            return pos_registry
+    # Take max(embedding_count, position_count): whichever finds more identities wins.
+    # Embeddings are the primary source of truth, but position-based may catch
+    # speakers that the embedding clusterer missed (e.g., no embeddings available).
+    pos_registry = build_face_registry(face_results, min_appearances)
+    if len(pos_registry.slots) > len(slots):
+        logger.info(
+            "Embedding registry found %d slots but position-based found %d — using position-based (max wins)",
+            len(slots), len(pos_registry.slots),
+        )
+        return pos_registry
+    elif len(pos_registry.slots) < len(slots):
+        logger.info(
+            "Embedding registry found %d slots, position-based found %d — using embeddings (max wins)",
+            len(slots), len(pos_registry.slots),
+        )
 
     logger.info(
         "Face registry (embeddings): %d slots from %d faces (%d with embeddings)",
